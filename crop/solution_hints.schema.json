@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "problem_pdf_index",
+    "problem_pdf_page",
+    "problem_printed_label",
+    "problem_printed_page",
+    "hierarchy_path",
+    "numbering_scope",
+    "anchors",
+    "warnings"
+  ],
+  "properties": {
+    "problem_pdf_index": {"type": "integer", "minimum": 0},
+    "problem_pdf_page": {"type": "integer", "minimum": 1},
+    "problem_printed_label": {"type": ["string", "null"]},
+    "problem_printed_page": {"type": ["integer", "null"], "minimum": 1},
+    "hierarchy_path": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "numbering_scope": {"$ref": "#/$defs/numbering_scope"},
+    "anchors": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/anchor"}
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "$defs": {
+    "bbox": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"type": "integer", "minimum": 0, "maximum": 1000}
+    },
+    "numbering_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_label",
+        "reset_signal",
+        "visible_question_labels",
+        "confidence"
+      ],
+      "properties": {
+        "scope_label": {"type": ["string", "null"]},
+        "reset_signal": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+        "visible_question_labels": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_text",
+        "mode",
+        "printed_start",
+        "printed_end",
+        "bbox",
+        "scope",
+        "target_question_labels",
+        "confidence"
+      ],
+      "properties": {
+        "raw_text": {"type": "string", "minLength": 1},
+        "mode": {"type": "string", "enum": ["start", "range"]},
+        "printed_start": {"type": "integer", "minimum": 1},
+        "printed_end": {"type": ["integer", "null"], "minimum": 1},
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "scope": {
+          "type": "string",
+          "enum": ["page", "column", "section", "question", "ambiguous"]
+        },
+        "target_question_labels": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

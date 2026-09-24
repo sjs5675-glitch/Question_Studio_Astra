@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "solution_pdf_index",
+    "solution_pdf_page",
+    "solution_printed_label",
+    "solution_printed_page",
+    "page_role",
+    "hierarchy_path",
+    "numbering_scope",
+    "blocks",
+    "warnings"
+  ],
+  "properties": {
+    "solution_pdf_index": {"type": "integer", "minimum": 0},
+    "solution_pdf_page": {"type": "integer", "minimum": 1},
+    "solution_printed_label": {"type": ["string", "null"]},
+    "solution_printed_page": {"type": ["integer", "null"], "minimum": 1},
+    "page_role": {
+      "type": "string",
+      "enum": ["quick_answer", "detailed_solution", "mixed", "other"]
+    },
+    "hierarchy_path": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "numbering_scope": {"$ref": "#/$defs/numbering_scope"},
+    "blocks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/block"}
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "$defs": {
+    "bbox": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"type": "integer", "minimum": 0, "maximum": 1000}
+    },
+    "numbering_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope_label",
+        "reset_detected",
+        "repeated_numbering_detected",
+        "visible_number_sequence",
+        "confidence"
+      ],
+      "properties": {
+        "scope_label": {"type": ["string", "null"]},
+        "reset_detected": {"type": "boolean"},
+        "repeated_numbering_detected": {"type": "boolean"},
+        "visible_number_sequence": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "parent_number",
+        "subquestion_labels",
+        "range_start",
+        "range_end",
+        "group_label"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "single",
+            "parent_with_subquestions",
+            "range",
+            "group",
+            "continuation"
+          ]
+        },
+        "parent_number": {"type": ["string", "null"]},
+        "subquestion_labels": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "range_start": {"type": ["string", "null"]},
+        "range_end": {"type": ["string", "null"]},
+        "group_label": {"type": ["string", "null"]}
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_id",
+        "parent_number",
+        "subquestion_label",
+        "answer_bbox",
+        "explicit_answer_text",
+        "stem_fingerprint_tokens",
+        "figure_labels",
+        "confidence"
+      ],
+      "properties": {
+        "entry_id": {"type": "string", "minLength": 1},
+        "parent_number": {"type": ["string", "null"]},
+        "subquestion_label": {"type": ["string", "null"]},
+        "answer_bbox": {
+          "anyOf": [
+            {"$ref": "#/$defs/bbox"},
+            {"type": "null"}
+          ]
+        },
+        "explicit_answer_text": {"type": ["string", "null"]},
+        "stem_fingerprint_tokens": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {"type": "string"}
+        },
+        "figure_labels": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {"type": "string"}
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "local_id",
+        "role",
+        "bbox",
+        "hierarchy_path",
+        "numbering_scope_label",
+        "coverage",
+        "entries",
+        "starts_on_previous_page",
+        "continues_next_page",
+        "continuation_label",
+        "confidence"
+      ],
+      "properties": {
+        "local_id": {"type": "string", "minLength": 1},
+        "role": {
+          "type": "string",
+          "enum": ["quick_answer", "detailed_solution", "mixed"]
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "hierarchy_path": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "numbering_scope_label": {"type": ["string", "null"]},
+        "coverage": {"$ref": "#/$defs/coverage"},
+        "entries": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/entry"}
+        },
+        "starts_on_previous_page": {"type": "boolean"},
+        "continues_next_page": {"type": "boolean"},
+        "continuation_label": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

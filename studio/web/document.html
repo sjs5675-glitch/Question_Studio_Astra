@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>문서 편집 · Question Studio</title>
+  <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/dist/document/document.css"><link rel="stylesheet" href="/document.css">
+  <script type="module" src="/dist/document/document.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#document-flow">본문으로 이동</a>
+  <header class="app-header"><div><p class="eyebrow">QUESTION STUDIO</p><h1>문서 편집</h1></div><a class="button" href="/">문제지로 돌아가기</a></header>
+  <main id="document-app">
+    <aside class="document-library" aria-label="저장된 문서"><h2>내 문서</h2><button id="document-refresh-list" class="button" type="button">목록 새로고침</button><div id="document-list"></div><p class="document-help">원본 문제는 바뀌지 않습니다.<br>편집한 내용은 이 문서에만 저장됩니다.</p></aside>
+    <section class="document-main" aria-label="문서 작업 공간">
+      <p id="document-status" role="status">문서 목록을 불러오는 중입니다.</p>
+      <div class="document-toolbar document-actions">
+        <button id="document-save" class="button primary" type="button" disabled>문서 저장</button><button id="document-undo" class="button" type="button" disabled>실행 취소</button><button id="document-redo" class="button" type="button" disabled>다시 실행</button>
+        <button id="document-pdf-download" class="button" type="button" disabled>PDF 만들기</button><button id="document-pdf-cancel" class="button" type="button" hidden>PDF 취소</button><a id="document-pdf-file" class="button" hidden>PDF 내려받기</a>
+        <button id="document-hwpx-download" class="button" type="button" disabled>현재 HWPX 만들기</button><button id="document-hwpx-cancel" class="button" type="button" hidden>HWPX 취소</button><a id="document-hwpx-file" class="button" hidden>HWPX 내려받기</a>
+        <button id="document-zip-download" class="button" type="button" disabled>문서 백업 ZIP 만들기 (정답·원본 포함)</button><button id="document-zip-cancel" class="button" type="button" hidden>ZIP 취소</button><a id="document-zip-file" class="button" hidden>문서 백업 ZIP 내려받기</a>
+      </div>
+      <div id="document-workspace" hidden>
+        <label class="document-title-label">문서 제목<input id="document-title" maxlength="300" autocomplete="off"></label>
+        <div class="document-toolbar" aria-label="본문 서식">
+          <button type="button" data-mark="bold" aria-label="굵게"><strong>B</strong></button><button type="button" data-mark="italic" aria-label="기울임"><em>I</em></button><button type="button" data-mark="underline" aria-label="밑줄"><u>U</u></button><button type="button" data-mark="superscript" aria-label="위 첨자">x²</button><button type="button" data-mark="subscript" aria-label="아래 첨자">x₂</button>
+          <label>글꼴<select id="document-font"><option>Noto Sans KR</option><option>Noto Serif KR</option></select></label>
+          <label>크기(pt)<input id="document-font-size" type="number" min="6" max="72" value="10"></label><label>줄 간격<input id="document-line-spacing" type="number" min="1" max="3" step="0.1" value="1.6"></label><label>문단 간격(mm)<input id="document-paragraph-spacing" type="number" min="0" max="30" value="3"></label>
+          <button id="document-add-math" type="button">수식 삽입</button>
+        </div>
+        <details class="document-layout-settings"><summary>지면 설정 · 용지와 출력 내용</summary><div id="document-layout-controls" class="document-layout-controls"></div></details>
+        <button id="document-preview-button" type="button">쪽 나눔 미리보기 계산</button>
+        <p class="document-help">문단을 눌러 바로 편집하세요. Enter: 새 문단 · Shift+Enter: 줄바꿈 · 수식 클릭: 수식 편집. 선택한 글자의 서식만 바꿀 수 있습니다.</p><p class="document-help">연속 편집 화면에는 전체 내용이 보입니다. 선택한 출력 내용과 쪽 나눔은 아래 미리보기에 적용됩니다.</p>
+        <article id="document-flow" aria-label="현재 문서 본문"></article>
+        <div id="document-layout-error" role="status"></div><section id="document-preview" aria-label="쪽 나눔 미리보기"></section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

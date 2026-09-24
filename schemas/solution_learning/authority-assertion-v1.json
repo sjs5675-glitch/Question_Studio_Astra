@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "astra://solution-learning/authority-assertion-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "assertion_id", "reviewer_id", "review_origin", "action_id", "source_event_sha", "source_sha", "target_id", "target_revision", "expected_effect_sha", "label_scope", "reviewed_at", "state"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "assertion_id": {"type": "string", "minLength": 1},
+    "reviewer_id": {"type": "string", "minLength": 1},
+    "review_origin": {"enum": ["user_attested", "agent", "legacy_unknown", "test_fixture"]},
+    "action_id": {"type": "string", "minLength": 1},
+    "source_event_sha": {"$ref": "#/$defs/sha256"},
+    "source_sha": {"$ref": "#/$defs/sha256"},
+    "target_id": {"type": "string", "minLength": 1},
+    "target_revision": {"type": "integer", "minimum": 1},
+    "expected_effect_sha": {"$ref": "#/$defs/sha256"},
+    "label_scope": {"enum": ["content_match", "crop_bounds", "unit_boundary", "answer_cell", "number_mapping"]},
+    "reviewed_at": {"type": "string", "format": "date-time"},
+    "state": {"enum": ["active", "retracted"]}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

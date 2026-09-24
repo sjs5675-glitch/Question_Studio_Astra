@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "complete_question",
+    "contains_expected_identifier",
+    "contains_required_context",
+    "contains_answer_or_solution",
+    "contains_other_question",
+    "required_content_missing_or_unreadable",
+    "explicit_answer_evidence",
+    "target_content_clipped",
+    "identifier_clipped",
+    "cosmetic_or_foreign_fragment_only",
+    "cut_off_content",
+    "excessive_blank_space",
+    "reasons",
+    "confidence"
+  ],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["pass", "review", "fail"]},
+    "complete_question": {"type": "boolean"},
+    "contains_expected_identifier": {"type": "boolean"},
+    "contains_required_context": {"type": "boolean"},
+    "contains_answer_or_solution": {"type": "boolean"},
+    "contains_other_question": {"type": "boolean"},
+    "required_content_missing_or_unreadable": {"type": "boolean"},
+    "explicit_answer_evidence": {"type": "boolean"},
+    "target_content_clipped": {"type": "boolean"},
+    "identifier_clipped": {"type": "boolean"},
+    "cosmetic_or_foreign_fragment_only": {"type": "boolean"},
+    "cut_off_content": {"type": "boolean"},
+    "excessive_blank_space": {"type": "boolean"},
+    "reasons": {"type": "array", "items": {"type": "string"}},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  }
+}

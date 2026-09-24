@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>문제집 자동 저장 · Astra</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./vendor/katex-0.18.1.min.js" defer></script>
+  <script src="./app.js" type="module"></script>
+</head>
+<body>
+  <a id="skipLink" class="skip-link" href="#workView">본문으로 건너뛰기</a>
+
+  <header class="app-header">
+    <h1>문제집 자동 저장 · Astra</h1>
+    <nav class="workspace-nav" aria-label="주요 메뉴">
+      <a id="workNav" href="/?view=work">새 작업</a>
+      <a id="savedNav" href="/?view=saved">저장된 문항</a>
+      <a id="bankNav" href="/?view=bank">문제은행</a>
+      <a id="setsNav" href="/?view=sets">문제지 만들기</a>
+      <a id="learningNav" href="/?view=learning">분석 참고 사례</a>
+    </nav>
+    <p id="connectionStatus" class="connection" data-state="idle">연결 확인 중</p>
+  </header>
+
+  <main id="workView" class="batch-area" aria-labelledby="batchTitle" tabindex="-1">
+    <div class="batch-heading">
+      <div>
+        <h2 id="batchTitle">문제집과 해설을 한 번에 저장</h2>
+        <p>문제 PDF와 해설 PDF를 선택하면 문항 분리부터 글자 인식과 저장까지 자동으로 처리합니다.</p>
+      </div>
+    </div>
+
+    <form id="batchForm" class="batch-form">
+      <div class="batch-fields">
+        <label class="file-field" for="sourcePdfFile">
+          <span>문제 PDF</span>
+          <input id="sourcePdfFile" name="source_file" type="file"
+                 accept=".pdf,application/pdf">
+        </label>
+        <label class="file-field" for="solutionPdfFile">
+          <span>해설 PDF</span>
+          <input id="solutionPdfFile" name="solution_file" type="file"
+                 accept=".pdf,application/pdf">
+        </label>
+        <details class="page-range-options">
+          <summary>일부 페이지만 처리</summary>
+          <label for="batchPages">
+            <span>처리할 쪽</span>
+            <input id="batchPages" name="pages" type="text" value="all" autocomplete="off"
+                   aria-describedby="pagesHelp" placeholder="3-12 또는 3-12,20" required>
+            <small id="pagesHelp">전체 처리라면 그대로 두세요.</small>
+          </label>
+        </details>
+        <fieldset id="batchProviderProfile" class="provider-profile-options" aria-describedby="batchProviderProfileHelp">
+          <legend>Astra 해설 검증 · 그림 생성 옵션</legend>
+          <label for="providerProfileFull">
+            <input id="providerProfileFull" name="provider_profile" type="radio" value="full" checked>
+            <span>그림 재생성 포함</span>
+            <small>문제·해설은 Astra CLI로 읽고 연결을 검증합니다. 그림은 별도 이미지 서비스로 생성합니다.</small>
+          </label>
+          <label for="providerProfileCodexOnly">
+            <input id="providerProfileCodexOnly" name="provider_profile" type="radio" value="codex_only">
+            <span>원본 그림 유지</span>
+            <small>문제·해설은 Astra CLI로 읽고 연결을 검증합니다. 그림은 원본을 유지합니다.</small>
+          </label>
+          <p id="batchProviderProfileHelp" class="provider-profile-help">확실한 연결만 자동 확정하고 불확실한 연결은 검토 대기로 남깁니다. 원본 PDF는 보존됩니다. 작업을 만든 뒤에는 그림 방식을 변경할 수 없습니다.</p>
+        </fieldset>
+      </div>
+      <details class="server-paths">
+        <summary>이 PC에 있는 PDF 경로 직접 입력</summary>
+        <div class="server-path-fields">
+          <label class="path-field" for="sourcePdfPath">
+            <span>문제 PDF 경로</span>
+            <input id="sourcePdfPath" name="source_path" type="text" autocomplete="off"
+                   placeholder="C:\문제집\문제.pdf">
+          </label>
+          <label class="path-field" for="solutionPdfPath">
+            <span>해설 PDF 경로</span>
+            <input id="solutionPdfPath" name="solution_path" type="text" autocomplete="off"
+                   placeholder="C:\문제집\해설.pdf">
+          </label>
+        </div>
+      </details>
+      <div class="batch-submit">
+        <button id="startBatch" class="button primary" type="submit">자동 저장 시작</button>
+      </div>
+    </form>
+
+    <section class="recent-batches" aria-labelledby="recentBatchesTitle">
+      <div class="section-heading">
+        <h3 id="recentBatchesTitle">최근 작업</h3>
+        <button id="refreshBatches" class="icon-button" type="button" aria-label="작업 새로고침" title="새로고침">↻</button>
+      </div>
+      <p id="batchesEmpty" class="empty-note">실행한 일괄 작업이 없습니다.</p>
+      <ul id="batchList" class="batch-list" aria-label="최근 작업 목록"></ul>
+      <p id="batchAnnouncement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+    </section>
+
+    <details class="advanced-import">
+      <summary>기존 작업 폴더 가져오기</summary>
+      <div class="advanced-import-body">
+        <div class="import-copy">
+          <h3>저장된 작업 가져오기</h3>
+        </div>
+        <form id="importForm" class="import-form">
+          <label for="importPath">작업 폴더 경로</label>
+          <div class="input-action">
+            <input id="importPath" name="source_path" type="text" autocomplete="off"
+                   placeholder="C:\Question_Crop\workspace\…" required>
+            <button id="importButton" class="button" type="submit">가져오기</button>
+          </div>
+        </form>
+      </div>
+    </details>
+  </main>
+
+  <main id="learningView" class="learning-page" aria-labelledby="learningTitle" tabindex="-1" hidden>
+    <header class="learning-heading">
+      <div>
+        <p class="eyebrow">Solution learning</p>
+        <h2 id="learningTitle">분석 참고 사례</h2>
+        <p>직접 확인한 해설 수정 기록만 보여줍니다. 사례 수는 분석 개선 효과를 뜻하지 않습니다.</p>
+      </div>
+      <button id="refreshLearning" class="button" type="button">새로고침</button>
+    </header>
+    <dl class="learning-summary" aria-label="학습 사례 현황">
+      <div><dt>저장된 사례</dt><dd id="learningActive">0</dd></div>
+      <div><dt>참고 가능</dt><dd id="learningEligible">0</dd></div>
+      <div><dt>검토 필요</dt><dd id="learningNeedsReview">0</dd></div>
+      <div><dt>적용 기록</dt><dd id="learningImpacted">0</dd></div>
+    </dl>
+    <p id="learningBenefitStatus" class="learning-benefit" role="status"></p>
+    <p id="learningEmpty" class="empty-state">저장된 분석 참고 사례가 없습니다.</p>
+    <section id="learningList" class="learning-list" aria-label="분석 참고 사례 목록"></section>
+  </main>
+
+  <div id="savedView" class="app-shell" hidden>
+    <aside class="sidebar" aria-label="프로젝트와 문항 탐색">
+      <section id="recoveryProgressPanel" class="nav-section recovery-progress" aria-labelledby="recoveryProgressTitle" aria-live="polite" hidden>
+        <div class="section-heading">
+          <h2 id="recoveryProgressTitle">자동 해설 복구</h2>
+          <span id="recoveryProgressStatus" class="recovery-status">진행 중</span>
+        </div>
+        <p id="recoveryProgressStage" class="recovery-stage"></p>
+        <p id="recoveryProgressItem" class="recovery-item"></p>
+        <dl class="recovery-counts">
+            <div><dt>검증 결과</dt><dd id="recoveryVerificationCount">0</dd></div>
+            <div><dt>후보 이미지</dt><dd id="recoveryCropCount">0</dd></div>
+        </dl>
+        <p id="recoveryProgressUpdated" class="recovery-updated"></p>
+      </section>
+      <section class="nav-section" aria-labelledby="projectsTitle">
+        <div class="section-heading">
+          <h2 id="projectsTitle">프로젝트</h2>
+          <button id="refreshProjects" class="icon-button" type="button" aria-label="프로젝트 새로고침" title="새로고침">↻</button>
+        </div>
+        <p id="projectsEmpty" class="empty-note">등록된 프로젝트가 없습니다.</p>
+        <ul id="projectList" class="nav-list" aria-label="프로젝트 목록"></ul>
+        <section class="trash-panel" aria-labelledby="trashTitle">
+          <div class="section-heading">
+            <h3 id="trashTitle">휴지통</h3>
+            <button id="refreshTrash" class="icon-button" type="button" aria-label="휴지통 새로고침" title="새로고침">↻</button>
+          </div>
+          <p id="trashStatus" class="trash-status" role="status" aria-live="polite"></p>
+          <ul id="trashList" class="nav-list" aria-label="휴지통 항목"></ul>
+        </section>
+        <div id="hwpxExportPanel" class="project-exports" aria-label="프로젝트 내보내기">
+          <button id="ocrMissing" class="button project-export-button" type="button" disabled>누락된 내용 다시 인식</button>
+          <button id="relinkSolutions" class="button project-export-button" type="button" disabled>답·해설 전체 다시 연결</button>
+          <p id="solutionRelinkLiveStatus" class="relink-live-status" role="status" aria-live="polite" hidden></p>
+          <button id="tagAllItems" class="button project-export-button" type="button" disabled>전체 자동 태깅</button>
+          <p id="tagAllProgress" class="tag-progress" role="status" aria-live="polite" hidden></p>
+          <button id="buildHwpx" class="button primary project-export-button" type="button" disabled>문제·해설 HWPX 만들기</button>
+          <section id="hwpxBuildResult" class="hwpx-build-result" aria-live="polite" hidden>
+            <p id="hwpxBuildStatus"></p>
+            <ul id="hwpxBuildChecks" class="hwpx-build-checks"></ul>
+            <div id="hwpxDownloadLinks" class="hwpx-download-links"></div>
+          </section>
+          <button id="archiveProject" class="button project-export-button" type="button" disabled>백업 파일 받기</button>
+        </div>
+      </section>
+
+      <section class="nav-section item-nav" aria-labelledby="itemsTitle">
+        <div class="section-heading">
+          <h2 id="itemsTitle">등록 문항</h2>
+          <span id="itemCount" class="count">0</span>
+        </div>
+        <dl id="solutionCoverage" class="solution-coverage" aria-label="등록 및 해설 확보 현황">
+          <div><dt>등록 문항</dt><dd id="coverageRegistered">0</dd></div>
+          <div><dt>해설 원본 있음</dt><dd id="coverageDetailed">0</dd></div>
+          <div><dt>빠른정답만</dt><dd id="coverageQuickOnly">0</dd></div>
+          <div><dt>review 후보 존재</dt><dd id="coverageReview">0</dd></div>
+          <div><dt>해설 원본 없음</dt><dd id="coverageMissing">0</dd></div>
+          <div><dt>자동 확인됨</dt><dd id="coverageVerified">0</dd></div>
+        </dl>
+        <p id="firstBlockerSummary" class="first-blocker-summary" hidden></p>
+        <div class="filters">
+          <label class="sr-only" for="itemSearch">문항 검색</label>
+          <input id="itemSearch" type="search" placeholder="문항 번호·태그 검색">
+          <label class="sr-only" for="statusFilter">상태 필터</label>
+          <select id="statusFilter">
+            <option value="all">전체 문항</option>
+            <option value="needs_attention">수정 필요한 문항</option>
+            <option value="missing_explanation">해설 타이핑 미완료</option>
+            <option value="complete">해설 타이핑 완료</option>
+          </select>
+          <label class="sr-only" for="tagFilter">태그 필터</label>
+          <select id="tagFilter">
+            <option value="all">모든 태그</option>
+            <option value="needs_review">태그 확인 필요</option>
+            <option value="figure">그림 사용</option>
+            <option value="graph">그래프 사용</option>
+          </select>
+          <label class="sr-only" for="figureStatusFilter">그림 재생성 상태 필터</label>
+          <select id="figureStatusFilter">
+            <option value="all">전체 그림 상태</option>
+            <option value="has_regenerated">재생성 후보 있음</option>
+            <option value="missing_regeneration">미재생성 그림 있음</option>
+            <option value="selected_regenerated">재생성 그림 사용 중</option>
+            <option value="needs_review">그림 확인 필요</option>
+            <option value="no_figure">그림 없음</option>
+          </select>
+        </div>
+        <p id="itemsEmpty" class="empty-note">프로젝트를 선택하세요.</p>
+        <ul id="itemList" class="nav-list item-list" aria-label="문항 목록"></ul>
+      </section>
+    </aside>
+
+    <main id="mainContent" class="main-content" tabindex="-1">
+      <section id="bankReadOnlyView" class="item-workspace" aria-labelledby="bankReadOnlyTitle" hidden>
+        <h2 id="bankReadOnlyTitle">문항 읽기</h2>
+        <p id="bankReadOnlyStatus" role="status" aria-live="polite"></p>
+        <div class="dual-reading-grid" aria-label="타이핑된 문제와 해설">
+          <section class="dual-reading-panel" aria-labelledby="bankReadQuestionTitle">
+            <header class="dual-reading-header"><h3 id="bankReadQuestionTitle">문제</h3></header>
+            <div id="bankReadQuestion" class="dual-reading-body" tabindex="0"></div>
+          </section>
+          <section class="dual-reading-panel" aria-labelledby="bankReadExplanationTitle">
+            <header class="dual-reading-header"><h3 id="bankReadExplanationTitle">해설</h3></header>
+            <div id="bankReadExplanation" class="dual-reading-body" tabindex="0"></div>
+          </section>
+        </div>
+      </section>
+      <section id="welcomePanel" class="welcome-panel">
+        <h2>등록된 문항을 선택하세요</h2>
+        <p>저장된 문제와 해설을 확인하거나 수정할 수 있습니다.</p>
+      </section>
+
+      <section id="itemWorkspace" class="item-workspace" aria-labelledby="itemTitle" hidden>
+        <header class="item-header">
+          <div>
+            <h2 id="itemTitle">문항</h2>
+            <dl class="item-meta">
+              <div><dt>저장 상태</dt><dd id="dirtyValue">저장됨</dd></div>
+            </dl>
+            <details class="technical-info">
+              <summary>기술 정보</summary>
+              <dl>
+                <div><dt>프로젝트</dt><dd id="itemContext"></dd></div>
+                <div><dt>문항 상태</dt><dd id="workflowValue">-</dd></div>
+                <div><dt>버전</dt><dd id="revisionValue">-</dd></div>
+              </dl>
+            </details>
+          </div>
+          <div class="item-actions" aria-label="문항 작업">
+            <select id="transcribeProfile" hidden aria-label="글자 인식 방식">
+              <option value="balanced">Astra 글자 인식</option>
+              <option value="economy">Astra 글자 인식</option>
+              <option value="quality_review">Astra 정밀 확인</option>
+            </select>
+          <button id="transcribeItem" class="button" type="button">해설 다시 타이핑</button>
+            <button id="approveItem" class="button primary" type="button">이대로 확인하고 다음</button>
+            <button id="saveItem" class="button" type="button">저장 <kbd>Ctrl</kbd>+<kbd>S</kbd></button>
+            <details class="more-actions">
+              <summary>더보기</summary>
+              <button id="validateItem" class="text-button" type="button">오류 확인</button>
+              <button id="reloadItem" class="text-button" type="button">다시 불러오기</button>
+            </details>
+          </div>
+        </header>
+
+        <details class="item-tags item-tags-details">
+          <summary class="tag-details-summary"><span id="itemTagsTitle">문항 태그</span><span id="tagChips" class="tag-chips" aria-live="polite"></span><span id="tagReviewBadge" class="tag-review-badge" hidden>태그 확인 필요</span></summary>
+          <div class="item-tags-content">
+          <details id="tagEditor" class="tag-editor">
+            <summary>태그 수정</summary>
+            <form id="tagForm" class="tag-form">
+              <div class="tag-fields">
+                <label><span>과목</span>
+                  <select id="tagSubject">
+                    <option value="">미분류</option>
+                    <option value="과학">과학</option>
+                    <option value="통합과학1">통합과학1</option>
+                    <option value="통합과학2">통합과학2</option>
+                    <option value="물리학">물리학</option>
+                    <option value="역학과 에너지">역학과 에너지</option>
+                    <option value="전자기와 양자">전자기와 양자</option>
+                  </select>
+                </label>
+                <label><span>단원</span><select id="tagUnit"><option value="">미분류</option></select></label>
+                <label><span>난이도</span>
+                  <select id="tagDifficulty">
+                    <option value="unknown">미분류</option>
+                    <option value="basic">쉬움</option>
+                    <option value="standard">보통</option>
+                    <option value="advanced">어려움</option>
+                  </select>
+                </label>
+                <label><span>문제 유형</span><input id="tagProblemTypes" type="text" autocomplete="off" placeholder="자료 해석, 개념 적용"></label>
+                <label><span>핵심어</span><input id="tagKeywords" type="text" autocomplete="off" placeholder="전자기 유도, 렌츠 법칙"></label>
+                <label><span>그림 종류</span><input id="tagVisualKinds" type="text" autocomplete="off" placeholder="diagram, graph"></label>
+                <label><span>그림 역할</span>
+                  <select id="tagVisualDependency">
+                    <option value="none">사용 안 함</option>
+                    <option value="supplementary">보조 자료</option>
+                    <option value="required">풀이에 필요</option>
+                    <option value="unknown">미분류</option>
+                  </select>
+                </label>
+              </div>
+              <fieldset class="tag-feature-fields">
+                <legend>포함 요소</legend>
+                <label><input id="tagHasFigure" type="checkbox"> 그림</label>
+                <label><input id="tagHasGraph" type="checkbox"> 그래프</label>
+                <label><input id="tagHasTable" type="checkbox"> 표</label>
+                <label><input id="tagHasEquation" type="checkbox"> 수식</label>
+                <label><input id="tagHasBogi" type="checkbox"> 보기</label>
+                <label><input id="tagHasChoices" type="checkbox"> 선택지</label>
+              </fieldset>
+              <div class="tag-actions">
+                <button id="autoTagItem" class="button" type="button">AI 자동 태깅</button>
+                <button id="saveTags" class="button primary" type="submit">태그 저장</button>
+              </div>
+            </form>
+          </details>
+          </div>
+        </details>
+
+        <section class="dual-reading-grid" aria-label="문제와 해설 함께 읽기">
+          <section id="questionReadingPanel" class="dual-reading-panel" aria-labelledby="questionReadingTitle">
+            <header class="dual-reading-header">
+              <h3 id="questionReadingTitle">문제</h3>
+              <div class="dual-reading-actions">
+                <div class="dual-view-switch" aria-label="문제 보기 방식"><button type="button" data-view-mode="source" aria-pressed="true">원본</button><button type="button" data-view-mode="read" aria-pressed="false">읽기</button></div>
+                <button class="button" type="button" data-edit-section="question">문제 편집</button>
+              </div>
+            </header>
+            <label class="dual-reading-asset-label">원본 이미지<select data-reading-asset aria-label="문제 원본 이미지 선택"></select></label>
+            <div class="dual-reading-body" tabindex="0" aria-label="문제 읽기 영역"></div>
+            <p class="dual-reading-status" role="status" aria-live="polite"></p>
+          </section>
+          <section id="explanationReadingPanel" class="dual-reading-panel" aria-labelledby="explanationReadingTitle">
+            <header class="dual-reading-header">
+              <div><h3 id="explanationReadingTitle">해설</h3><p class="dual-answer-line"><strong data-answer-summary>-</strong></p></div>
+              <div class="dual-reading-actions">
+                <div class="dual-view-switch" aria-label="해설 보기 방식"><button type="button" data-view-mode="source" aria-pressed="true">원본</button><button type="button" data-view-mode="read" aria-pressed="false">읽기</button></div>
+                <button class="button" type="button" data-edit-section="explanation">해설 편집</button>
+                <button class="text-button" type="button" data-open-solution-tools aria-controls="solutionImageTools">이미지 바꾸기</button>
+              </div>
+            </header>
+            <label class="dual-reading-asset-label">원본 이미지<select data-reading-asset aria-label="해설 원본 이미지 선택"></select></label>
+            <div class="dual-reading-body" tabindex="0" aria-label="해설 읽기 영역"></div>
+            <p class="dual-reading-status" role="status" aria-live="polite"></p>
+          </section>
+        </section>
+
+        <details id="solutionImageTools" class="solution-image-tools">
+          <summary>해설 이미지 바꾸기</summary>
+          <section id="solutionImagePicker" class="solution-image-picker" aria-label="해설 이미지 바꾸기">
+          <label class="button" for="solutionImageFiles">이미지 선택·추가</label>
+          <input id="solutionImageFiles" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden>
+          <div id="solutionImageDrop" class="solution-image-drop" tabindex="0">여기로 이미지를 끌어오거나 클릭한 뒤 Ctrl+V로 붙여넣기</div>
+          <ol id="solutionImageQueue"></ol>
+          <button id="applySolutionImages" class="button primary" type="button" disabled>이 이미지로 바꾸고 타이핑</button>
+          <button id="revertSolutionImage" class="button" type="button" disabled>이전 해설 이미지로 되돌리기</button>
+          <button id="restoreSolutionContent" class="button" type="button" disabled>텍스트·정답도 이전 결과로 복원</button>
+          <p id="solutionImageStatus" role="status" aria-live="polite"></p>
+          <button id="beginSolutionCrop" class="button" type="button">영역 다시 자르기</button>
+          <button id="showSolutionCandidates" class="button" type="button">다른 후보 보기</button>
+          <div id="solutionCropEditor" class="solution-crop-editor" hidden>
+            <label>수정할 페이지 <select id="solutionCropPage"></select></label>
+            <label>확대 <input id="solutionCropZoom" type="range" min="50" max="200" value="100"> <output id="solutionCropZoomValue">100%</output></label>
+            <p>원본 위에서 드래그해 선택하세요. 선택 영역은 드래그로 옮기고 모서리로 크기를 바꿀 수 있습니다. 방향키는 이동, Shift+방향키는 크기 조절입니다.</p>
+            <div class="solution-crop-scroll"><div id="solutionCropCanvas" class="solution-crop-canvas"><img id="solutionCropOriginal" alt="선택한 해설 원본 페이지"><div id="solutionCropBox" class="solution-crop-box" tabindex="0" role="slider" aria-label="해설 선택 영역" aria-valuemin="0" aria-valuemax="100"><i class="nw"></i><i class="ne"></i><i class="sw"></i><i class="se"></i></div></div></div>
+            <div class="solution-crop-previews"><figure><img id="solutionCropBefore" alt="수정 전 해설"><figcaption>수정 전</figcaption></figure><figure><canvas id="solutionCropAfter" aria-label="수정 후 미리보기"></canvas><figcaption>수정 후</figcaption></figure></div>
+            <div class="solution-crop-actions"><button id="applySolutionCrop" class="button primary" type="button">이 영역으로 바꾸고 타이핑</button><button id="cancelSolutionCrop" class="button" type="button">취소</button></div>
+            <p id="solutionCropStatus" role="status" aria-live="polite"></p>
+          </div>
+          </section>
+        </details>
+        <details id="solutionLinkDetails" class="solution-link-details">
+          <summary>해설 연결 설명</summary>
+          <p id="solutionLinkSummary"></p>
+          <ul id="solutionLinkEvidence"></ul>
+          <div class="solution-propagation">
+            <label class="solution-propagation-toggle">
+              <input id="solutionPropagationToggle" type="checkbox">
+              <span>같은 범위 해설 문항도 다시 확인</span>
+            </label>
+            <p id="solutionPropagationHelp" class="solution-propagation-help"></p>
+            <button id="previewSolutionPropagation" class="button" type="button">영향 미리 보기</button>
+            <div id="solutionPropagationPreview" class="solution-propagation-preview" hidden>
+              <strong id="solutionPropagationScope"></strong>
+              <p id="solutionPropagationCounts"></p>
+              <p>원격 AI 호출 0회</p>
+              <button id="applySolutionPropagation" class="button primary" type="button">이 해설 확정 + 같은 범위 재평가</button>
+            </div>
+          </div>
+          <details class="solution-feedback-advanced"><summary>검토 기록·고급 정보</summary><section id="solutionFeedbackPanel" class="solution-feedback" aria-labelledby="solutionFeedbackTitle" hidden>
+            <h3 id="solutionFeedbackTitle">검토 결과 기록</h3>
+            <p id="solutionFeedbackSource" class="solution-feedback-source"></p>
+            <label class="solution-feedback-part"><span>검토한 해설 영역</span><select id="solutionFeedbackPart"></select></label>
+            <label class="solution-feedback-attestation">
+              <input id="solutionFeedbackAttested" type="checkbox">
+              <span>표시된 문제와 해설 원본을 직접 비교해, 아래 항목을 검토했습니다.</span>
+            </label>
+            <p id="solutionFeedbackHelp" class="solution-feedback-help"></p>
+            <div class="solution-feedback-actions">
+              <button id="solutionFeedbackCorrect" class="button primary" type="button">이 후보가 맞음</button>
+              <button id="solutionFeedbackReject" class="button" type="button">이 후보 아님</button>
+            </div>
+            <details class="solution-feedback-crop-advanced"><summary>고급 정보: 좌표 기록</summary><fieldset class="solution-feedback-crop">
+              <legend>해설 영역 조정</legend>
+              <label><span>왼쪽</span><input id="solutionFeedbackLeft" type="number" min="0" max="1" step="0.001" inputmode="decimal"></label>
+              <label><span>위</span><input id="solutionFeedbackTop" type="number" min="0" max="1" step="0.001" inputmode="decimal"></label>
+              <label><span>오른쪽</span><input id="solutionFeedbackRight" type="number" min="0" max="1" step="0.001" inputmode="decimal"></label>
+              <label><span>아래</span><input id="solutionFeedbackBottom" type="number" min="0" max="1" step="0.001" inputmode="decimal"></label>
+              <button id="solutionFeedbackCrop" class="button" type="button">좌표 기록 저장</button>
+            </fieldset></details>
+            <fieldset class="solution-feedback-correction">
+              <legend>단원·번호 정정</legend>
+              <label><span>표제 역할</span><select id="solutionFeedbackHeading"><option value="heading">표제</option><option value="body">본문</option><option value="continuation">이전 표제의 이어짐</option></select></label>
+              <button id="solutionFeedbackSaveHeading" class="button" type="button">표제 역할 저장</button>
+              <label><span>해설 원본 번호</span><input id="solutionFeedbackAliasValue" type="text" maxlength="100" autocomplete="off"></label>
+              <button id="solutionFeedbackAlias" class="button" type="button">번호 정정 저장</button>
+            </fieldset>
+            <p id="solutionFeedbackSync" class="solution-feedback-sync" aria-live="polite"></p>
+          </section></details>
+        </details>
+
+        <details id="editorWorkbench" class="editor-workbench">
+          <summary><span id="editorWorkbenchTitle" role="heading" aria-level="3" tabindex="-1">편집 작업대</span><span id="activeEditSection" class="active-edit-section"></span></summary>
+        <section class="content-overview" aria-label="문제와 해설 입력 상태">
+          <div class="section-tabs" role="tablist" aria-label="확인할 내용">
+            <button id="questionTab" role="tab" type="button" aria-selected="true" aria-controls="sourceView ocrContentView structurePreview" data-section="question">
+              <span>문제</span>
+              <strong id="questionOcrValue">확인 중</strong>
+              <small id="questionOcrSummary"></small>
+            </button>
+            <button id="explanationTab" role="tab" type="button" aria-selected="false" aria-controls="sourceView ocrContentView structurePreview" data-section="explanation" tabindex="-1">
+              <span>해설</span>
+              <strong id="explanationOcrValue">확인 중</strong>
+              <small><span id="explanationOcrSummary"></span><span id="solutionLinkValue"></span></small>
+            </button>
+          </div>
+          <div class="answer-summary">
+            <span>저장된 정답</span>
+            <strong id="answerSummary">-</strong>
+          </div>
+        </section>
+
+
+
+        <div class="review-grid">
+          <section class="panel source-panel" aria-labelledby="sourceTitle">
+            <div class="panel-heading">
+              <h3 id="sourceTitle">문제 원본</h3>
+              <div class="source-controls">
+                <label class="overlay-toggle" for="overlayToggle">
+                  <input id="overlayToggle" type="checkbox" checked>
+                  <span>영역 표시</span>
+                </label>
+              </div>
+            </div>
+            <label class="sr-only" for="sourceAssetSelect">원본 이미지 선택</label>
+            <select id="sourceAssetSelect" class="source-asset-select" aria-label="원본 이미지 선택" hidden></select>
+            <div id="sourceView" class="source-view" role="tabpanel" aria-labelledby="questionTab">
+              <div id="sourceCanvas" class="source-canvas" hidden>
+                <img id="sourceImage" alt="">
+                <div id="sourceOverlayLayer" class="source-overlay-layer" aria-label="글자 인식 영역" aria-describedby="bboxEditHelp"></div>
+              </div>
+              <div id="sourcePlaceholder" class="source-placeholder">
+                <strong>원본 이미지를 찾을 수 없습니다.</strong>
+                <span></span>
+              </div>
+            </div>
+            <p id="sourceAssetLabel" class="asset-label"></p>
+            <details class="area-edit-tools">
+              <summary>인식 영역 수정</summary>
+              <p id="bboxEditHelp" class="bbox-edit-help">영역을 선택한 뒤 방향키로 이동하고 Shift와 방향키로 크기를 조절할 수 있습니다.</p>
+              <p id="bboxEditStatus" class="bbox-edit-status" role="status" aria-live="polite"></p>
+            </details>
+            <section id="figureReviewPanel" class="figure-review" aria-labelledby="figureReviewTitle" hidden>
+              <div class="figure-review-heading">
+                <div>
+                  <h4 id="figureReviewTitle">그림 검수</h4>
+                  <p id="figureReviewSummary"></p>
+                </div>
+              </div>
+              <div id="figureVariantList" class="figure-variant-list"></div>
+            </section>
+          </section>
+
+          <section class="panel editor-panel" aria-labelledby="editorTitle">
+            <div class="panel-heading">
+              <div>
+                <h3 id="editorTitle">문제 타이핑 결과</h3>
+                <p>원본에서 인식한 내용을 확인하고 필요한 부분만 수정하세요.</p>
+              </div>
+              <div class="editor-view-actions">
+                <div class="tabs" aria-label="보기 방식">
+                  <button id="contentViewTab" type="button" aria-pressed="true">일반 보기</button>
+                  <button id="jsonViewTab" type="button" aria-pressed="false">기술 정보</button>
+                </div>
+                <button id="formatJson" class="text-button" type="button" hidden>형식 정리</button>
+              </div>
+            </div>
+            <div id="ocrContentView" class="simple-editor">
+              <section class="block-editor" aria-labelledby="blockEditorTitle">
+                <div class="simple-editor-heading">
+                  <h4 id="blockEditorTitle">선택한 내용</h4>
+                  <span id="selectedBlockLabel">선택 안 됨</span>
+                </div>
+                <div id="blockEditorFields"></div>
+                <p id="blockEditorEmpty" class="empty-note">원본 영역이나 전체 타이핑 결과에서 수정할 내용을 선택하세요.</p>
+              </section>
+              <section id="answerEditor" class="answer-editor" aria-labelledby="answerEditorTitle">
+                <div class="simple-editor-heading">
+                  <h4 id="answerEditorTitle">정답</h4>
+                  <span id="answerKindLabel">미입력</span>
+                </div>
+                <div id="answerEditorFields"></div>
+              </section>
+            </div>
+            <label class="sr-only" for="jsonEditor">문항 기술 정보 편집기</label>
+            <textarea id="jsonEditor" class="json-editor" spellcheck="false" autocapitalize="off" autocomplete="off" hidden></textarea>
+            <p id="editorError" class="field-error" role="alert"></p>
+          </section>
+
+          <section class="panel preview-panel" aria-labelledby="previewTitle">
+            <div class="panel-heading">
+              <div>
+                <h3 id="previewTitle">문제 미리보기</h3>
+                <p>원본 구성에 가깝게 읽을 수 있도록 보여 줍니다.</p>
+              </div>
+            </div>
+            <div id="structurePreview" class="structure-preview"></div>
+          </section>
+        </div>
+
+        </details>
+
+        <details class="project-summary-details">
+          <summary>프로젝트 상태 요약</summary>
+        <section class="review-queue" aria-labelledby="reviewQueueTitle">
+          <div class="review-queue-copy">
+            <div>
+              <h3 id="reviewQueueTitle">프로젝트 요약</h3>
+              <p id="reviewQueueStatus">문항 상태를 집계하는 중입니다.</p>
+            </div>
+            <dl class="review-counts" aria-label="검수 문항 수">
+              <div><dt>문제 입력</dt><dd id="reviewApproved">0</dd></div>
+              <div><dt>해설 입력</dt><dd id="reviewTotal">0</dd></div>
+              <div><dt>수정 필요</dt><dd id="reviewNeeded">0</dd></div>
+            </dl>
+          </div>
+          <progress id="reviewProgress" value="0" max="1" aria-label="해설 입력 진행률" hidden>0%</progress>
+          <div class="review-queue-actions">
+            <button id="nextReviewItem" class="button" type="button">다음 수정 필요 문항</button>
+            <button id="approveNextItem" class="button" type="button" hidden>이대로 확인하고 다음</button>
+          </div>
+        </section>
+        </details>
+
+        <div class="lower-grid">
+          <section id="candidatePanel" class="panel candidate-panel" aria-labelledby="candidateTitle" hidden>
+            <div class="panel-heading">
+              <div>
+                <h3 id="candidateTitle">새 OCR 결과</h3>
+                <p>현재 내용과 새로 인식한 결과를 비교합니다.</p>
+              </div>
+            </div>
+            <div id="candidateEmpty" class="empty-state">새 결과가 없습니다.</div>
+            <div id="candidateCompare" class="candidate-compare" hidden>
+              <div><h4>현재 내용</h4><pre id="candidateCurrent"></pre></div>
+              <div><h4>새 결과</h4><pre id="candidateProposed"></pre></div>
+            </div>
+            <button id="applyCandidate" class="button primary" type="button" hidden>새 결과로 바꾸기</button>
+          </section>
+
+          <section id="issuesPanel" class="panel issues-panel" aria-labelledby="issuesTitle">
+            <div class="panel-heading">
+              <div>
+                <h3 id="issuesTitle">확인할 내용</h3>
+                <p id="issueSummary"></p>
+              </div>
+            </div>
+            <ul id="issueList" class="issue-list"></ul>
+            <div id="issuesEmpty" class="empty-state">확인할 내용이 없습니다.</div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <main id="bankView" class="bank-page" aria-labelledby="bankTitle" tabindex="-1" hidden>
+    <header class="bank-page-heading">
+      <div>
+        <h2 id="bankTitle">통합 문제은행</h2>
+        <p>모든 PDF에서 저장한 문항을 태그로 찾아 문제지에 담습니다.</p>
+      </div>
+      <button id="createSetFromBank" class="button" type="button">새 문제지</button>
+    </header>
+    <button id="bankClassificationToggle" class="button bank-classification-toggle" type="button" aria-controls="bankClassification" aria-expanded="false" hidden>분류 필터 펼치기</button>
+    <div class="bank-layout">
+      <aside id="bankClassification" class="bank-classification" aria-label="문항 분류">
+        <p class="bank-filter-help">같은 분류는 OR, 서로 다른 분류는 AND입니다. 미분류 문항도 따로 찾을 수 있습니다.</p>
+        <section class="bank-filter-group" aria-labelledby="bankUnitTitle">
+          <h3 id="bankUnitTitle">단원</h3>
+          <label><span>과목 · 여러 항목은 OR</span><select id="bankSubjectFilter" multiple size="3" aria-label="과목 필터"></select></label>
+          <label><span>단원 · 여러 항목은 OR</span><select id="bankUnitFilter" multiple size="4" aria-label="단원 필터"></select></label>
+        </section>
+        <section class="bank-filter-group" aria-labelledby="bankSourceTitle">
+          <h3 id="bankSourceTitle">출처</h3>
+          <label><span>문제집·파일 · 여러 항목은 OR</span><select id="bankSourceFilter" multiple size="4" aria-label="출처 필터"></select></label>
+        </section>
+        <section class="bank-filter-group" aria-labelledby="bankPersonalTitle">
+          <h3 id="bankPersonalTitle">나만의 분류</h3>
+          <label><span>난이도 · 여러 항목은 OR</span>
+            <select id="bankDifficultyFilter" multiple size="4" aria-label="난이도 필터"></select>
+          </label>
+          <label><span>문제 유형 · 여러 항목은 OR</span><select id="bankProblemTypesFilter" multiple size="4" aria-label="문제 유형 필터"></select></label>
+          <label><span>핵심어 · 여러 항목은 OR</span><select id="bankKeywordsFilter" multiple size="4" aria-label="핵심어 필터"></select></label>
+          <label><span>문제 특징 · 여러 항목은 OR</span><select id="bankFeatureFilter" multiple size="4" aria-label="문제 특징 필터"></select></label>
+        </section>
+        <section class="bank-filter-group" aria-labelledby="bankFigureStatusTitle">
+          <h3 id="bankFigureStatusTitle">그림 재생성 상태</h3>
+          <label><span>상태</span>
+            <select id="bankFigureStatusFilter" multiple size="4" aria-label="그림 재생성 상태 필터">
+              <option value="has_regenerated">재생성 후보 있음</option>
+              <option value="missing_regeneration">미재생성 그림 있음</option>
+              <option value="selected_regenerated">재생성 그림 사용 중</option>
+              <option value="needs_review">확인 필요</option>
+              <option value="no_figure">그림 없음</option>
+            </select>
+          </label>
+        </section>
+      </aside>
+      <section class="bank-results" aria-label="문제은행 검색 결과">
+        <div class="bank-search-tabs" role="tablist" aria-label="저장된 검색">
+          <div id="bankSearchTabs" class="bank-search-tab-list"></div>
+          <button id="newBankSearch" class="button" type="button">새 검색</button>
+        </div>
+        <div class="bank-search-row">
+          <label for="bankSearch">키워드</label>
+          <input id="bankSearch" type="search" placeholder="문항 내용·단원·출처·태그 검색">
+          <label for="bankNumberSearch">원본 번호</label>
+          <input id="bankNumberSearch" type="search" placeholder="예: A05, Ⅱ01">
+          <button id="refreshBank" class="icon-button" type="button" aria-label="문제은행 새로고침" title="새로고침">↻</button>
+        </div>
+        <div id="bankConditionChips" class="bank-condition-chips" aria-label="적용된 조건"></div>
+        <button id="resetBankSearch" class="text-button" type="button">조건 초기화</button>
+        <section class="bank-figure-actions" aria-label="선택 문항 작업">
+          <strong id="bankSelectionCount" aria-live="polite" aria-atomic="true">0개 선택</strong>
+          <button id="clearBankSelection" class="button" type="button">선택 해제</button>
+          <label for="bankTargetSet">담을 문제지</label>
+          <select id="bankTargetSet" aria-label="문항을 담을 문제지"></select>
+          <button id="addSelectedBankItems" class="button primary" type="button">선택 문항 담기</button>
+          <button id="regenerateSelectedFigures" class="button" type="button" disabled>그림 재생성</button>
+          <button id="deleteSelectedBankItems" class="button" type="button" disabled>삭제</button>
+          <a id="bankSavedSetLink" href="/?view=sets">내 문제지 0개</a>
+          <span id="bankSelectionStatus" role="status" aria-live="polite" aria-atomic="true"></span>
+        </section>
+        <div class="bank-toolbar">
+          <div class="bank-summary"><strong id="bankCount">0</strong><span id="bankRange">문항</span></div>
+          <span id="bankSimilarityNotice" class="bank-similarity-notice" hidden>유사도 미확인 문항 포함</span>
+          <button id="selectBankPage" class="button" type="button">현재 페이지 전체 선택</button>
+          <div class="bank-quick-select" aria-label="현재 페이지 빠른 선택">
+            <button class="button" type="button" data-bank-quick-select="5">+5</button>
+            <button class="button" type="button" data-bank-quick-select="10">+10</button>
+            <button class="button" type="button" data-bank-quick-select="20">+20</button>
+          </div>
+          <label for="bankPageSize">한 페이지</label>
+          <select id="bankPageSize"><option>20</option><option>50</option><option>100</option></select>
+          <label for="bankSort">정렬</label>
+          <select id="bankSort"><option value="original">원래 순서</option><option value="latest">최신순</option><option value="number">원본 번호순</option></select>
+        </div>
+        <p id="bankLoadStatus" class="bank-load-status" role="status" aria-live="polite" hidden></p>
+        <p id="bankEmpty" class="empty-state" role="status" aria-live="polite">문제은행을 불러오는 중입니다.</p>
+        <section id="bankList" class="bank-grid" aria-label="문제은행 문항 목록"></section>
+        <nav class="bank-pagination" aria-label="검색 결과 페이지 이동">
+          <button id="bankPreviousPage" class="button" type="button">이전</button>
+          <span id="bankPageStatus" aria-live="polite">1 / 1</span>
+          <button id="bankNextPage" class="button" type="button">다음</button>
+        </nav>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="bankReadDialog" class="bank-read-dialog" aria-labelledby="bankReadOnlyTitle">
+    <button id="closeBankReadDialog" class="button bank-read-close" type="button" aria-label="문항 읽기 닫기">닫기 ×</button>
+  </dialog>
+
+  <div id="setsView" class="sets-shell" hidden>
+    <aside class="sets-sidebar" aria-label="저장된 문제지">
+      <div class="section-heading">
+        <h2>내 문제지</h2>
+        <button id="createQuestionSet" class="button" type="button">새 문제지</button>
+      </div>
+      <p id="setsEmpty" class="empty-note">저장된 문제지가 없습니다.</p>
+      <ul id="questionSetList" class="nav-list" aria-label="문제지 목록"></ul>
+    </aside>
+    <main id="setWorkspace" class="set-workspace" tabindex="-1">
+      <section id="setWelcome" class="welcome-panel">
+        <h2>문제지를 선택하세요</h2>
+        <p>문제은행에서 고른 문항의 순서를 바꾸고 HWPX를 만들 수 있습니다.</p>
+      </section>
+      <section id="setEditor" hidden>
+        <header class="set-editor-heading">
+          <label for="setTitle"><span>문제지 이름</span><input id="setTitle" type="text" maxlength="120"></label>
+          <div class="set-editor-actions">
+            <button id="saveQuestionSet" class="button" type="button">저장</button>
+            <button id="buildQuestionSetHwpx" class="button primary" type="button">HWPX 만들기</button>
+          </div>
+        </header>
+        <fieldset class="output-mode-options">
+          <legend>해설 출력 방식</legend>
+          <label class="output-mode-card">
+            <input type="radio" name="setOutputMode" value="separate">
+            <strong>문제·해설 따로</strong>
+            <span>학생용 문제지와 해설지를 별도 파일로 만듭니다.</span>
+          </label>
+          <label class="output-mode-card">
+            <input type="radio" name="setOutputMode" value="combined_end_section">
+            <strong>한 파일·미주 해설</strong>
+            <span>각 문제 번호와 연결된 미주에 답과 풀이를 넣습니다.</span>
+          </label>
+        </fieldset>
+        <section class="document-entry" aria-labelledby="documentEntryTitle">
+          <h3 id="documentEntryTitle">문서 편집</h3>
+          <p id="documentEntryStatus">저장된 문제지로 독립 문서를 만들어 편집합니다. 문서 PDF/HWPX 출력은 준비 중이며 기존 문제지 HWPX는 계속 사용할 수 있습니다.</p>
+          <div class="set-editor-actions">
+            <button id="createDocument" class="button" type="button" disabled aria-describedby="documentEntryStatus" data-create-endpoint="/api/documents">선택 문제지로 문서 만들기</button>
+            <a class="button" href="/document.html">저장된 문서</a>
+          </div>
+          <details class="technical-info"><summary>문서 연결 기술 정보</summary><pre id="documentEntryPayload"></pre></details>
+        </section>
+        <section class="set-order-section" aria-labelledby="setOrderTitle">
+          <div class="section-heading">
+            <h3 id="setOrderTitle">출제 순서</h3>
+            <span id="setItemCount" class="count">0</span>
+          </div>
+          <p id="setItemsEmpty" class="empty-state">문제은행에서 문항을 추가하세요.</p>
+          <ol id="setItemList" class="set-item-list" aria-label="선택 문항 순서"></ol>
+          <p id="setOrderAnnouncement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+        </section>
+        <section id="setBuildResult" class="hwpx-build-result set-build-result" aria-live="polite" hidden>
+          <p id="setBuildStatus"></p>
+          <ul id="setBuildChecks" class="hwpx-build-checks"></ul>
+          <div id="setDownloadLinks" class="hwpx-download-links"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div id="appMessage" class="app-message" role="status" aria-live="polite" aria-atomic="true"></div>
+  <details id="requestDiagnostics" class="technical-info request-diagnostics" hidden><summary>요청 오류 기술 정보</summary><pre id="requestDiagnosticText"></pre></details>
+</body>
+</html>

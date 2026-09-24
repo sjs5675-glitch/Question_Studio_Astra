@@ -1,0 +1,5 @@
+html, body { margin: 0; padding: 0; background: white; }
+#document-print-root { margin: 0; padding: 0; }
+#document-print-root .document-layout-page { margin: 0; box-shadow: none; break-after: page; break-inside: avoid; }
+#document-print-root .document-layout-page:last-child { break-after: auto; }
+@page { margin: 0; }

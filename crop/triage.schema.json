@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pages", "warnings"],
+  "properties": {
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "page_number",
+          "page_type",
+          "has_student_questions",
+          "rotation_correction",
+          "confidence"
+        ],
+        "properties": {
+          "page_number": {"type": "integer", "minimum": 1},
+          "page_type": {
+            "type": "string",
+            "enum": [
+              "problem",
+              "mixed_problem_and_concept",
+              "problem_with_inline_solution",
+              "shared_material_only",
+              "excluded_drill",
+              "concept_only",
+              "solution",
+              "answer_key",
+              "cover",
+              "table_of_contents",
+              "advertisement",
+              "blank",
+              "other"
+            ]
+          },
+          "has_student_questions": {"type": "boolean"},
+          "rotation_correction": {"type": "integer", "enum": [0, 90, 180, 270]},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

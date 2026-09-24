@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://question-json-studio.local/schemas/project.schema.json",
+  "title": "Question JSON Studio project",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_id",
+    "language",
+    "workflow",
+    "metadata",
+    "item_order",
+    "groups",
+    "rendering",
+    "export"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "0.1.0"
+    },
+    "project_id": {
+      "$ref": "#/$defs/id"
+    },
+    "provider_profile": {
+      "enum": ["full", "codex_only"]
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "revision", "created_at", "updated_at"],
+      "properties": {
+        "status": {
+          "enum": ["source_only", "content_working", "content_ready", "export_ready"]
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "year",
+        "semester",
+        "exam_type",
+        "school",
+        "school_level",
+        "grade",
+        "subject",
+        "filename_base"
+      ],
+      "properties": {
+        "year": {"$ref": "#/$defs/nonempty_or_null"},
+        "semester": {"$ref": "#/$defs/nonempty_or_null"},
+        "exam_type": {"$ref": "#/$defs/nonempty_or_null"},
+        "school": {"$ref": "#/$defs/nonempty_or_null"},
+        "school_level": {"$ref": "#/$defs/nonempty_or_null"},
+        "grade": {"$ref": "#/$defs/nonempty_or_null"},
+        "subject": {"$ref": "#/$defs/nonempty_or_null"},
+        "filename_base": {"$ref": "#/$defs/nonempty_or_null"},
+        "range": {"type": ["string", "null"]},
+        "publisher": {"type": ["string", "null"]},
+        "book_title": {"type": ["string", "null"]},
+        "book_volume": {"type": ["string", "null"]},
+        "book_type": {"type": ["string", "null"]}
+      }
+    },
+    "item_order": {
+      "type": "array",
+      "minItems": 0,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/id"
+      }
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/group"
+      }
+    },
+    "source_import": {
+      "oneOf": [
+        {"$ref": "#/$defs/source_import"},
+        {"type": "null"}
+      ]
+    },
+    "source_reconciliation": {
+      "oneOf": [
+        {"$ref": "#/$defs/source_reconciliation"},
+        {"type": "null"}
+      ]
+    },
+    "rendering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_design_profile_ref", "explanation_design_profile_ref"],
+      "properties": {
+        "question_design_profile_ref": {
+          "oneOf": [
+            {"$ref": "#/$defs/safe_path"},
+            {"type": "null"}
+          ]
+        },
+        "explanation_design_profile_ref": {
+          "oneOf": [
+            {"$ref": "#/$defs/safe_path"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "renderer",
+        "output_mode",
+        "shared_item_policy",
+        "include_answers",
+        "include_explanations",
+        "engine_id",
+        "engine_fingerprint_sha256"
+      ],
+      "properties": {
+        "renderer": {
+          "enum": ["native_ordered", "legacy_compatible"]
+        },
+        "output_mode": {
+          "const": "separate_hwpx"
+        },
+        "shared_item_policy": {
+          "const": "explicit_item_order"
+        },
+        "include_answers": {
+          "type": "boolean"
+        },
+        "include_explanations": {
+          "type": "boolean"
+        },
+        "engine_id": {
+          "type": ["string", "null"]
+        },
+        "engine_fingerprint_sha256": {
+          "oneOf": [
+            {"$ref": "#/$defs/sha256"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "nonempty_or_null": {
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "null"}
+      ]
+    },
+    "safe_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*:)(?!.*\\\\)(?!.*//)(?!\\.\\.?/)(?!.*\\/\\.\\.?\\/)(?!.*\\/\\.\\.?$).+$"
+    },
+    "group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_id", "label", "shared_item_id", "member_item_ids"],
+      "properties": {
+        "group_id": {
+          "$ref": "#/$defs/id"
+        },
+        "label": {
+          "type": ["string", "null"]
+        },
+        "shared_item_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/id"},
+            {"type": "null"}
+          ]
+        },
+        "member_item_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "source_import_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "relative_path", "sha256", "schema_version"],
+      "properties": {
+        "role": {
+          "enum": ["manifest", "detection", "ensemble", "link_manifest"]
+        },
+        "relative_path": {
+          "$ref": "#/$defs/safe_path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "schema_version": {
+          "type": ["string", "number", "null"]
+        }
+      }
+    },
+    "source_import": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["leaf_run_id", "fingerprint_sha256", "imported_at", "source_files"],
+      "properties": {
+        "leaf_run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fingerprint_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "imported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/source_import_file"
+          }
+        }
+      }
+    },
+    "source_reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "crop_job_id",
+        "leaf_run_id",
+        "manifest_sha256",
+        "current_link_manifest_sha256",
+        "revision",
+        "applied_at"
+      ],
+      "properties": {
+        "crop_job_id": {
+          "$ref": "#/$defs/id"
+        },
+        "leaf_run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "current_link_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "applied_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "question_id",
+    "candidate_ids",
+    "candidate_role",
+    "decision",
+    "same_question",
+    "anchor_segment_match",
+    "hierarchy_scope_match",
+    "parent_number_match",
+    "subquestion_match",
+    "range_or_group_match",
+    "monotonic_order_match",
+    "fingerprint_match",
+    "candidate_crop_complete",
+    "target_identifier_visible",
+    "target_answer_visible",
+    "first_line_complete",
+    "last_line_complete",
+    "neighbor_entry_absent",
+    "next_question_absent",
+    "explicit_answer_conflict",
+    "evidence",
+    "review_reasons",
+    "confidence"
+  ],
+  "properties": {
+    "question_id": {"type": "string", "minLength": 1},
+    "candidate_ids": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "candidate_role": {
+      "type": "string",
+      "enum": ["quick_answer", "detailed_solution", "mixed"]
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["verified", "review", "wrong_link", "conflict"]
+    },
+    "same_question": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+    "anchor_segment_match": {"$ref": "#/$defs/comparison_state"},
+    "hierarchy_scope_match": {"$ref": "#/$defs/comparison_state"},
+    "parent_number_match": {"$ref": "#/$defs/comparison_state"},
+    "subquestion_match": {"$ref": "#/$defs/comparison_state"},
+    "range_or_group_match": {"$ref": "#/$defs/comparison_state"},
+    "monotonic_order_match": {"$ref": "#/$defs/comparison_state"},
+    "fingerprint_match": {"$ref": "#/$defs/comparison_state"},
+    "candidate_crop_complete": {"type": "boolean"},
+    "target_identifier_visible": {"type": "boolean"},
+    "target_answer_visible": {"type": "string", "enum": ["yes", "no", "not_applicable"]},
+    "first_line_complete": {"type": "boolean"},
+    "last_line_complete": {"type": "boolean"},
+    "neighbor_entry_absent": {"type": "boolean"},
+    "next_question_absent": {"type": "boolean"},
+    "explicit_answer_conflict": {"type": "boolean"},
+    "evidence": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "review_reasons": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  },
+  "$defs": {
+    "comparison_state": {
+      "type": "string",
+      "enum": ["match", "mismatch", "unknown", "not_applicable"]
+    }
+  }
+}

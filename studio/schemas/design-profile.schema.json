@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://question-json-studio.local/schemas/design-profile.schema.json",
+  "title": "Question JSON Studio approved HWPX design profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "document_kind",
+    "approval",
+    "template",
+    "design"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "0.1.0"},
+    "profile_id": {"$ref": "#/$defs/id"},
+    "document_kind": {"enum": ["question", "explanation"]},
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviewer", "approved_at"],
+      "properties": {
+        "status": {"enum": ["draft", "approved", "rejected"]},
+        "reviewer": {"type": ["string", "null"]},
+        "approved_at": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "approved"}}, "required": ["status"]},
+          "then": {
+            "properties": {
+              "reviewer": {"type": "string", "minLength": 1},
+              "approved_at": {"type": "string", "format": "date-time"}
+            }
+          }
+        }
+      ]
+    },
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "path", "sha256"],
+      "properties": {
+        "source": {"const": "user_approved_clean_hwpx"},
+        "path": {"$ref": "#/$defs/hwpx_path"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "design": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["page", "columns", "flow", "styles"],
+      "properties": {
+        "page": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width_mm", "height_mm", "orientation", "margins_mm"],
+          "properties": {
+            "width_mm": {"type": "number", "exclusiveMinimum": 0},
+            "height_mm": {"type": "number", "exclusiveMinimum": 0},
+            "orientation": {"enum": ["portrait", "landscape"]},
+            "margins_mm": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["top", "right", "bottom", "left"],
+              "properties": {
+                "top": {"type": "number", "minimum": 0},
+                "right": {"type": "number", "minimum": 0},
+                "bottom": {"type": "number", "minimum": 0},
+                "left": {"type": "number", "minimum": 0}
+              }
+            }
+          }
+        },
+        "columns": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "gap_mm", "mixed_columns"],
+          "properties": {
+            "count": {"type": "integer", "minimum": 1, "maximum": 2},
+            "gap_mm": {"type": "number", "minimum": 0},
+            "mixed_columns": {"const": false}
+          }
+        },
+        "flow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "section_count",
+            "mode",
+            "figure_placement",
+            "choice_layout",
+            "unsupported_table",
+            "page_break_between_items"
+          ],
+          "properties": {
+            "section_count": {"const": 1},
+            "mode": {"const": "natural"},
+            "figure_placement": {"const": "inline"},
+            "choice_layout": {"enum": ["vertical", "source"]},
+            "unsupported_table": {"enum": ["error", "approved_raster_fallback"]},
+            "page_break_between_items": {"type": "boolean"}
+          }
+        },
+        "styles": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "minLength": 1},
+          "required": ["paragraph", "equation", "choice", "figure_caption"]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "safe_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*:)(?!.*\\\\)(?!.*//)(?!\\.\\.?/)(?!.*\\/\\.\\.?\\/)(?!.*\\/\\.\\.?$).+$"
+    },
+    "hwpx_path": {
+      "allOf": [
+        {"$ref": "#/$defs/safe_path"},
+        {"pattern": "^.+\\.[Hh][Ww][Pp][Xx]$"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "astra-document-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "build": "node build-document.mjs", "pilot": "node scripts/document-pilot.mjs" },
+  "dependencies": {
+    "@tiptap/core": "3.31.3",
+    "@tiptap/pm": "3.31.3",
+    "@tiptap/starter-kit": "3.31.3",
+    "mathlive": "0.110.0",
+    "katex": "0.18.1",
+    "@fontsource/noto-sans-kr": "5.3.0",
+    "@fontsource/noto-serif-kr": "5.3.0",
+    "playwright-core": "1.63.0"
+  },
+  "devDependencies": { "esbuild": "0.28.2" }
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": "0.1.0",
+  "template_id": "neutral-a4-v1",
+  "file": "neutral-a4-v1.hwpx",
+  "sha256": "f65d25302078b566ef0a456afc88d95adcf3ceccc700b9d434823297795aaf2e",
+  "size_bytes": 9351,
+  "source": {
+    "mechanics": "exam-studio-multi",
+    "resources": {
+      "content_hpf_template.xml": "be7306894a184b84322bd27170d053332f2d843836bbc4fbf11d6b78e8dd9e69",
+      "Contents/header.xml": "ac5dd8ae1d007af98138f7f76a3877362d81980139604d53ccde4f927381344c",
+      "META-INF/container.rdf": "0cfd814c20595c841e48e62fbf7591829f13c177fa92af634c8199f85ecf3a89",
+      "META-INF/container.xml": "5109d3a9249ec1058177fedab574c5d9616058aa92ebefcd33249ebb36a20f61",
+      "META-INF/manifest.xml": "2b4b155c1bb6a9ccc212fef113c4831d2f558e67cf1260eb314ce54f26fd32ea",
+      "mimetype": "5ab5230b5af04f78947736bf8dd1a269aa684e234f7f4a392efb85289d1655c2",
+      "settings.xml": "c3a0adfa3d84438d32c4a5f7421b48e7a4491920fd20458e2ffe986a1a208536",
+      "version.xml": "900bdc34373ebe803f3cca19830a0e11a96841fed4a829714f30a9758e64d8d5"
+    },
+    "copied_visible_body": false,
+    "copied_base_bindata": false
+  },
+  "design": {
+    "paper": "A4",
+    "orientation": "portrait",
+    "columns": 1,
+    "margins_mm": {
+      "left": 20,
+      "right": 20,
+      "top": 18,
+      "bottom": 18
+    },
+    "named_styles": [
+      "neutral-paragraph",
+      "neutral-equation",
+      "neutral-choice",
+      "neutral-figure-caption"
+    ]
+  },
+  "policy": {
+    "empty_sections": 1,
+    "bindata": false,
+    "svg": false,
+    "endnotes": false,
+    "macros": false,
+    "solver": false,
+    "page_numbering_added_by_renderer": true
+  }
+}

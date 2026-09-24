@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "astra://solution-learning/run-snapshot-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_id", "run_id", "corpus_epoch", "retriever_version", "profiles", "examples", "created_at", "snapshot_sha"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "snapshot_id": {"type": "string", "minLength": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "corpus_epoch": {"type": "integer", "minimum": 0},
+    "retriever_version": {"type": "string", "minLength": 1},
+    "profiles": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer", "minimum": 1}], "items": false}},
+    "examples": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer", "minimum": 1}, {"$ref": "#/$defs/sha256"}], "items": false}},
+    "created_at": {"type": "string", "format": "date-time"},
+    "snapshot_sha": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

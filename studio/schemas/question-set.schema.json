@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://question-json-studio.local/schemas/question-set.schema.json",
+  "title": "Question JSON Studio question set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "set_id",
+    "title",
+    "revision",
+    "output_mode",
+    "items",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": "0.1.0"},
+    "set_id": {
+      "type": "string",
+      "pattern": "^set-[A-Za-z0-9][A-Za-z0-9._-]{0,123}$"
+    },
+    "title": {"type": "string", "minLength": 1, "maxLength": 200},
+    "revision": {"type": "integer", "minimum": 1},
+    "output_mode": {"enum": ["separate", "combined_end_section"]},
+    "items": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/item_ref"}
+    },
+    "rendering": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["template_ref", "design_profile_ref"],
+      "properties": {
+        "template_ref": {"$ref": "#/$defs/safe_path_or_null"},
+        "design_profile_ref": {"$ref": "#/$defs/safe_path_or_null"}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "updated_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "safe_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*:)(?!.*\\\\)(?!.*//)(?!\\.\\.?/)(?!.*\\/\\.\\.?\\/)(?!.*\\/\\.\\.?$).+$"
+    },
+    "safe_path_or_null": {
+      "oneOf": [
+        {"$ref": "#/$defs/safe_path"},
+        {"type": "null"}
+      ]
+    },
+    "item_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "item_id", "source_revision"],
+      "properties": {
+        "project_id": {"$ref": "#/$defs/id"},
+        "item_id": {"$ref": "#/$defs/id"},
+        "source_revision": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

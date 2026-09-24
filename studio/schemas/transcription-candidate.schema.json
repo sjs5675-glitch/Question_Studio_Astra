@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://question-json-studio.local/schemas/transcription-candidate.schema.json",
+  "title": "Exam crop transcription candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "section",
+    "blocks",
+    "answer",
+    "coverage_complete",
+    "ignored_regions",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "section": {"enum": ["question", "answer", "explanation"]},
+    "blocks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/block"}
+    },
+    "answer": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "choice_labels", "runs", "true_false"],
+          "properties": {
+            "kind": {"enum": ["choice", "content", "true_false", "unknown"]},
+            "choice_labels": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "runs": {
+              "type": "array",
+              "items": {"$ref": "#/$defs/run"}
+            },
+            "true_false": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["label", "value"],
+                "properties": {
+                  "label": {"type": "string"},
+                  "value": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "coverage_complete": {"type": "boolean"},
+    "ignored_regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bbox", "reason"],
+        "properties": {
+          "bbox": {"$ref": "#/$defs/bbox"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "$defs": {
+    "bbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["left", "top", "right", "bottom"],
+      "properties": {
+        "left": {"type": "number", "minimum": 0, "maximum": 1},
+        "top": {"type": "number", "minimum": 0, "maximum": 1},
+        "right": {"type": "number", "minimum": 0, "maximum": 1},
+        "bottom": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "text_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "text"],
+      "properties": {
+        "type": {"const": "text"},
+        "text": {"type": "string"},
+        "marks": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["underline"]}
+        }
+      }
+    },
+    "equation_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "source_text", "latex"],
+      "properties": {
+        "type": {"const": "equation"},
+        "source_text": {"type": "string"},
+        "latex": {"type": "string"}
+      }
+    },
+    "line_break_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {"type": {"const": "line_break"}}
+    },
+    "run": {
+      "oneOf": [
+        {"$ref": "#/$defs/text_run"},
+        {"$ref": "#/$defs/equation_run"},
+        {"$ref": "#/$defs/line_break_run"}
+      ]
+    },
+    "paragraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "role", "runs", "bbox", "confidence"],
+      "properties": {
+        "type": {"const": "paragraph"},
+        "role": {
+          "enum": ["stem", "instruction", "body", "answer", "explanation", "caption", "heading", "note"]
+        },
+        "runs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/run"}
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "figure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "role",
+        "figure_kind",
+        "regeneration_policy",
+        "bbox",
+        "labels",
+        "alt_text",
+        "regeneration_note",
+        "confidence"
+      ],
+      "properties": {
+        "type": {"const": "figure"},
+        "role": {"enum": ["main", "choice", "explanation", "table_image"]},
+        "figure_kind": {
+          "enum": ["diagram", "graph", "photo", "map", "circuit", "microscope", "table_image", "other"]
+        },
+        "regeneration_policy": {
+          "enum": ["original_only", "local_vector", "ai_allowed"]
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "bbox"],
+            "properties": {
+              "text": {"type": "string"},
+              "bbox": {"$ref": "#/$defs/bbox"}
+            }
+          }
+        },
+        "alt_text": {"type": "string"},
+        "regeneration_note": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "labeled_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "runs", "figure_bbox"],
+      "properties": {
+        "label": {"type": "string"},
+        "runs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/run"}
+        },
+        "figure_bbox": {
+          "oneOf": [
+            {"$ref": "#/$defs/bbox"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "bogi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "title", "title_visible", "items", "bbox", "confidence"],
+      "properties": {
+        "type": {"const": "bogi"},
+        "title": {"type": "string"},
+        "title_visible": {"type": "boolean"},
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/labeled_item"}
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "choices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "source_layout", "items", "bbox", "confidence"],
+      "properties": {
+        "type": {"const": "choices"},
+        "source_layout": {"enum": ["auto", "horizontal", "vertical", "grid"]},
+        "items": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/labeled_item"}
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "table_cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "row_span", "col_span", "runs"],
+      "properties": {
+        "role": {"enum": ["header", "body"]},
+        "row_span": {"type": "integer", "minimum": 1},
+        "col_span": {"type": "integer", "minimum": 1},
+        "runs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/run"}
+        }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "semantic_type", "column_count", "rows", "bbox", "confidence"],
+      "properties": {
+        "type": {"const": "table"},
+        "semantic_type": {
+          "enum": ["generic", "normal_distribution", "probability", "increase_decrease", "synthetic_division", "pascal", "choice_matrix"]
+        },
+        "column_count": {"type": "integer", "minimum": 1},
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/table_cell"}
+          }
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "box": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "role", "title", "runs", "items", "bbox", "confidence"],
+      "properties": {
+        "type": {"const": "box"},
+        "role": {"enum": ["passage", "condition", "experiment", "data", "note"]},
+        "title": {"type": ["string", "null"]},
+        "runs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/run"}
+        },
+        "items": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/labeled_item"}
+        },
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "block": {
+      "oneOf": [
+        {"$ref": "#/$defs/paragraph"},
+        {"$ref": "#/$defs/figure"},
+        {"$ref": "#/$defs/bogi"},
+        {"$ref": "#/$defs/choices"},
+        {"$ref": "#/$defs/table"},
+        {"$ref": "#/$defs/box"}
+      ]
+    }
+  }
+}
