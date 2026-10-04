@@ -1,0 +1,69 @@
+.astra-document #document-app { display: block; max-width: 1600px; padding: var(--s6); margin: 0 auto; }
+.astra-document .document-library { padding: var(--s3) var(--s4); margin-bottom: var(--s6); border: 1px solid var(--line); background: var(--surface); border-radius: var(--r-control); }
+.astra-document .document-library summary { cursor: pointer; font-size: var(--t-body); font-weight: 600; }
+.astra-document .document-library .button { width: auto; margin-top: var(--s3); }
+.astra-document #document-list { display: flex; flex-wrap: wrap; margin: var(--s3) 0; max-height: 220px; overflow: auto; }
+.astra-document .document-list-item { min-width: 180px; max-width: 320px; font-size: var(--t-label); }
+.astra-document .document-page-heading h1 { font-size: var(--t-title); margin-bottom: var(--s1); }
+.astra-document .document-page-heading p { color: var(--muted); margin-bottom: var(--s4); }
+.astra-document #document-status { font-size: var(--t-label); color: var(--muted); margin-bottom: var(--s3); }
+.astra-document .document-actions { gap: var(--s2); padding-bottom: var(--s4); margin-bottom: var(--s6); border-bottom: 1px solid var(--line); }
+.astra-document #document-save { background: var(--brand); color: var(--surface); border-color: var(--brand); }
+.astra-document #document-zip-download { color: var(--muted); }
+.astra-document .document-title-label { margin: 0 0 var(--s6); font-size: var(--t-label); }
+.astra-document #document-title { font-size: 1.25rem; padding: var(--s3) var(--s4); }
+.astra-document .document-editor-grid { display: grid; grid-template-columns: minmax(0,1fr) 304px; gap: var(--s6); align-items: start; }
+.astra-document .document-canvas-pane { min-width: 0; }
+.astra-document .document-formatbar { padding: var(--s3); margin: 0 0 var(--s4); gap: var(--s2); background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-control); align-items: end; }
+.astra-document .document-formatbar label { font-size: var(--t-small); }
+.astra-document .document-formatbar [data-mark] { width: 36px; min-height: 40px; padding: var(--s2); font-size: var(--t-body); }
+.astra-document .document-formatbar :is(input,select) { min-height: 36px; padding: var(--s1) var(--s2); font-size: var(--t-label); }
+.astra-document #document-font { min-width: 128px; max-width: 150px; }
+.astra-document .document-formatbar input { width: 68px; }
+.astra-document .document-canvas-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--s3); margin: var(--s4) 0; }
+.astra-document .document-canvas-heading h2 { margin: 0; font-size: var(--t-section); }
+.astra-document .document-help { font-size: var(--t-small); line-height: 1.6; color: var(--muted); }
+.astra-document #document-flow { padding: var(--s8); border: 0; border-radius: var(--r-control); box-shadow: var(--shadow); min-height: 600px; }
+.astra-document #document-flow .document-question { padding-bottom: var(--s6); margin-bottom: var(--s6); }
+.astra-document #document-flow .document-question > .document-label { color: var(--brand-dark); font-size: var(--t-label); }
+.astra-document #document-flow .document-move { gap: var(--s1); padding-top: var(--s2); }
+.astra-document #document-flow .document-move button { background: transparent; font-size: var(--t-small); min-height: 32px; }
+.astra-document .document-inspector { min-width: 0; background: var(--surface); padding: var(--s4); border: 1px solid var(--line); border-radius: var(--r-panel); }
+.astra-document .document-inspector > h2 { font-size: var(--t-section); margin: 0 0 var(--s1); }
+.astra-document .document-inspector > p { margin-bottom: var(--s4); }
+.astra-document .document-layout-controls { display: block; padding: 0; }
+.astra-document .inspector-group { padding: var(--s3) 0; border-top: 1px solid var(--line); }
+.astra-document .inspector-group > summary { cursor: pointer; min-height: 32px; color: var(--text); font-size: var(--t-body); font-weight: 600; }
+.astra-document .inspector-fields { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: var(--s3); padding-top: var(--s3); }
+.astra-document .inspector-fields > label { min-width: 0; font-size: var(--t-small); color: var(--muted); }
+.astra-document .inspector-fields :is(select,textarea,button) { width: 100%; font-size: var(--t-label); }
+.astra-document .inspector-fields > :is(select,button,p), .astra-document .inspector-fields > .field-wide { grid-column: 1 / -1; }
+.astra-document .inspector-fields textarea { min-height: 76px; }
+.astra-document .inspector-fields .checkbox-field { display: flex; align-items: center; flex-direction: row; min-height: 40px; gap: var(--s2); grid-column: 1 / -1; }
+.astra-document .inspector-fields .checkbox-field input { min-height: 18px; width: 18px; height: 18px; padding: 0; }
+.astra-document .inspector-fields .document-help { margin: 0; }
+.astra-document #document-preview { padding: var(--s4) 0; }
+.astra-document .figure-description { overflow-wrap: anywhere; line-height: 1.6; font-size: var(--t-small); color: var(--muted); }
+.astra-document .document-math-dialog button { min-height: 40px; font-size: var(--t-label); }
+@media (max-width: 1179px) {
+  .astra-document .document-editor-grid { grid-template-columns: minmax(0,1fr) 280px; gap: var(--s4); }
+  .astra-document #document-flow { padding: var(--s6); }
+}
+@media (max-width: 900px) {
+  .astra-document .document-editor-grid { display: flex; flex-direction: column; }
+  .astra-document .document-inspector { order: -1; width: 100%; }
+  .astra-document .document-canvas-pane { width: 100%; }
+  .astra-document .document-layout-controls { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 0 var(--s6); align-items: start; }
+  .astra-document .inspector-fields { padding-bottom: var(--s3); }
+}
+@media (max-width: 600px) {
+  .astra-document #document-app { padding: var(--s4); }
+  .astra-document .document-layout-controls { display: block; }
+  .astra-document .document-actions .button { flex: 1 1 auto; min-height: 44px; }
+  .astra-document .document-formatbar { gap: var(--s2); }
+  .astra-document .document-formatbar :is(button,input,select) { min-height: 44px; }
+  .astra-document #document-flow { padding: var(--s4); }
+}
+.astra-document .document-math-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: var(--s4); }
+.astra-document .document-math-dialog .math-setting { display: grid; gap: var(--s2); margin: var(--s3) 0; font-size: var(--t-label); color: var(--muted); }
+.astra-document .document-math-dialog .math-setting :is(input,select) { width: 100%; margin: 0; color: var(--text); }

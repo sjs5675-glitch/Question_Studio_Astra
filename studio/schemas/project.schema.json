@@ -100,6 +100,7 @@
     "source_import": {
       "oneOf": [
         {"$ref": "#/$defs/source_import"},
+        {"$ref": "#/$defs/exam_source_import"},
         {"type": "null"}
       ]
     },
@@ -257,6 +258,17 @@
             "$ref": "#/$defs/source_import_file"
           }
         }
+      }
+    },
+    "exam_source_import": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_id", "document_sha256", "original_filename", "imported_at"],
+      "properties": {
+        "draft_id": {"$ref": "#/$defs/id"},
+        "document_sha256": {"$ref": "#/$defs/sha256"},
+        "original_filename": {"type": "string", "minLength": 1},
+        "imported_at": {"type": "string", "format": "date-time"}
       }
     },
     "source_reconciliation": {

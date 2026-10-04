@@ -7,10 +7,15 @@ from .document_types import DocumentError, Json, JsonMap, Node, NodeKind, mappin
 
 
 class TreeBuilder:
-    def __init__(self, snapshot_id: str, asset_ids: dict[str, str]) -> None:
+    def __init__(self, snapshot_id: str, asset_ids: dict[str, str], asset_width_px: dict[str, int] | None = None) -> None:
         self.snapshot_id = snapshot_id
         self.asset_ids = asset_ids
+        self.asset_width_px = asset_width_px or {}
         self.nodes: list[Node] = []
+
+    def figure_width(self, source_id: str) -> float:
+        width = self.asset_width_px.get(source_id)
+        return min(85, round(width * 25.4 / 200, 2)) if width else 65
 
     def add(self, kind: NodeKind, payload: JsonMap, pointer: str) -> Node:
         node: Node = {'id': str(uuid4()), 'kind': kind, 'children': [], 'payload': payload,
@@ -50,7 +55,7 @@ class TreeBuilder:
                 if original not in self.asset_ids:
                     raise DocumentError('document_asset_corrupt', f'Figure asset is unavailable: {original}')
                 return self.add('figure', {'asset_id': self.asset_ids[original], 'alt_text': text(source.get('alt_text', ''), 'alt_text'),
-                    'role': text(source.get('role', 'figure'), 'role'), 'width_mm': 65, 'height_mm': None, 'keep_aspect': True}, pointer)['id']
+                    'role': text(source.get('role', 'figure'), 'role'), 'width_mm': self.figure_width(original), 'height_mm': None, 'keep_aspect': True}, pointer)['id']
             case 'paragraph':
                 node = self.add('paragraph', {'role': text(source.get('role', 'body'), 'role')}, pointer)
                 node['children'] = self.blocks(source.get('inlines', []), pointer + '/inlines')
@@ -104,6 +109,21 @@ class TreeBuilder:
     def blocks(self, raw: Json, pointer: str) -> list[str]:
         return [self.block(value, f'{pointer}/{index}') for index, value in enumerate(sequence(raw, pointer))]
 
+    def source_crops(self, package: JsonMap, section: str) -> list[str]:
+        result: list[str] = []
+        assets = sequence(mapping(package.get('resources', {}), 'resources').get('assets', []), 'assets')
+        for index, raw in enumerate(assets):
+            crop = mapping(raw, 'asset')
+            if crop.get('role') != 'source_crop' or crop.get('section') != section or crop.get('state') != 'ready':
+                continue
+            asset_id = text(crop.get('asset_id'), 'asset_id')
+            if asset_id not in self.asset_ids:
+                raise DocumentError('document_asset_corrupt', f'Missing source {section} image {asset_id}')
+            figure = self.add('figure', {'asset_id': self.asset_ids[asset_id], 'alt_text': f'원본 {section} 이미지',
+                'role': 'source_crop', 'width_mm': self.figure_width(asset_id), 'height_mm': None, 'keep_aspect': True}, f'/resources/assets/{index}')
+            result.append(figure['id'])
+        return result
+
     def answer(self, raw: Json, pointer: str) -> str:
         source = mapping(raw, 'answer')
         kind = text(source.get('kind'), 'answer.kind')
@@ -136,7 +156,7 @@ class TreeBuilder:
                 raise DocumentError('document_import_unsupported', f'Unsupported answer kind: {kind}')
         return node['id']
 
-    def question(self, package: JsonMap, selected: bool = True) -> str:
+    def question(self, package: JsonMap, selected: bool = True, question_start: int = 0) -> str:
         content = mapping(package.get('content'), 'content')
         identity = mapping(package.get('identity', {}), 'identity')
         if selected:
@@ -145,19 +165,31 @@ class TreeBuilder:
         else:
             root = self.add('box', {'role': 'shared_context', 'title': '', 'title_visible': False, 'source_layout': None}, '/content/question')
         question = content.get('question')
-        if question is not None:
-            root['children'] = self.blocks(mapping(question, 'question').get('blocks', []), '/content/question/blocks')
-        elif selected:
-            root['payload']['diagnostics'] = ['question_content_missing']
+        blocks = mapping(question, 'question').get('blocks', []) if question is not None else []
+        if blocks:
+            root['children'] = [self.block(block, f'/content/question/blocks/{index}')
+                                for index, block in enumerate(sequence(blocks, 'question.blocks')) if index >= question_start]
+        else:
+            root['children'] = self.source_crops(package, 'question')
+            if selected and not root['children']:
+                raise DocumentError('document_source_missing', f"No question content or image: {package.get('item_id')}")
         if selected:
             for role in ('answer', 'explanation'):
                 raw = content.get(role)
                 if raw is None:
+                    if role == 'explanation':
+                        images = self.source_crops(package, 'explanation')
+                        if images:
+                            explanation = self.add('explanation', {}, '/content')
+                            explanation['children'] = images
+                            root['children'].append(explanation['id'])
+                            continue
                     sequence(root['payload']['diagnostics'], 'diagnostics').append(f'{role}_missing')
                 elif role == 'answer':
                     root['children'].append(self.answer(raw, '/content/answer'))
                 else:
                     explanation = self.add('explanation', {}, '/content/explanation')
-                    explanation['children'] = self.blocks(mapping(raw, 'explanation').get('blocks', []), '/content/explanation/blocks')
+                    explanation_blocks = mapping(raw, 'explanation').get('blocks', [])
+                    explanation['children'] = self.blocks(explanation_blocks, '/content/explanation/blocks') if explanation_blocks else self.source_crops(package, 'explanation')
                     root['children'].append(explanation['id'])
         return root['id']

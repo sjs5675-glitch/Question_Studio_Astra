@@ -86,6 +86,7 @@ class SolutionCandidate:
     origin: str
     source_relative_path: str
     source_sha256: str
+    source_document: str
     document_sha256: str
     document_page_count: int
     bbox: tuple[int, int, int, int]
@@ -109,6 +110,7 @@ class SolutionCandidate:
             "origin": self.origin,
             "source_relative_path": self.source_relative_path,
             "source_sha256": self.source_sha256,
+            "source_document": self.source_document,
             "document_sha256": self.document_sha256,
             "document_page_count": self.document_page_count,
             "bbox": list(self.bbox),
@@ -276,6 +278,7 @@ class EnrichmentResult:
     preserved_verified_item_ids: tuple[str, ...]
     missing_item_ids: tuple[str, ...]
     added_candidate_count: int
+    skipped_changed_item_ids: tuple[str, ...] = ()
 
 
 def parse_printed_number(value: str) -> PrintedNumber | None:
@@ -412,17 +415,22 @@ def _valid_bbox(value: Any) -> tuple[int, int, int, int] | None:
     return left, top, right, bottom
 
 
-def _document_page_count(link_manifest: Mapping[str, Any], fallback: int) -> int:
-    solution = link_manifest.get("solution")
-    page_map = solution.get("page_map") if isinstance(solution, Mapping) else None
+def _document_page_count(
+    link_manifest: Mapping[str, Any], fallback: int, *, source_document: str = "solution"
+) -> int:
+    source = link_manifest.get(source_document)
+    page_map = source.get("page_map") if isinstance(source, Mapping) else None
     return max(len(page_map), fallback) if isinstance(page_map, list) else max(fallback, 1)
 
 
 def _document_sha(link_manifest: Mapping[str, Any], raw_asset: Mapping[str, Any]) -> str:
+    source_document = raw_asset.get("source_document", "solution")
+    if source_document not in {"problem", "solution"}:
+        raise SolutionIntegrityError("solution asset source_document is invalid")
     value = raw_asset.get("source_sha256")
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
-        solution = link_manifest.get("solution")
-        value = solution.get("source_sha256") if isinstance(solution, Mapping) else None
+        source = link_manifest.get(source_document)
+        value = source.get("source_sha256") if isinstance(source, Mapping) else None
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise SolutionIntegrityError("solution document SHA-256 is missing or invalid")
     return value.lower()
@@ -459,14 +467,18 @@ def _existing_candidates(
         candidate_confidence = _confidence(
             manifest_item.get("confidence"), link_item.get("confidence"), raw_asset.get("confidence")
         )
+        source_document = str(raw_asset.get("source_document") or "solution")
         result.append(
             SolutionCandidate(
                 candidate_id=external_id,
                 origin=origin,
                 source_relative_path=relative,
                 source_sha256=source_hash,
+                source_document=source_document,
                 document_sha256=_document_sha(link_manifest, raw_asset),
-                document_page_count=_document_page_count(link_manifest, pdf_page),
+                document_page_count=_document_page_count(
+                    link_manifest, pdf_page, source_document=source_document
+                ),
                 bbox=bbox,
                 pdf_index=max(pdf_index, 0),
                 pdf_page=max(pdf_page, 1),
@@ -691,6 +703,7 @@ def _fallback_matches(
                     origin="consensus_exact_match",
                     source_relative_path=render_relative,
                     source_sha256=render_hash,
+                    source_document="solution",
                     document_sha256=document_sha.lower(),
                     document_page_count=_document_page_count(link_manifest, pdf_page),
                     bbox=bbox,
@@ -1150,8 +1163,8 @@ def _source_pdf_crop(
     """Render a high-resolution crop from the hash-bound source PDF when present."""
 
     link_manifest = _load_safe_json(leaf, "solutions/link_manifest.json")
-    solution = link_manifest.get("solution")
-    source_pdf = solution.get("source_pdf") if isinstance(solution, Mapping) else None
+    source_record = link_manifest.get(candidate.source_document)
+    source_pdf = source_record.get("source_pdf") if isinstance(source_record, Mapping) else None
     if not isinstance(source_pdf, str) or not source_pdf.strip():
         return None
     source = Path(source_pdf).expanduser().absolute()
@@ -1434,6 +1447,48 @@ def _asset_id(candidate_id: str) -> str:
     return "source-solution-" + hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:20]
 
 
+def refresh_replaced_auto_selection(document: dict[str, Any]) -> bool:
+    """Move an automatic selection only to a replacement of the same candidate."""
+    provenance = document.get("provenance", {})
+    selection = provenance.get("solution_selection")
+    review = document.get("review", {})
+    if (not isinstance(selection, dict) or selection.get("origin") != "auto_candidate"
+        or document.get("workflow", {}).get("status") in {"content_ready", "export_ready"}
+        or any(review.get(key) is not None for key in
+               ("approved_revision", "approved_sha256", "reviewer"))):
+        return False
+    selected_id = selection.get("source_asset_id")
+    revision = selection.get("revision")
+    if not isinstance(selected_id, str) or type(revision) is not int:
+        return False
+    matches = []
+    for link in provenance.get("solution_links", []):
+        external_id = link.get("external_asset_id")
+        if (not isinstance(external_id, str) or link.get("status") not in {"review", "verified"}
+            or any("rejected" in str(reason) or "excluded" in str(reason)
+                   for reason in (link.get("review_reasons") or []))):
+            continue
+        base = _asset_id(external_id)
+        if selected_id == base or re.fullmatch(re.escape(base) + r"-[0-9a-f]{12}", selected_id):
+            matches.append(link)
+    if len(matches) != 1:
+        return False
+    replacement_id = matches[0].get("source_asset_id")
+    assets = [asset for asset in document.get("resources", {}).get("assets", [])
+              if asset.get("asset_id") == replacement_id and asset.get("role") == "source_crop"
+              and asset.get("state", "ready") == "ready"]
+    if len(assets) != 1 or not _SHA256.fullmatch(str(assets[0].get("sha256", ""))):
+        return False
+    replacement_sha = assets[0]["sha256"]
+    if replacement_id == selected_id and replacement_sha == selection.get("source_sha256"):
+        return False
+    provenance["solution_selection"] = {
+        "source_asset_id": replacement_id, "source_sha256": replacement_sha,
+        "revision": revision + 1, "origin": "auto_candidate", "selected_at": utc_now(),
+    }
+    return True
+
+
 def _append_issue(document: dict[str, Any], issue: str) -> bool:
     review = document.get("review")
     if not isinstance(review, dict):
@@ -1463,6 +1518,8 @@ def enrich_project_from_leaf(
     preserve_approved: bool = False,
     expected_link_manifest_sha256: str | None = None,
     expected_project_revision: int | None = None,
+    item_ids: Sequence[str] | None = None,
+    expected_item_sha256: Mapping[str, str] | None = None,
 ) -> EnrichmentResult:
     """Backfill review solution crops without overwriting verified links or content."""
 
@@ -1475,6 +1532,28 @@ def enrich_project_from_leaf(
     ):
         raise SolutionIntegrityError("solution link manifest changed before reconciliation")
     project = load_json_object(project_root / "project.json")
+    project_order = project.get("item_order")
+    if not isinstance(project_order, list):
+        raise SolutionIntegrityError("project item order is invalid")
+    scoped_items: set[str] | None = None
+    if item_ids is not None:
+        if (
+            any(not isinstance(item_id, str) or _SAFE_ID.fullmatch(item_id) is None for item_id in item_ids)
+            or len(set(item_ids)) != len(item_ids)
+            or not set(item_ids).issubset(project_order)
+        ):
+            raise SolutionIntegrityError("recovery item scope is invalid")
+        scoped_items = set(item_ids)
+    expected_hashes: dict[str, str] | None = None
+    if expected_item_sha256 is not None:
+        if scoped_items is None or set(expected_item_sha256) != scoped_items or any(
+            not isinstance(value, str) or _SHA256.fullmatch(value) is None
+            for value in expected_item_sha256.values()
+        ):
+            raise SolutionIntegrityError("recovery item hashes are invalid")
+        expected_hashes = {
+            item_id: value.casefold() for item_id, value in expected_item_sha256.items()
+        }
     project_workflow = project.get("workflow")
     if (
         expected_project_revision is not None
@@ -1493,11 +1572,19 @@ def enrich_project_from_leaf(
     updated: list[str] = []
     preserved: list[str] = []
     missing: list[str] = []
+    skipped_changed: list[str] = []
     added_count = 0
-    for item_id in project.get("item_order", []):
+    for item_id in project_order:
         if not isinstance(item_id, str):
             continue
+        if scoped_items is not None and item_id not in scoped_items:
+            continue
         item_path = project_root / "items" / item_id / "question.json"
+        if expected_hashes is not None and (
+            not item_path.is_file() or sha256_file(item_path) != expected_hashes[item_id]
+        ):
+            skipped_changed.append(item_id)
+            continue
         item = load_json_object(item_path)
         workflow = item.get("workflow")
         review = item.get("review")
@@ -1670,6 +1757,7 @@ def enrich_project_from_leaf(
                     "kind": "detailed_solution",
                     "external_asset_id": candidate.candidate_id,
                     "source_asset_id": local_asset_id,
+                    "source_document": candidate.source_document,
                     "document_sha256": candidate.document_sha256,
                     "document_page_count": candidate.document_page_count,
                     "status": decision.status,
@@ -1767,6 +1855,7 @@ def enrich_project_from_leaf(
                     coverage = review.get("coverage")
                     if isinstance(coverage, dict):
                         coverage["explanation"] = "unreviewed"
+        changed |= refresh_replaced_auto_selection(candidate_document)
         if changed:
             current_manifest = _load_safe_json(leaf, "solutions/link_manifest.json")
             bind_import_origin(candidate_document, leaf, unit_id,
@@ -1781,7 +1870,10 @@ def enrich_project_from_leaf(
         and sha256_file(link_manifest_path) != expected_link_manifest_sha256
     ):
         raise SolutionIntegrityError("solution link manifest changed during project update")
-    return EnrichmentResult(tuple(updated), tuple(preserved), tuple(missing), added_count)
+    return EnrichmentResult(
+        tuple(updated), tuple(preserved), tuple(missing), added_count,
+        tuple(skipped_changed),
+    )
 
 
 # Explicit aliases make the intended importer-facing names easy to discover.

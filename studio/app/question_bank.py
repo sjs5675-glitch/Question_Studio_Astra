@@ -56,6 +56,10 @@ class QuestionSetNotFound(ModelNotFound):
     """Raised when a requested question set or referenced item is absent."""
 
 
+class QuestionSetArchiveConflict(QuestionBankError):
+    pass
+
+
 # ponytail: one process-local lock per set fits the single desktop server; add an
 # OS lock only if multiple server processes may edit the same workspace.
 _LOCKS: dict[Path, threading.Lock] = {}
@@ -899,12 +903,36 @@ def patch_question_set(
         return candidate
 
 
+def delete_question_set(
+    workspace_root: Path | str, set_id: str, expected_revision: int
+) -> dict[str, Any]:
+    expected_revision = _positive_revision(expected_revision, field="expected_revision")
+    path = _set_path(workspace_root, set_id)
+    with _lock_for(path):
+        if not path.is_file():
+            raise QuestionSetNotFound(f"question set not found: {set_id}")
+        current = _validate_question_set(load_json_object(path), path=path)
+        if current["revision"] != expected_revision:
+            raise RevisionConflict(expected_revision, current["revision"])
+        archive_root = path.parent / ".deleted"
+        if archive_root.exists() and not _is_within(archive_root.resolve(), _workspace(workspace_root)):
+            raise QuestionBankError("unsafe question-set archive")
+        archive_root.mkdir(exist_ok=True)
+        archive = archive_root / path.name
+        if archive.exists() or archive.is_symlink():
+            raise QuestionSetArchiveConflict(f"question set archive already exists: {set_id}")
+        path.replace(archive)
+        return current
+
+
 __all__ = [
     "OUTPUT_MODES",
     "QUESTION_SET_SCHEMA",
     "QuestionBankError",
     "QuestionSetNotFound",
+    "QuestionSetArchiveConflict",
     "create_question_set",
+    "delete_question_set",
     "get_question_set",
     "list_bank_items",
     "list_question_sets",

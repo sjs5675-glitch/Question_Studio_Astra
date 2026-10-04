@@ -28,10 +28,10 @@ def create_document(workspace: Path, request: JsonMap) -> Document:
     document: Document = {'schema_version': 1, 'document_id': identifier, 'revision': 1,
         'created_at': now, 'updated_at': now, 'origin': {'set_id': set_id, 'set_revision': expected},
         'imports': imports, 'assets': assets, 'content': content, 'groups': groups,
-        'styles': {'defaults': {'font_family': 'Noto Sans KR', 'font_size_pt': 10, 'line_spacing': 1.6, 'paragraph_spacing_mm': 3}, 'node_overrides': {}},
+        'styles': {'defaults': {'font_family': 'Noto Sans KR', 'font_size_pt': 11, 'line_spacing': 1.5, 'paragraph_spacing_mm': 0.6}, 'node_overrides': {}},
         'layout': {'template': 'mock_exam', 'paper': 'A4', 'width_mm': 210, 'height_mm': 297,
-            'margins_mm': {'top': 15, 'right': 15, 'bottom': 15, 'left': 15}, 'columns': 2, 'column_gap_mm': 10,
-            'question_gap_mm': 8, 'break_before': [], 'first_page': 'title_questions', 'title': selected['title'], 'instructions': '',
+            'margins_mm': {'top': 15, 'right': 15, 'bottom': 15, 'left': 15}, 'columns': 2, 'column_gap_mm': 8,
+            'question_gap_mm': 2, 'break_before': [], 'first_page': 'title_questions', 'title': selected['title'], 'instructions': '',
             'unit': '', 'type': '', 'header': '', 'footer': '', 'page_start': 1, 'cover_number_visible': False, 'context_repeats': []},
         'output_role': 'combined_end_section' if selected['output_mode'] == 'combined_end_section' else 'question_only'}
     document = validate_document(document)

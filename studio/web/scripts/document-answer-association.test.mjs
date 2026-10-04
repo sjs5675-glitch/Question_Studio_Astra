@@ -39,3 +39,16 @@ test('question-only output excludes true/false verdicts without dropping the sta
   assert.equal(view.content.nodes.some(node => node.kind === 'answer'), false);
   assert.equal(view.content.nodes.find(node => node.id === 'text').payload.text, 'STATEMENT_A then STATEMENT_B');
 });
+
+test('question output numbers follow selected root order without changing source labels', () => {
+  const current = fixture();
+  const first = current.content.nodes.find(node => node.id === 'question');
+  first.payload.label = '492';
+  const second = structuredClone(first); second.id = 'question-2'; second.payload.label = '7'; second.children = [];
+  current.content.nodes.push(second); current.content.roots = ['question-2', 'question'];
+  const view = outputDocument(current, 'questions');
+  const questions = view.content.nodes.filter(node => node.kind === 'question');
+  assert.deepEqual(questions.map(node => [node.id, node.payload.label]), [['question-2', '1'], ['question', '2']]);
+  assert.equal(first.payload.label, '492');
+  assert.equal(second.payload.label, '7');
+});

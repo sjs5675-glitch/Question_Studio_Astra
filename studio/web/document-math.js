@@ -17,7 +17,7 @@ export async function editEquation(options) {
   const original = structuredClone(node.payload);
   const dialog = document.createElement('dialog'); dialog.className = 'document-math-dialog';
   const title = document.createElement('h2'); title.textContent = '수식 편집';
-  const note = document.createElement('p'); note.textContent = `${original.authority} · ${node.id} · 적용 전까지 문서에는 반영되지 않습니다.`;
+  const note = document.createElement('p'); note.textContent = '적용 전까지 문서에는 반영되지 않습니다.';
   const rawOriginal = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = '보존된 현재 표현';
   const rawValues = document.createElement('pre'); rawValues.textContent = JSON.stringify({ current: original, imported: source }, null, 2); rawOriginal.append(summary, rawValues);
   const size = document.createElement('input'); size.type = 'number'; size.min = '.5'; size.max = '3'; size.step = '.1'; size.value = String(style.math_size ?? 1); size.setAttribute('aria-label', '수식 크기 배율');
@@ -112,7 +112,13 @@ export async function editEquation(options) {
   dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
   dialog.addEventListener('keydown', event => { if (event.key === 'Escape' && !event.isComposing) { event.preventDefault(); event.stopPropagation(); close(); } }, true);
   dialog.addEventListener('keydown', event => event.stopPropagation());
-  dialog.append(title, note, rawOriginal, mode, resolutionLabel, size, variant, host, raw, controls, preview, status, actions);
+  function setting(label, control) {
+    const wrapper = document.createElement('label'); wrapper.className = 'math-setting';
+    const text = document.createElement('span'); text.textContent = label; wrapper.append(text, control); return wrapper;
+  }
+  const styleControls = document.createElement('div'); styleControls.className = 'document-math-options';
+  styleControls.append(setting('수식 크기 배율', size), setting('수식 굵기', variant));
+  dialog.append(title, note, rawOriginal, setting('수식 입력 방식', mode), resolutionLabel, styleControls, host, raw, controls, preview, status, actions);
   document.body.append(dialog); dialog.showModal();
   raw.value = initial;
   mode.value = ['plain_only', 'plain_literal'].includes(original.authority) ? 'literal' : 'visual';

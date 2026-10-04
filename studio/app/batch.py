@@ -55,6 +55,7 @@ from .model import (
     save_json_cas,
     sha256_file,
     solution_content_hash,
+    solution_link_summary,
     validate_id,
 )
 from .question_bank import QuestionBankError, resolve_bank_item_refs
@@ -63,6 +64,7 @@ from .solution_reconciliation import (
     SolutionIntegrityError,
     enrich_project_from_leaf,
     record_source_reconciliation,
+    refresh_replaced_auto_selection,
 )
 from .transcription import (
     AstraTranscriptionError,
@@ -166,6 +168,7 @@ SOLUTION_CONFIRMATION_RECEIPT_FIELDS = {
 }
 RESUME_RETENTION = timedelta(days=7)
 REQUEST_FIELDS = {
+    "project_name",
     "source_path",
     "solution_path",
     "pages",
@@ -3094,6 +3097,17 @@ class BatchCoordinator:
             raise BatchError("Request body must be an object")
         if any(not isinstance(key, str) or key not in REQUEST_FIELDS for key in payload):
             raise BatchError("Request contains unsupported fields")
+        project_name = None
+        if "project_name" in payload:
+            value = payload["project_name"]
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 200
+                or re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+            ):
+                raise BatchError("project_name must be a non-blank string of at most 200 characters without control characters")
+            project_name = value.strip()
         source = self._pdf(
             self._alias(payload, ("source_path", "problem_pdf", "source")),
             "source_path",
@@ -3142,6 +3156,7 @@ class BatchCoordinator:
             "finished_at": None,
             # Private persistence fields are removed from list/get/create views.
             "request": {
+                "project_name": project_name,
                 "source_path": str(source),
                 "solution_path": str(solution) if solution else None,
                 "source_name": self._display_name(source_name, source.name),
@@ -3517,6 +3532,7 @@ class BatchCoordinator:
             "request": {
                 key: request.get(key)
                 for key in (
+                    "project_name",
                     "source_name",
                     "solution_name",
                     "pages",
@@ -3659,6 +3675,7 @@ class BatchCoordinator:
             "updated_at": timestamp,
             "finished_at": None,
             "request": {
+                "project_name": request.get("project_name"),
                 "source_name": request.get("source_name"),
                 "solution_name": request.get("solution_name"),
                 "regenerate_figures": True,
@@ -4126,6 +4143,7 @@ class BatchCoordinator:
         failure = parse_page_failure(result.get("detection_failure"))
         if state == "failed" and failure is not None:
             result["phase"] = failure["stage"]
+        result["project_name"] = request.get("project_name")
         result["source_name"] = request.get("source_name")
         result["solution_name"] = request.get("solution_name")
         result["options"] = {
@@ -4612,7 +4630,7 @@ class BatchCoordinator:
                     {
                         "source": str(solution_path),
                         "crop_dpi": int(request.get("crop_dpi") or 300),
-                        "force": False,
+                        "force": True,
                     },
                 )
                 current_record = self._wait_for_crop(
@@ -4783,6 +4801,8 @@ class BatchCoordinator:
         self, project_dir: Path, item_ids: Sequence[str] | None = None
     ) -> list[dict[str, Any]]:
 
+        from .solution_verification import candidate_generation, ranked_solution_links
+
         project = load_json_object(project_dir / "project.json")
         selected_ids = item_ids if item_ids is not None else project.get("item_order", [])
         targets: list[dict[str, Any]] = []
@@ -4797,6 +4817,12 @@ class BatchCoordinator:
             selection = document.get("provenance", {}).get("solution_selection")
             asset_id = str(link["source_asset_id"]) if link else ""
             source_sha = self._asset_sha256(document, asset_id) if asset_id else None
+            ranked_links, ranking_tied = ranked_solution_links(document)
+            candidate_asset_ids = list(dict.fromkeys(
+                str(candidate["source_asset_id"])
+                for candidate in ranked_links
+                if isinstance(candidate.get("source_asset_id"), str)
+            ))
             selection_revision = selection.get("revision") if isinstance(selection, Mapping) else None
             key = f"{item_id}:{asset_id}:{source_sha or 'none'}:{selection_revision or 0}"
             targets.append({
@@ -4805,6 +4831,13 @@ class BatchCoordinator:
                 "input_revision": document.get("workflow", {}).get("revision"),
                 "input_content_hash": solution_content_hash(document),
                 "state": "pending" if source_sha else "no_source",
+                "candidate_generation": candidate_generation(document),
+                "candidate_asset_ids": candidate_asset_ids,
+                "candidate_cursor": 0,
+                "attempted_image_sha256": [],
+                "verification_calls": 0,
+                "remaining_candidate_count": len(candidate_asset_ids),
+                "ranking_tied": ranking_tied,
             })
         return targets
 
@@ -4883,23 +4916,50 @@ class BatchCoordinator:
 
         with self._lock:
             record = copy.deepcopy(self._jobs[job_id])
+            durable_jobs = copy.deepcopy(list(self._jobs.values()))
         project_dir = self.workspace_root / str(record["project_id"])
         request = record.get("request") or {}
         provider_profile = parse_provider_profile(request.get("provider_profile"))
         config = effective_provider_config(provider_profile, str(request.get("ocr_profile") or "balanced"))
         previous = {
-            target["key"]: target
+            (target.get("item_id"), target.get("candidate_generation")): target
             for target in record.get("solution_targets", [])
-            if isinstance(target, Mapping) and isinstance(target.get("key"), str)
+            if isinstance(target, Mapping) and isinstance(target.get("item_id"), str)
         }
+        historical_ocr: dict[tuple[Any, Any], dict[str, int]] = {}
+        for durable_job in durable_jobs:
+            for durable_target in durable_job.get("solution_targets", []):
+                if not isinstance(durable_target, Mapping):
+                    continue
+                durable_key = (
+                    durable_target.get("item_id"), durable_target.get("candidate_generation")
+                )
+                totals = historical_ocr.setdefault(durable_key, {"ocr_calls": 0, "ocr_candidates": 0})
+                for name in ("ocr_calls", "ocr_candidates"):
+                    totals[name] = max(totals[name], int(durable_target.get(name) or 0))
         item_ids = [record["item_id"]] if record.get("kind") == "solution_operation" else request.get("item_ids")
+        project = load_json_object(project_dir / "project.json")
+        for item_id in item_ids if item_ids is not None else project.get("item_order", []):
+            question_path = project_dir / "items" / item_id / "question.json"
+            document = load_json_object(question_path)
+            if refresh_replaced_auto_selection(document):
+                save_json_cas(question_path, document, expected_revision=document["workflow"]["revision"])
         targets = self._collect_solution_targets(project_dir, item_ids=item_ids)
         for target in targets:
-            prior = previous.get(target["key"])
+            target.update(historical_ocr.get(
+                (target["item_id"], target["candidate_generation"]), {}
+            ))
+            prior = previous.get((target["item_id"], target["candidate_generation"]))
             if prior:
-                target.update({name: prior[name] for name in ("attempts", "ocr_calls", "ocr_candidates", "candidate_job_id", "verification_receipt", "input_content_hash") if name in prior})
+                target.update({name: prior[name] for name in (
+                    "attempts", "ocr_calls", "ocr_candidates", "candidate_job_id",
+                    "verification_receipt", "input_content_hash", "candidate_cursor",
+                    "attempted_image_sha256", "verification_calls", "verification_state",
+                ) if name in prior})
                 if prior.get("state") in {"failed", "cancelled", "generated_pending_apply"}:
                     target["state"] = prior["state"]
+            if target["state"] == "pending" and int(target.get("ocr_calls") or 0) >= 3:
+                target["state"] = "review_budget_exhausted"
             question_path = project_dir / "items" / target["item_id"] / "question.json"
             if target["source_sha256"]:
                 document = load_json_object(question_path)
@@ -4919,18 +4979,27 @@ class BatchCoordinator:
                 if current_transcription and self._has_explanation(document):
                     target["state"] = "applied" if prior and prior.get("state") == "applied" else "skipped_current"
         for target in targets:
-            if target["state"] != "pending" or target["selection_revision"] is not None:
+            if target["state"] != "pending":
                 continue
             question_path = project_dir / "items" / target["item_id"] / "question.json"
             document = load_json_object(question_path)
+            current_selection = document.get("provenance", {}).get("solution_selection")
+            if (isinstance(current_selection, Mapping)
+                    and current_selection.get("source_asset_id") == target["asset_id"]
+                    and current_selection.get("source_sha256") == target["source_sha256"]):
+                continue
+            next_selection_revision = (
+                int(current_selection.get("revision") or 0) + 1
+                if isinstance(current_selection, Mapping) else 1
+            )
             document["provenance"]["solution_selection"] = {
                 "source_asset_id": target["asset_id"], "source_sha256": target["source_sha256"],
-                "revision": 1, "origin": "auto_candidate", "selected_at": _now(),
+                "revision": next_selection_revision, "origin": "auto_candidate", "selected_at": _now(),
             }
             saved = save_json_cas(question_path, document, expected_revision=document["workflow"]["revision"])
-            target["selection_revision"] = 1
+            target["selection_revision"] = next_selection_revision
             target["input_revision"] = saved["workflow"]["revision"]
-            target["key"] = f'{target["item_id"]}:{target["asset_id"]}:{target["source_sha256"]}:1'
+            target["key"] = f'{target["item_id"]}:{target["asset_id"]}:{target["source_sha256"]}:{next_selection_revision}'
         with self._lock:
             live = self._jobs[job_id]
             live["solution_targets"] = targets
@@ -4946,14 +5015,16 @@ class BatchCoordinator:
             self._update(job_id, summary={**record["summary"], "solution_transcription": {"total": 0}})
             return
 
-        candidate_cache = self._shared_candidate_cache(project_dir, config, provider_profile=provider_profile)
+        candidate_cache = self._shared_candidate_cache(project_dir, config, provider_profile=provider_profile,
+            source_sha256s={target["source_sha256"] for target in targets if target["state"] == "pending"})
         content_cache = self._shared_content_cache(project_dir, provider_profile=provider_profile)
         analysis_owners = self._shared_analysis_owners(project_dir, provider_profile)
         groups: dict[str, list[dict[str, Any]]] = {}
         for target in targets:
             if target["state"] == "pending":
                 groups.setdefault(target["source_sha256"], []).append(target)
-        terminal_states = {"applied", "skipped_current", "generated_pending_apply", "failed", "no_source", "cancelled"}
+        terminal_states = {"applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted",
+                           "failed", "no_source", "cancelled"}
 
         def report_targets() -> None:
             done = sum(target["state"] in terminal_states for target in targets)
@@ -5070,7 +5141,8 @@ class BatchCoordinator:
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         counts = {state: sum(target["state"] == state for target in targets)
-            for state in ("applied", "skipped_current", "generated_pending_apply", "failed", "no_source", "cancelled")}
+            for state in ("applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted",
+                          "failed", "no_source", "cancelled")}
         with self._lock:
             summary = copy.deepcopy(self._jobs[job_id]["summary"])
         summary["solution_transcription"] = {"total": len(targets), **counts}
@@ -5079,10 +5151,15 @@ class BatchCoordinator:
 
         from .solution_verification import alternative_assets, can_try_alternative, mark_pair_mismatch, repair_selected_crop, verify_selected
         verified = reviewed = failed = 0
-        verification_total = sum(target["state"] in {"applied", "skipped_current"} for target in targets)
+        verification_states = {"applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted"}
+        verification_total = sum(target["state"] in verification_states for target in targets)
         self._update(job_id, stage="solution_verification", message=f"Checking solution pairs: 0/{verification_total}.")
         for target in targets:
-            if target["state"] not in {"applied", "skipped_current"}:
+            if target["state"] not in verification_states:
+                continue
+            if int(target.get("verification_calls") or 0) >= 3:
+                target["verification_state"] = target.get("verification_state") or "review"
+                reviewed += 1
                 continue
             self._checkpoint(job_id)
             question_path = project_dir / "items" / target["item_id"] / "question.json"
@@ -5097,39 +5174,57 @@ class BatchCoordinator:
                     }
                     save_json_cas(question_path, current, expected_revision=current["workflow"]["revision"])
                 outcome = verify_selected(question_path)
+                if outcome.get("reason") != "current_receipt":
+                    target["verification_calls"] = int(target.get("verification_calls") or 0) + 1
+                attempted_hashes = target.setdefault("attempted_image_sha256", [])
+                if target.get("source_sha256") and target["source_sha256"] not in attempted_hashes:
+                    attempted_hashes.append(target["source_sha256"])
                 if (outcome["state"] == "review" and int(target.get("crop_repairs") or 0) < 1
                     and can_try_alternative(target)):
                     current = load_json_object(question_path)
                     last_auto = current.get("provenance", {}).get("last_auto_applied_hash")
-                    if not self._has_explanation(current) or (isinstance(last_auto, str) and last_auto == solution_content_hash(current)):
+                    protected_body = target["state"] == "generated_pending_apply"
+                    if (protected_body or not self._has_explanation(current)
+                            or (isinstance(last_auto, str) and last_auto == solution_content_hash(current))):
                         repaired = repair_selected_crop(question_path, outcome, self.import_roots)
                         if repaired is not None:
                             current = load_json_object(question_path)
                             selection = current["provenance"]["solution_selection"]
                             target.update(asset_id=selection["source_asset_id"], source_sha256=selection["source_sha256"],
                                 selection_revision=selection["revision"], crop_repairs=1,
-                                ocr_candidates=int(target.get("ocr_candidates") or 1) + 1,
-                                ocr_calls=int(target.get("ocr_calls") or 0) + 1,
                                 key=f"{target['item_id']}:{selection['source_asset_id']}:{selection['source_sha256']}:{selection['revision']}")
+                            if protected_body:
+                                target.pop("candidate_job_id", None)
+                            else:
+                                target["ocr_candidates"] = int(target.get("ocr_candidates") or 1) + 1
+                                target["ocr_calls"] = int(target.get("ocr_calls") or 0) + 1
                             self._update(job_id, solution_targets=targets)
-                            try:
-                                candidate = create_transcription_job(question_path, target["asset_id"], "explanation",
-                                    config=config, shared_parent_mode=True, provider_profile=provider_profile)
-                                local = clone_candidate_job_for_item(question_path, candidate, target["asset_id"],
-                                    expected_base_revision=current["workflow"]["revision"])
-                                target["candidate_job_id"] = local.path.name
-                                self._update(job_id, solution_targets=targets)
-                                apply_candidate_job(question_path, local.path,
-                                    expected_base_revision=current["workflow"]["revision"],
-                                    preserve_existing_answer=True, discard_candidate_answer=True)
-                            except Exception as exc:
-                                target.update(state="failed", error_code=_ocr_error_code(exc))
-                                raise
+                            if not protected_body:
+                                try:
+                                    candidate = create_transcription_job(question_path, target["asset_id"], "explanation",
+                                        config=config, shared_parent_mode=True, provider_profile=provider_profile)
+                                    local = clone_candidate_job_for_item(question_path, candidate, target["asset_id"],
+                                        expected_base_revision=current["workflow"]["revision"])
+                                    target["candidate_job_id"] = local.path.name
+                                    self._update(job_id, solution_targets=targets)
+                                    apply_candidate_job(question_path, local.path,
+                                        expected_base_revision=current["workflow"]["revision"],
+                                        preserve_existing_answer=True, discard_candidate_answer=True)
+                                except Exception as exc:
+                                    target.update(state="failed", error_code=_ocr_error_code(exc))
+                                    raise
                             outcome = verify_selected(question_path)
+                            if outcome.get("reason") != "current_receipt":
+                                target["verification_calls"] = int(target.get("verification_calls") or 0) + 1
+                            if target["source_sha256"] not in attempted_hashes:
+                                attempted_hashes.append(target["source_sha256"])
                 if outcome["state"] == "mismatch":
                     mark_pair_mismatch(question_path)
                     current = load_json_object(question_path)
                     alternatives = alternative_assets(current, target["asset_id"])
+                    alternatives = [alternative_id for alternative_id in alternatives
+                                    if self._asset_sha256(current, alternative_id) not in attempted_hashes]
+                    target["remaining_candidate_count"] = len(alternatives)
                     for alternative_id in alternatives:
                         if not can_try_alternative(target):
                             break
@@ -5144,16 +5239,24 @@ class BatchCoordinator:
                             "origin": "auto_candidate", "selected_at": _now(),
                         }
                         current = save_json_cas(question_path, current, expected_revision=current["workflow"]["revision"])
-                        target["ocr_candidates"] = int(target.get("ocr_candidates") or 1) + 1
-                        target["ocr_calls"] = int(target.get("ocr_calls") or 0) + 1
-                        candidate = create_transcription_job(question_path, alternative_id, "explanation",
-                            config=config, shared_parent_mode=True, provider_profile=provider_profile)
-                        local = clone_candidate_job_for_item(question_path, candidate, alternative_id,
-                            expected_base_revision=current["workflow"]["revision"])
-                        apply_candidate_job(question_path, local.path,
-                            expected_base_revision=current["workflow"]["revision"],
-                            preserve_existing_answer=True, discard_candidate_answer=True)
+                        target.update(asset_id=alternative_id, source_sha256=alternative_sha,
+                                      selection_revision=current["provenance"]["solution_selection"]["revision"])
+                        if target["state"] != "generated_pending_apply" and int(target.get("ocr_calls") or 0) < 3:
+                            target["ocr_candidates"] = int(target.get("ocr_candidates") or 1) + 1
+                            target["ocr_calls"] = int(target.get("ocr_calls") or 0) + 1
+                            candidate = create_transcription_job(question_path, alternative_id, "explanation",
+                                config=config, shared_parent_mode=True, provider_profile=provider_profile)
+                            local = clone_candidate_job_for_item(question_path, candidate, alternative_id,
+                                expected_base_revision=current["workflow"]["revision"])
+                            apply_candidate_job(question_path, local.path,
+                                expected_base_revision=current["workflow"]["revision"],
+                                preserve_existing_answer=True, discard_candidate_answer=True)
                         outcome = verify_selected(question_path)
+                        if outcome.get("reason") != "current_receipt":
+                            target["verification_calls"] = int(target.get("verification_calls") or 0) + 1
+                        attempted_hashes.append(alternative_sha)
+                        target["candidate_cursor"] = int(target.get("candidate_cursor") or 0) + 1
+                        target["remaining_candidate_count"] = max(0, len(alternatives) - target["candidate_cursor"])
                         if outcome["state"] == "verified":
                             break
                         if outcome["state"] == "mismatch":
@@ -5174,9 +5277,20 @@ class BatchCoordinator:
                          progress=95 + (4 * checked // verification_total if verification_total else 4),
                          message=f"Checking solution pairs: {checked}/{verification_total}.")
         counts = {state: sum(target["state"] == state for target in targets)
-            for state in ("applied", "skipped_current", "generated_pending_apply", "failed", "no_source", "cancelled")}
+            for state in ("applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted",
+                          "failed", "no_source", "cancelled")}
         summary["solution_transcription"] = {"total": len(targets), **counts}
         summary["solution_verification"] = {"verified": verified, "review": reviewed, "failed": failed}
+        link_counts = {state: 0 for state in ("no_candidate", "unverified", "review", "verified", "mismatch", "conflict")}
+        for target in targets:
+            state = solution_link_summary(load_json_object(
+                project_dir / "items" / target["item_id"] / "question.json"
+            ), item_root=project_dir / "items" / target["item_id"])["link_state"]
+            link_counts[state] += 1
+        summary["solution_linking"] = {
+            "total": len(targets), "counts": link_counts,
+            "remaining_count": len(targets) - link_counts["verified"],
+        }
         self._update(job_id, summary=summary, solution_targets=targets, progress=99,
                      message=(f"Solution processing ended: {counts['applied']} typed, {counts['failed']} OCR failed, "
                               f"{counts['no_source']} no source; {verified} verified, {reviewed} review, {failed} check failed."))
@@ -5371,7 +5485,12 @@ class BatchCoordinator:
                     summary=summary,
                 )
                 self._checkpoint(job_id)
-                imported = import_leaf_run(run_dir, self.workspace_root)
+                imported = import_leaf_run(
+                    run_dir,
+                    self.workspace_root,
+                    project_name=request.get("project_name"),
+                    source_name=request.get("source_name"),
+                )
                 self._update(job_id, project_id=imported.project_id)
                 project_dir = imported.project_dir
             else:
@@ -5563,7 +5682,7 @@ class BatchCoordinator:
             project_dir, parse_provider_profile(provider_profile)
         )
         candidate_cache = self._shared_candidate_cache(project_dir, config,
-            provider_profile=parse_provider_profile(provider_profile))
+            provider_profile=parse_provider_profile(provider_profile), source_sha256s=set(groups))
         content_cache = self._shared_content_cache(
             project_dir, provider_profile=parse_provider_profile(provider_profile)
         )
@@ -6479,6 +6598,8 @@ class BatchCoordinator:
     def _registered_explanation_link(
         cls, document: Mapping[str, Any]
     ) -> Mapping[str, Any] | None:
+        from .solution_verification import ranked_solution_links
+
         assets = document.get("resources", {}).get("assets", [])
         asset_ids = {
             asset.get("asset_id")
@@ -6498,36 +6619,34 @@ class BatchCoordinator:
             and not any("rejected" in str(reason) or "excluded" in str(reason) for reason in (link.get("review_reasons") or []))
         ]
         selection = document.get("provenance", {}).get("solution_selection")
+        ranked, _ = ranked_solution_links(document)
+        ranked_asset_ids = {link.get("source_asset_id") for link in ranked}
         if isinstance(selection, Mapping):
             selected_id = selection.get("source_asset_id")
             selected_sha = selection.get("source_sha256")
-            if selected_id in asset_ids and selected_sha == cls._asset_sha256(document, selected_id):
+            manual = selection.get("origin") != "auto_candidate"
+            if (selected_id in asset_ids and selected_sha == cls._asset_sha256(document, selected_id)
+                    and (manual or selected_id in ranked_asset_ids)):
                 chosen = next((link for link in eligible if link.get("source_asset_id") == selected_id), None)
                 return chosen
-        detailed = [
-            link
-            for link in eligible
-            if link.get("kind") in {"detailed_solution", "mixed"}
-        ]
+            provenance = document.get("provenance", {})
+            raw_snapshot = provenance.get("raw_snapshot") if isinstance(provenance, Mapping) else None
+            raw_link = raw_snapshot.get("link_item") if isinstance(raw_snapshot, Mapping) else None
+            if (selection.get("origin") == "auto_candidate" and selected_id
+                    and not (isinstance(raw_link, Mapping) and isinstance(raw_link.get("candidate_ids"), list))):
+                return None
+        eligible_ids = {link.get("source_asset_id") for link in eligible}
+        detailed = [link for link in ranked
+                    if link.get("source_asset_id") in eligible_ids
+                    and link.get("kind") in {"detailed_solution", "mixed"}]
         candidates = detailed or [
-            link for link in eligible if link.get("kind") == "quick_answer"
+            link for link in ranked
+            if link.get("source_asset_id") in eligible_ids and link.get("kind") == "quick_answer"
         ]
         protected = [
             link for link in candidates if cls._is_protected_solution_link(link)
         ]
         selected_pool = protected or candidates
-        selected_pool.sort(
-            key=lambda link: (
-                0 if link.get("status") == "verified" else 1,
-                (
-                    0
-                    if not protected and cls._is_boundary_seam_repaired(link)
-                    else 1
-                ),
-                -float(link.get("confidence") or 0),
-                str(link.get("source_asset_id")),
-            )
-        )
         return selected_pool[0] if selected_pool else None
 
     @classmethod
@@ -6606,33 +6725,42 @@ class BatchCoordinator:
         cls, project_dir: Path, provider_profile: str = "full"
     ) -> dict[str, tuple[Path, str, Path]]:
         latest: dict[str, tuple[int, Path, str, Path]] = {}
-        for item_dir in (project_dir / "items").iterdir():
-            document = load_json_object(item_dir / "question.json")
+        documents = [(item_dir, load_json_object(item_dir / "question.json"))
+                     for item_dir in (project_dir / "items").iterdir()]
+        source_shas = set()
+        for _item_dir, document in documents:
             asset_id = cls._registered_explanation_asset(document)
             source_sha = cls._asset_sha256(document, asset_id) if asset_id else None
-            if source_sha is None:
-                continue
-            expected_key = shared_analysis_key(source_sha, provider_profile=parse_provider_profile(provider_profile))
+            if source_sha is not None:
+                source_shas.add(source_sha)
+        profile = parse_provider_profile(provider_profile)
+        keys = {shared_analysis_key(sha, provider_profile=profile): sha for sha in source_shas}
+        families_by_name = {key[:24]: (key, sha) for key, sha in keys.items()}
+        for item_dir, document in documents:
             try:
                 families = list((item_dir / "jobs" / ".analysis").iterdir())
             except FileNotFoundError:
                 continue
             for family in families:
-                if family.name != expected_key[:24]:
+                identity = families_by_name.get(family.name)
+                if identity is None:
                     continue
+                expected_key, source_sha = identity
                 for attempt in analysis_attempts(family):
                     request = load_analysis_request(attempt, expected_key, section="explanation",
-                        shared_parent_mode=True, provider_profile=parse_provider_profile(provider_profile), source_asset_id=asset_id)
-                    if request.source_asset_id != asset_id:
+                        shared_parent_mode=True, provider_profile=profile)
+                    if cls._asset_sha256(document, request.source_asset_id) != source_sha:
                         raise CandidateIntegrityError("shared analysis source asset differs")
                     order = int(attempt.name, 16)
                     if source_sha not in latest or order > latest[source_sha][0]:
-                        latest[source_sha] = (order, item_dir / "question.json", asset_id, attempt)
+                        latest[source_sha] = (order, item_dir / "question.json", request.source_asset_id, attempt)
         return {source_sha: (path, asset_id, attempt) for source_sha, (_, path, asset_id, attempt) in latest.items()}
+
 
     @classmethod
     def _shared_candidate_cache(
-        cls, project_dir: Path, config: ProviderConfig, *, provider_profile: str = "full"
+        cls, project_dir: Path, config: ProviderConfig, *, provider_profile: str = "full",
+        source_sha256s: set[str] | None = None,
     ) -> dict[str, CandidateJob]:
         cached: dict[str, CandidateJob] = {}
         analysis_owners = cls._shared_analysis_owners(project_dir, provider_profile)
@@ -6656,6 +6784,8 @@ class BatchCoordinator:
                     or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
                 ):
                     continue
+                if source_sha256s is not None and source_sha256 not in source_sha256s:
+                    continue
                 job = load_candidate_job(job_path)
                 if source_sha256 in analysis_owners:
                     latest_attempt = analysis_owners[source_sha256][2]
@@ -6664,8 +6794,13 @@ class BatchCoordinator:
                         shared_parent_mode=True, provider_profile=parse_provider_profile(provider_profile), source_asset_id=analysis_owners[source_sha256][1])
                     if metadata.get("idempotency_key") != request.idempotency_key:
                         continue
-                    load_analysis_response(latest_attempt, expected_key, section="explanation",
-                        shared_parent_mode=True, provider_profile=parse_provider_profile(provider_profile), source_asset_id=analysis_owners[source_sha256][1], published_job=job)
+                    try:
+                        load_analysis_response(latest_attempt, expected_key, section="explanation",
+                            shared_parent_mode=True, provider_profile=parse_provider_profile(provider_profile), source_asset_id=analysis_owners[source_sha256][1], published_job=job)
+                    except CandidateIntegrityError as exc:
+                        if str(exc) != "published candidate differs from selected analysis":
+                            raise
+                        continue
                 elif metadata.get("analysis_response_path"):
                     raise CandidateIntegrityError("published shared candidate checkpoint is missing")
                 if metadata.get("analysis_key") != shared_analysis_key(source_sha256,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from PIL import Image
 
@@ -83,6 +83,78 @@ def repair_selected_crop(question_path: Path, outcome: dict[str, Any], import_ro
     return select_source(question_path, payload, import_roots=import_roots, auto_crop=True)
 
 
+def _candidate_score(document: Mapping[str, Any], link: Mapping[str, Any]) -> tuple[int | float, ...]:
+    provenance = document.get('provenance')
+    raw_snapshot = provenance.get('raw_snapshot') if isinstance(provenance, Mapping) else None
+    raw_link = raw_snapshot.get('link_item') if isinstance(raw_snapshot, Mapping) else None
+    wanted_pages = set(raw_link.get('solution_printed_pages') or []) if isinstance(raw_link, Mapping) else set()
+    wanted_document = raw_link.get('source_document') if isinstance(raw_link, Mapping) else None
+    parts = link.get('parts')
+    parts = parts if isinstance(parts, list) else []
+    page_match = bool(wanted_pages and any(
+        isinstance(part, Mapping) and part.get('printed_page') in wanted_pages
+        for part in parts))
+    evidence = link.get('evidence') or []
+    return (
+        int(link.get('status') == 'verified'),
+        int(wanted_document in {'problem', 'solution'} and link.get('source_document') == wanted_document),
+        int(page_match),
+        int(any(value in evidence for value in ('same_question', 'identity_match', 'astra-current-evidence'))),
+        float(link.get('confidence') or 0),
+    )
+
+
+def ranked_solution_links(document: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], bool]:
+    provenance = document.get('provenance')
+    links = provenance.get('solution_links') if isinstance(provenance, Mapping) else None
+    raw_snapshot = provenance.get('raw_snapshot') if isinstance(provenance, Mapping) else None
+    raw_link = raw_snapshot.get('link_item') if isinstance(raw_snapshot, Mapping) else None
+    current_ids = raw_link.get('candidate_ids') if isinstance(raw_link, Mapping) else None
+    current = {value for value in current_ids if isinstance(value, str)} if isinstance(current_ids, list) else None
+    candidates = [
+        link for link in (links if isinstance(links, list) else [])
+        if isinstance(link, Mapping)
+        and link.get('kind') in {'detailed_solution', 'mixed', 'quick_answer'}
+        and (current is None or link.get('external_asset_id') in current)
+        and not any('rejected' in str(reason) or 'excluded' in str(reason)
+                    for reason in (link.get('review_reasons') or []))
+    ]
+    scored = [(link, _candidate_score(document, link)) for link in sorted(
+        candidates, key=lambda value: str(value.get('source_asset_id')))]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    tied = len(scored) > 1 and scored[0][1] == scored[1][1]
+    return [pair[0] for pair in scored], tied
+
+
+def candidate_generation(document: Mapping[str, Any]) -> str:
+    provenance = document.get('provenance')
+    links = provenance.get('solution_links') if isinstance(provenance, Mapping) else None
+    raw_snapshot = provenance.get('raw_snapshot') if isinstance(provenance, Mapping) else None
+    raw_link = raw_snapshot.get('link_item') if isinstance(raw_snapshot, Mapping) else None
+    current_ids = raw_link.get('candidate_ids') if isinstance(raw_link, Mapping) else None
+    current = {value for value in current_ids if isinstance(value, str)} if isinstance(current_ids, list) else None
+    candidates = [link for link in (links if isinstance(links, list) else [])
+                  if isinstance(link, Mapping) and (current is None or link.get('external_asset_id') in current)]
+    assets = document.get('resources')
+    raw_assets = assets.get('assets') if isinstance(assets, Mapping) else None
+    asset_sha = {asset.get('asset_id'): asset.get('sha256') for asset in (raw_assets if isinstance(raw_assets, list) else [])
+                 if isinstance(asset, Mapping)}
+    identity_data = document.get('identity')
+    ranking_identity = {
+        key: identity_data.get(key) for key in ('printed_number', 'parent_item_id', 'group_id')
+    } if isinstance(identity_data, Mapping) else None
+    payload = {'policy': 'solution-ranking-v2', 'identity': ranking_identity, 'candidates': [{
+        'external_asset_id': link.get('external_asset_id'),
+        'source_asset_id': link.get('source_asset_id'),
+        'source_sha256': asset_sha.get(link.get('source_asset_id')),
+        'source_document': link.get('source_document'),
+        'document_sha256': link.get('document_sha256'),
+        'parts': link.get('parts'),
+    } for link in sorted(candidates, key=lambda value: str(value.get('external_asset_id')))]}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                     separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
 def alternative_assets(document: dict[str, Any], selected_asset_id: str) -> list[str]:
     selection = document.get('provenance', {}).get('solution_selection', {})
     if selection.get('origin') != 'auto_candidate':
@@ -90,18 +162,18 @@ def alternative_assets(document: dict[str, Any], selected_asset_id: str) -> list
     ready = {asset.get('asset_id') for asset in document.get('resources', {}).get('assets', [])
              if isinstance(asset, dict) and asset.get('section') == 'explanation'
              and asset.get('role') == 'source_crop' and asset.get('state', 'ready') == 'ready'}
-    links = [link for link in document.get('provenance', {}).get('solution_links', [])
-             if isinstance(link, dict) and link.get('source_asset_id') in ready
-             and link.get('source_asset_id') != selected_asset_id
-             and link.get('kind') in {'detailed_solution', 'mixed'}
-             and not any('rejected' in str(reason) or 'excluded' in str(reason)
-                         for reason in link.get('review_reasons', []))]
-    links.sort(key=lambda link: (-float(link.get('confidence') or 0), str(link['source_asset_id'])))
-    return list(dict.fromkeys(link['source_asset_id'] for link in links))[:2]
+    links, _ = ranked_solution_links(document)
+    return list(dict.fromkeys(str(link['source_asset_id']) for link in links
+                              if link.get('source_asset_id') in ready
+                              and link.get('source_asset_id') != selected_asset_id))
 
 
 def can_try_alternative(target: dict[str, Any]) -> bool:
-    return int(target.get('ocr_candidates') or 1) < 3 and int(target.get('ocr_calls') or 0) < 3
+    if 'verification_calls' not in target:
+        return int(target.get('ocr_candidates') or 1) < 3 and int(target.get('ocr_calls') or 0) < 3
+    calls = int(target.get('verification_calls') or 0)
+    remaining = target.get('remaining_candidate_count')
+    return calls < 3 and (type(remaining) is not int or remaining > 0)
 
 
 def mark_pair_mismatch(question_path: Path) -> None:

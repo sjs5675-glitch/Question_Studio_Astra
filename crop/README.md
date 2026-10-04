@@ -6,7 +6,7 @@ AI가 이미지를 직접 편집하지 않습니다. AI는 `문항 의미 + 관�
 
 ## 현재 범위
 
-- 우선 대상: `C:\Users\서재성\Documents\과학 문제집\고등\2022 개정`
+- 우선 대상: `C:\Users\USER\Documents\과학 문제집\고등\2022 개정`
 - 해당 폴더: PDF 77개, 7.12 GiB, 10,272쪽
 - 전체 고등·중등: PDF 583개, 정상적으로 읽힌 567개/67,275쪽
 - 이미지 전용·텍스트형·혼합형·암호화 플래그 PDF를 모두 PDFium으로 렌더
@@ -154,7 +154,7 @@ codex login status
 
 ```powershell
 uv run python question_crop.py audit `
-  "C:\Users\서재성\Documents\과학 문제집\고등\2022 개정" `
+  "C:\Users\USER\Documents\과학 문제집\고등\2022 개정" `
   --out output\audit_high_2022.json `
   --workers 4
 ```
@@ -163,7 +163,7 @@ uv run python question_crop.py audit `
 
 ```powershell
 uv run python question_crop.py run `
-  "C:\Users\서재성\Documents\과학 문제집\고등\2022 개정\오투 통합과학1 (25년)\오투 통합과학1 본문 (학생용).pdf" `
+  "C:\Users\USER\Documents\과학 문제집\고등\2022 개정\오투 통합과학1 (25년)\오투 통합과학1 본문 (학생용).pdf" `
   --out runs\pilot `
   --pages 36 `
   --triage always `
@@ -203,7 +203,7 @@ uv run python question_crop.py benchmark benchmarks\high22_stress.json `
 
 ```powershell
 uv run python question_crop.py run `
-  "C:\Users\서재성\Documents\과학 문제집\고등\2022 개정" `
+  "C:\Users\USER\Documents\과학 문제집\고등\2022 개정" `
   --out runs\high22 `
   --model gpt-5.6-sol `
   --workers 2 `

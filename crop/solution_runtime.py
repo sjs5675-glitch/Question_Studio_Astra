@@ -60,6 +60,7 @@ from solution_link import (
     PageIdentity,
     PairVerification,
     PrintedPageRange,
+    ProblemBoundary,
     ProblemIndex,
     ProblemItem,
     QUICK_ANSWER_FRONT_MATTER_PAGES,
@@ -1240,6 +1241,45 @@ def _hint_number_scope_label(hint: Mapping[str, Any]) -> object:
     return next(iter(prefixes)) if len(prefixes) == 1 else scope
 
 
+def _hint_reference_document(raw_text: object) -> str:
+    text = unicodedata.normalize("NFKC", str(raw_text or "")).casefold()
+    if "문제편" in text:
+        return "problem"
+    if re.search(r"해설편|해설서|정답\s*(?:과|및|&)\s*해설|정답친해", text):
+        return "solution"
+    return "unknown"
+
+
+def _source_bound_problem_page_candidates(
+    hints: Mapping[int, Mapping[str, Any]], total_pages: int
+) -> dict[int, int]:
+    candidates: dict[int, set[int]] = {}
+    for source_index, hint in hints.items():
+        source_printed = hint.get("problem_printed_page")
+        if isinstance(source_printed, bool) or not isinstance(source_printed, int):
+            continue
+        for anchor in hint.get("anchors", []):
+            if not isinstance(anchor, Mapping) or anchor.get(
+                "reference_document", "unknown"
+            ) != "problem":
+                continue
+            start = anchor.get("printed_start")
+            end = anchor.get("printed_end")
+            if isinstance(start, bool) or not isinstance(start, int):
+                continue
+            if not isinstance(end, int) or isinstance(end, bool):
+                end = start + FALLBACK_ANCHOR_WINDOW_PAGES - 1
+            for printed_page in range(start, end + 1):
+                pdf_index = source_index + printed_page - source_printed
+                if 0 <= pdf_index < total_pages:
+                    candidates.setdefault(pdf_index, set()).add(printed_page)
+    return {
+        pdf_index: next(iter(values))
+        for pdf_index, values in candidates.items()
+        if len(values) == 1
+    }
+
+
 def _numbering_scope_path(
     hint: Mapping[str, Any], fallback: tuple[str, ...]
 ) -> tuple[str, ...]:
@@ -1375,6 +1415,7 @@ def _recover_bracketed_anchor_spans(
             for right in ordered
             if right.sequence == right_sequence
             and left.segment_id == right.segment_id
+            and left.reference_document == right.reference_document
             and left.segment_id != "ambiguous"
             and left.page_range.start <= right.page_range.start
             and left.confidence >= 0.9
@@ -1427,6 +1468,7 @@ def _recover_bracketed_anchor_spans(
             True,
             source,
             (reason,),
+            left.reference_document,
         )
     return recovered
 
@@ -2792,6 +2834,94 @@ def _verification_envelope(schema: Mapping[str, Any]) -> dict[str, Any]:
     return envelope
 
 
+def _ordered_neighbor_context(
+    problem: ProblemItem,
+    asset: SolutionAsset,
+    problems: Sequence[ProblemItem],
+    assets: Sequence[SolutionAsset],
+    problem_source_sha256: str,
+    solution_source_sha256: str,
+) -> dict[str, Any]:
+    problem_scope = sorted(
+        (item for item in problems if item.scope_id == problem.scope_id),
+        key=lambda item: item.sequence,
+    )
+    candidate_scope = sorted(
+        (
+            item
+            for item in assets
+            if item.scope_id == asset.scope_id
+            and item.source_document == asset.source_document
+        ),
+        key=lambda item: item.sequence,
+    )
+
+    def window[T](values: Sequence[T], target: T, sequence: Callable[[T], int]) -> tuple[T, ...]:
+        before = [value for value in values if sequence(value) < sequence(target)][-2:]
+        after = [value for value in values if sequence(value) > sequence(target)][:2]
+        return tuple((*before, *after))
+
+    problem_neighbors = window(problem_scope, problem, lambda item: item.sequence)
+    candidate_neighbors = window(candidate_scope, asset, lambda item: item.sequence)
+    problem_relations: dict[str, set[str]] = {}
+    candidate_relations: dict[str, set[str]] = {}
+    for item in problem_neighbors:
+        problem_relations.setdefault(item.parent_number, set()).add(
+            "before" if item.sequence < problem.sequence else "after"
+        )
+    for item in candidate_neighbors:
+        candidate_relations.setdefault(item.parent_number, set()).add(
+            "before" if item.sequence < asset.sequence else "after"
+        )
+    shared = set(problem_relations) & set(candidate_relations)
+    comparable = {
+        label
+        for label in shared
+        if len(problem_relations[label]) == len(candidate_relations[label]) == 1
+    }
+    if any(problem_relations[label] != candidate_relations[label] for label in comparable):
+        order_match = "mismatch"
+    elif comparable:
+        order_match = "match"
+    else:
+        order_match = "unknown"
+    candidate_source_sha256 = (
+        problem_source_sha256
+        if asset.source_document == "problem"
+        else solution_source_sha256
+    )
+    context = {
+        "problem_sequence": problem.sequence,
+        "candidate_sequence": asset.sequence,
+        "problem_source_sha256": problem_source_sha256,
+        "candidate_source_sha256": candidate_source_sha256,
+        "candidate_source_document": asset.source_document,
+        "problem_neighbors": [
+            {
+                "item_id": item.item_id,
+                "parent_number": item.parent_number,
+                "sequence": item.sequence,
+                "relation": "before" if item.sequence < problem.sequence else "after",
+            }
+            for item in problem_neighbors
+        ],
+        "candidate_neighbors": [
+            {
+                "asset_id": item.asset_id,
+                "parent_number": item.parent_number,
+                "sequence": item.sequence,
+                "relation": "before" if item.sequence < asset.sequence else "after",
+                "printed_pages": list(item.printed_pages),
+                "source_document": item.source_document,
+            }
+            for item in candidate_neighbors
+        ],
+        "computed_monotonic_order_match": order_match,
+    }
+    context["context_sha256"] = quality.identity(context)
+    return context
+
+
 def _verification_prompt(
     template: str,
     problem: ProblemItem,
@@ -2799,6 +2929,7 @@ def _verification_prompt(
     pair: CandidatePair,
     corroborating: SolutionAsset | None = None,
     source_context: Mapping[str, Any] | None = None,
+    order_context: Mapping[str, Any] | None = None,
 ) -> str:
     metadata = {
         "item_id": problem.item_id,
@@ -2852,7 +2983,12 @@ def _verification_prompt(
         QUESTION_METADATA=json.dumps(metadata, ensure_ascii=False),
         CANDIDATE_METADATA=json.dumps(candidate, ensure_ascii=False),
         SEQUENCE_CONTEXT=json.dumps(
-            {"problem_sequence": problem.sequence, "candidate_sequence": asset.sequence},
+            order_context
+            or {
+                "problem_sequence": problem.sequence,
+                "candidate_sequence": asset.sequence,
+                "computed_monotonic_order_match": "unknown",
+            },
             ensure_ascii=False,
         ),
         ATTACHMENT_MAP=(
@@ -3047,8 +3183,10 @@ class RuntimeState:
     solution_index: SolutionIndex | None = None
     solution_page_map: tuple[PageIdentity, ...] = ()
     solution_texts: tuple[PageText, ...] = ()
+    problem_texts: tuple[PageText, ...] = ()
     problem_hints: dict[int, dict[str, Any]] = field(default_factory=dict)
     block_results: dict[int, dict[str, Any]] = field(default_factory=dict)
+    problem_block_results: dict[int, dict[str, Any]] = field(default_factory=dict)
     calibration_results: dict[int, dict[str, Any]] = field(default_factory=dict)
     problem_items_by_id: dict[str, ProblemItem] = field(default_factory=dict)
     problem_hierarchy_by_id: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -3654,6 +3792,11 @@ class SolutionRuntimeAdapter:
             )
             if result is None:
                 return None
+            for anchor in result.get("anchors", []):
+                if isinstance(anchor, dict) and "reference_document" not in anchor:
+                    anchor["reference_document"] = _hint_reference_document(
+                        anchor.get("raw_text")
+                    )
             validate_contract(result, json.loads(HINT_SCHEMA.read_text(encoding="utf-8")))
             if result["problem_pdf_index"] != page_index or result["problem_pdf_page"] != page_index + 1:
                 return None
@@ -3787,10 +3930,20 @@ class SolutionRuntimeAdapter:
         text: str,
         total_pages: int,
         target_labels: Sequence[str] = (),
+        source_document: str = "solution",
     ) -> dict[str, Any] | None:
         calibration_only = bool(target_labels)
+        source_pdf = (
+            self._source_pdf(state)
+            if source_document == "problem"
+            else context.solution_path
+        )
         cache = (
-            state.calibration_results if calibration_only else state.block_results
+            state.calibration_results
+            if calibration_only
+            else state.problem_block_results
+            if source_document == "problem"
+            else state.block_results
         )
         if page_index in cache:
             return cache[page_index]
@@ -3799,14 +3952,14 @@ class SolutionRuntimeAdapter:
                 context.run_dir
                 / "solutions"
                 / "render"
-                / _digest_file(context.solution_path)[:12]
+                / _digest_file(source_pdf)[:12]
             )
             images, attachment_map = self._attachments(
-                context.solution_path, render_root, page_index, total_pages, text, None
+                source_pdf, render_root, page_index, total_pages, text, None
             )
             prompt = _solution_prompt(
                 BLOCK_PROMPT.read_text(encoding="utf-8"),
-                context.solution_path,
+                source_pdf,
                 page_index,
                 attachment_map,
                 text,
@@ -3832,6 +3985,8 @@ class SolutionRuntimeAdapter:
                 context,
                 "solution-page-calibration"
                 if calibration_only
+                else "problem-solution-blocks"
+                if source_document == "problem"
                 else "solution-blocks",
                 prompt,
                 images,
@@ -4161,6 +4316,7 @@ class SolutionRuntimeAdapter:
             )
             for hint in state.problem_hints.values()
             for anchor in hint.get("anchors", [])
+            if anchor.get("reference_document", "unknown") in {"solution", "unknown"}
         ]
         anchor_starts = {start for start, _end in anchor_ranges}
         anchor_required_pages = anchor_starts | {
@@ -4303,6 +4459,7 @@ class SolutionRuntimeAdapter:
         except Exception as exc:
             raise StageHookError(f"cannot read problem PDF: {exc}") from exc
         total_pages = int(state.run_state.get("total_pages") or len(problem_texts))
+        state.problem_texts = problem_texts
         source_pages = sorted(
             {
                 int(page) - 1
@@ -4422,6 +4579,32 @@ class SolutionRuntimeAdapter:
         state.scope_section_paths = {
             item.scope.identity: item.scope.section_path for item in scoped
         }
+        printed_problem = recover_internal_printed_page_gaps(
+            stabilize_printed_page_candidates(
+                {
+                    page.pdf_index: (
+                        printed_page_from_text(page.text)
+                        if page.quality == "usable"
+                        else None
+                    )
+                    for page in problem_texts
+                }
+            )
+        )
+        printed_problem.update(
+            {
+                page: hint.get("problem_printed_page")
+                for page, hint in state.problem_hints.items()
+                if hint.get("problem_printed_page") is not None
+            }
+        )
+        for page_index, printed_page in _source_bound_problem_page_candidates(
+            state.problem_hints, total_pages
+        ).items():
+            current = printed_problem.get(page_index)
+            if current in {None, printed_page}:
+                printed_problem[page_index] = printed_page
+        problem_page_map = build_page_map(total_pages, printed_problem, "problem")
         solution_map = self._ensure_solution_page_map(context, state)
 
         raw_anchors: list[StartAnchor] = []
@@ -4432,6 +4615,10 @@ class SolutionRuntimeAdapter:
                 if page_index + 1 in item.get("source_pages", [])
             ]
             for anchor_index, anchor in enumerate(hint.get("anchors", []), 1):
+                reference_document = str(
+                    anchor.get("reference_document")
+                    or _hint_reference_document(anchor.get("raw_text"))
+                ).casefold()
                 labels: set[str] = set()
                 for label in anchor.get("target_question_labels", []):
                     if not str(label).strip():
@@ -4455,12 +4642,25 @@ class SolutionRuntimeAdapter:
                     scoped_targets = [
                         item_id for item_id in targets if scope_by_item[item_id].scope.identity == scope_id
                     ]
+                    reference_map = (
+                        problem_page_map
+                        if reference_document == "problem"
+                        else solution_map
+                        if reference_document == "solution"
+                        else (*problem_page_map, *solution_map)
+                    )
                     segments = {
                         page.segment_id
-                        for page in solution_map
+                        for page in reference_map
                         if page.printed_page == int(anchor["printed_start"])
                     }
-                    segment_id = next(iter(segments)) if len(segments) == 1 else "ambiguous"
+                    segment_id = (
+                        "unknown"
+                        if reference_document == "unknown"
+                        else next(iter(segments))
+                        if len(segments) == 1
+                        else "ambiguous"
+                    )
                     page_range = PrintedPageRange(
                         int(anchor["printed_start"]),
                         int(anchor["printed_end"]) if anchor.get("printed_end") is not None else None,
@@ -4475,11 +4675,30 @@ class SolutionRuntimeAdapter:
                             scope_id,
                             segment_id,
                             page_range,
-                            float(anchor["confidence"]) if len(segments) == 1 else 0.0,
+                            float(anchor["confidence"]) if segments else 0.0,
+                            reference_document,
                         )
                     )
 
-        propagated = propagate_problem_anchors(raw_anchors, scoped)
+        boundary_sequences = {
+            min(
+                scope_by_item[item_id].item.sequence
+                for item_id in state.manifest_items_by_id
+                if page_index + 1
+                in state.manifest_items_by_id[item_id].get("source_pages", [])
+            )
+            for page_index, hint in state.problem_hints.items()
+            if hint.get("numbering_scope", {}).get("reset_signal") == "yes"
+            and any(
+                page_index + 1 in item.get("source_pages", [])
+                for item in state.manifest_items_by_id.values()
+            )
+        }
+        problem_boundaries = tuple(
+            ProblemBoundary(sequence, "numbering_reset")
+            for sequence in sorted(boundary_sequences)
+        )
+        propagated = propagate_problem_anchors(raw_anchors, scoped, problem_boundaries)
         propagated_ids: dict[str, set[str]] = {anchor.anchor_id: set(anchor.item_ids) for anchor in raw_anchors}
         for item_id, anchor in propagated.items():
             propagated_ids.setdefault(anchor.anchor_id, set()).add(item_id)
@@ -4494,9 +4713,10 @@ class SolutionRuntimeAdapter:
         # monotonic order and independent VLM verification still guard every
         # candidate.  Full-book runs continue to use the earlier next anchor.
         available_by_segment: dict[str, set[int]] = {}
-        for page in solution_map:
+        for page in (*problem_page_map, *solution_map):
             if page.printed_page is not None:
                 available_by_segment.setdefault(page.segment_id, set()).add(page.printed_page)
+                available_by_segment.setdefault("unknown", set()).add(page.printed_page)
         fallback_boundaries: list[AnchorBoundary] = []
         for anchor in enriched:
             has_later_anchor = any(
@@ -4512,7 +4732,35 @@ class SolutionRuntimeAdapter:
                 fallback_boundaries.append(
                     AnchorBoundary(anchor.segment_id, boundary_page, "bounded_probe_window")
                 )
-        spans = expand_start_anchors(enriched, solution_map, fallback_boundaries)
+        unknown_map = tuple(
+            replace(page, segment_id="unknown")
+            for page in (*problem_page_map, *solution_map)
+        )
+        spans = tuple(
+            span
+            for reference_document, page_map in (
+                ("problem", problem_page_map),
+                ("solution", solution_map),
+                ("unknown", unknown_map),
+            )
+            for span in expand_start_anchors(
+                tuple(
+                    anchor
+                    for anchor in enriched
+                    if anchor.reference_document == reference_document
+                ),
+                page_map,
+                tuple(
+                    boundary
+                    for boundary in fallback_boundaries
+                    if any(
+                        anchor.reference_document == reference_document
+                        and anchor.segment_id == boundary.segment_id
+                        for anchor in enriched
+                    )
+                ),
+            )
+        )
         span_by_anchor = {anchor_id: span for span in spans for anchor_id in span.anchor_ids}
         bracketed_spans = _recover_bracketed_anchor_spans(
             scoped,
@@ -4549,13 +4797,9 @@ class SolutionRuntimeAdapter:
                     column,
                     owner_id,
                     state.problem_crop_search_eligible_by_id.get(item_id, False),
-                    item_id in state.prior_missing_detailed_ids,
+                    item_id in state.prior_missing_detailed_ids and not context.force,
                 )
             )
-        printed_problem = {
-            page: hint.get("problem_printed_page") for page, hint in state.problem_hints.items()
-        }
-        problem_page_map = build_page_map(total_pages, printed_problem, "problem")
         state.problem_index = ProblemIndex(
             common_book_id,
             problem_page_map,
@@ -4771,7 +5015,6 @@ class SolutionRuntimeAdapter:
             or problem.group_label is not None
             or problem.subquestion_label is not None
             or not problem.parent_number.isdigit()
-            or int(problem.parent_number) < 10
         ):
             return False
         peers = sorted(
@@ -5512,12 +5755,21 @@ class SolutionRuntimeAdapter:
         ]
 
     def _block_assets(
-        self, state: RuntimeState, problem_index: ProblemIndex, *, expanded: bool = False
+        self,
+        state: RuntimeState,
+        problem_index: ProblemIndex,
+        *,
+        expanded: bool = False,
+        page_map: Sequence[PageIdentity] | None = None,
+        block_results: Mapping[int, Mapping[str, Any]] | None = None,
+        source_document: str = "solution",
     ) -> tuple[SolutionAsset, ...]:
-        page_by_index = {page.pdf_index: page for page in state.solution_page_map}
+        current_page_map = tuple(page_map or state.solution_page_map)
+        current_results = block_results or state.block_results
+        page_by_index = {page.pdf_index: page for page in current_page_map}
         drafts: list[dict[str, Any]] = []
         pending: list[dict[str, Any]] = []
-        for page_index, result in sorted(state.block_results.items()):
+        for page_index, result in sorted(current_results.items()):
             page_identity_value = page_by_index.get(page_index)
             if expanded and page_identity_value is not None:
                 try:
@@ -5533,8 +5785,8 @@ class SolutionRuntimeAdapter:
                     if any(
                         other.pdf_index != page_index
                         and other.segment_id == page_identity_value.segment_id
-                        and (other.printed_page == observed or state.block_results.get(other.pdf_index, {}).get("solution_printed_page") == observed)
-                        for other in state.solution_page_map
+                        and (other.printed_page == observed or current_results.get(other.pdf_index, {}).get("solution_printed_page") == observed)
+                        for other in current_page_map
                     ):
                         continue
                     page_identity_value = replace(page_identity_value, printed_page=observed)
@@ -5741,7 +5993,13 @@ class SolutionRuntimeAdapter:
                             expanded and problem.anchor is None
                             or problem.anchor is not None
                             and problem.anchor.resolved
-                            and problem.anchor.segment_id == page_identity_value.segment_id
+                            and problem.anchor.reference_document
+                            in {"unknown", source_document}
+                            and (
+                                problem.anchor.reference_document == "unknown"
+                                or problem.anchor.segment_id
+                                == page_identity_value.segment_id
+                            )
                             and (expanded or _problem_allows_solution_page(
                                 problem, page_identity_value.printed_page, role
                             ))
@@ -5753,6 +6011,14 @@ class SolutionRuntimeAdapter:
                         for problem, score in scored_problems
                         if score == best_score and score > 0
                     }
+                    review_reason = None
+                    if not matching_scopes and role == SolutionRole.DETAILED_SOLUTION:
+                        referenced_scopes = {
+                            problem.scope_id for problem, _score in scored_problems
+                        }
+                        if len(referenced_scopes) == 1:
+                            matching_scopes = referenced_scopes
+                            review_reason = "referenced_scope_mismatch"
                     if len(matching_scopes) > 1 and all(problem.anchor is not None for problem, _score in scored_problems):
                         block_column = _bbox_column(block.get("bbox"))
                         column_scopes = {
@@ -5774,6 +6040,8 @@ class SolutionRuntimeAdapter:
                     prefix = "answer" if role == SolutionRole.QUICK_ANSWER else "explanation"
                     if role == SolutionRole.MIXED:
                         prefix = "mixed"
+                    if source_document == "problem":
+                        prefix = "problem-" + prefix
                     draft = {
                         "asset_id": f"{prefix}-p{page_index + 1:04d}-b{block_index:02d}-e{entry_index:02d}",
                         "role": role,
@@ -5791,6 +6059,7 @@ class SolutionRuntimeAdapter:
                         ),
                         "explicit_answer": entry.get("explicit_answer_text"),
                         "confidence": min(float(block["confidence"]), float(entry["confidence"])),
+                        "review_reason": review_reason,
                         "continuation_label": continuation_label,
                         "next_pdf_index": page_index + 1,
                     }
@@ -5839,6 +6108,8 @@ class SolutionRuntimeAdapter:
                 tuple(str(value) for value in draft["fingerprints"]),
                 draft["explicit_answer"],
                 draft["confidence"],
+                source_document=source_document,
+                review_reason=draft["review_reason"],
             )
             for draft in merged_drafts
         )
@@ -5940,43 +6211,69 @@ class SolutionRuntimeAdapter:
         page_map = self._ensure_solution_page_map(context, state)
         text_by_page = {page.pdf_index: page.text for page in state.solution_texts}
         quality_by_page = {page.pdf_index: page.quality for page in state.solution_texts}
-
-        def quick_probe(page: PageIdentity) -> bool:
-            if quality_by_page.get(page.pdf_index) != "usable":
-                return True
-            return _looks_like_quick_answer_text(
-                text_by_page.get(page.pdf_index, "")
-            )
-
-        candidate_pages = {
-            page.pdf_index
-            for page in page_map
-            if page.printed_page is not None
-            and any(
-                problem.anchor is not None
-                and problem.anchor.resolved
-                and problem.anchor.segment_id == page.segment_id
-                and (
-                    problem.anchor.page_range.contains(page.printed_page)
-                    or (
-                        max(
-                            1,
-                            problem.anchor.page_range.start
-                            - QUICK_ANSWER_LOOKBACK_PAGES,
-                        )
-                        <= page.printed_page
-                        < problem.anchor.page_range.start
-                        and quick_probe(page)
-                    )
-                    or (
-                        page.pdf_index < QUICK_ANSWER_FRONT_MATTER_PAGES
-                        and page.printed_page < problem.anchor.page_range.start
-                        and quick_probe(page)
-                    )
-                )
-                for problem in problem_index.items
-            )
+        problem_text_by_page = {
+            page.pdf_index: page.text for page in state.problem_texts
         }
+        problem_quality_by_page = {
+            page.pdf_index: page.quality for page in state.problem_texts
+        }
+
+        def candidate_pages_for(
+            document: str,
+            document_page_map: Sequence[PageIdentity],
+            document_text: Mapping[int, str],
+            document_quality: Mapping[int, str],
+        ) -> set[int]:
+            def document_quick_probe(page: PageIdentity) -> bool:
+                if document_quality.get(page.pdf_index) != "usable":
+                    return True
+                return _looks_like_quick_answer_text(
+                    document_text.get(page.pdf_index, "")
+                )
+
+            return {
+                page.pdf_index
+                for page in document_page_map
+                if page.printed_page is not None
+                and any(
+                    problem.anchor is not None
+                    and problem.anchor.resolved
+                    and problem.anchor.reference_document in {"unknown", document}
+                    and (
+                        problem.anchor.reference_document == "unknown"
+                        or problem.anchor.segment_id == page.segment_id
+                    )
+                    and (
+                        problem.anchor.page_range.contains(page.printed_page)
+                        or (
+                            max(
+                                1,
+                                problem.anchor.page_range.start
+                                - QUICK_ANSWER_LOOKBACK_PAGES,
+                            )
+                            <= page.printed_page
+                            < problem.anchor.page_range.start
+                            and document_quick_probe(page)
+                        )
+                        or (
+                            page.pdf_index < QUICK_ANSWER_FRONT_MATTER_PAGES
+                            and page.printed_page < problem.anchor.page_range.start
+                            and document_quick_probe(page)
+                        )
+                    )
+                    for problem in problem_index.items
+                )
+            }
+
+        candidate_pages = candidate_pages_for(
+            "solution", page_map, text_by_page, quality_by_page
+        )
+        problem_candidate_pages = candidate_pages_for(
+            "problem",
+            problem_index.page_map,
+            problem_text_by_page,
+            problem_quality_by_page,
+        )
         candidate_pages.update(
             _anchor_window_null_page_indices(page_map, problem_index.items)
         )
@@ -5991,11 +6288,51 @@ class SolutionRuntimeAdapter:
                     len(page_map),
                 )
                 for page_index in sorted(candidate_pages)
+            ] + [
+                executor.submit(
+                    self._detect_solution_block,
+                    context,
+                    state,
+                    page_index,
+                    problem_text_by_page.get(page_index, ""),
+                    len(problem_index.page_map),
+                    (),
+                    "problem",
+                )
+                for page_index in sorted(problem_candidate_pages)
             ]
             for future in as_completed(futures):
                 future.result()
-        if candidate_pages and not (candidate_pages & set(state.block_results)):
+        required_detections = bool(candidate_pages or problem_candidate_pages)
+        available_detections = bool(
+            candidate_pages & set(state.block_results)
+            or problem_candidate_pages & set(state.problem_block_results)
+        )
+        if required_detections and not available_detections:
             raise StageHookError("all required solution-block detections failed")
+        for document, requested, completed, document_map in (
+            ("solution", candidate_pages, set(state.block_results), page_map),
+            (
+                "problem",
+                problem_candidate_pages,
+                set(state.problem_block_results),
+                problem_index.page_map,
+            ),
+        ):
+            if requested:
+                state.search_trace.append(
+                    {
+                        "stage": "current",
+                        "source_document": document,
+                        "new_pages": sorted(requested & completed),
+                        "failed_pages": sorted(requested - completed),
+                        "remaining_pages": [],
+                        "reused_pages": [],
+                        "uninspected_pages": sorted(
+                            {page.pdf_index for page in document_map} - completed
+                        ),
+                    }
+                )
         for page_index in sorted(candidate_pages):
             self._refine_quick_answer_blocks(
                 context,
@@ -6005,6 +6342,13 @@ class SolutionRuntimeAdapter:
                 len(page_map),
             )
         canonical_assets = self._block_assets(state, problem_index)
+        problem_document_assets = self._block_assets(
+            state,
+            problem_index,
+            page_map=problem_index.page_map,
+            block_results=state.problem_block_results,
+            source_document="problem",
+        )
         recovery_assets: tuple[SolutionAsset, ...] = ()
         shared_parent_assets: tuple[SolutionAsset, ...] = ()
         parent_review_assets: tuple[SolutionAsset, ...] = ()
@@ -6029,6 +6373,7 @@ class SolutionRuntimeAdapter:
         )
         assets = (
             canonical_assets
+            + problem_document_assets
             + recovery_assets
             + shared_parent_assets
             + parent_review_assets
@@ -6541,15 +6886,6 @@ class SolutionRuntimeAdapter:
                 [] if not review_reason else [str(review_reason)]
             )
         if (
-            result.get("decision") == "verified"
-            and result.get("same_question") == "yes"
-            and result.get("target_identifier_visible") is True
-            and result.get("neighbor_entry_absent") is True
-            and result.get("next_question_absent") is True
-            and result.get("monotonic_order_match") in {None, "unknown"}
-        ):
-            result["monotonic_order_match"] = "match"
-        if (
             role == SolutionRole.QUICK_ANSWER
             and result.get("decision") == "verified"
             and result.get("same_question") == "yes"
@@ -6591,6 +6927,7 @@ class SolutionRuntimeAdapter:
         result: Mapping[str, Any],
         problem: ProblemItem,
         asset: SolutionAsset,
+        order_context: Mapping[str, Any] | None = None,
     ) -> tuple[str, ...]:
         errors: list[str] = []
         if result.get("question_id") != problem.item_id:
@@ -6599,6 +6936,23 @@ class SolutionRuntimeAdapter:
             errors.append("candidate_ids do not contain the supplied asset")
         if result.get("candidate_role") != asset.role.value:
             errors.append("candidate_role does not match the supplied asset")
+        if (
+            problem.anchor is not None
+            and problem.anchor.reference_document != "unknown"
+            and problem.anchor.reference_document != asset.source_document
+        ):
+            errors.append("candidate source document contradicts the problem reference")
+        computed_order = (
+            order_context.get("computed_monotonic_order_match")
+            if order_context is not None
+            else None
+        )
+        if computed_order in {"mismatch", "unknown"} and result.get(
+            "monotonic_order_match"
+        ) != computed_order:
+            errors.append(
+                "monotonic_order_match contradicts deterministic neighbor evidence"
+            )
 
         neighbor_state = cls._neighbor_evidence_state(result)
         if neighbor_state == "present" and result.get("next_question_absent") is True:
@@ -7253,6 +7607,7 @@ class SolutionRuntimeAdapter:
         *,
         problem: ProblemItem,
         asset: SolutionAsset,
+        order_context: Mapping[str, Any] | None = None,
         cache_only: bool = False,
     ) -> dict[str, Any] | None:
         if provider != "astra":
@@ -7297,7 +7652,7 @@ class SolutionRuntimeAdapter:
             except ContractError as exc:
                 return value, str(exc), ()
             return value, None, self._verification_semantic_errors(
-                value, problem, asset
+                value, problem, asset, order_context
             )
 
         def cached(
@@ -7746,8 +8101,22 @@ class SolutionRuntimeAdapter:
                 source_context['source_context_images'] = [{key:value for key,value in record.items() if key!='path'} for record in supplied['source_context_images']]
         except (OSError, ValueError, KeyError):
             return None, None, None
+        order_context = _ordered_neighbor_context(
+            problem,
+            asset,
+            state.problem_index.items if state.problem_index is not None else (problem,),
+            tuple(state.assets_by_id.values()),
+            _digest_file(self._source_pdf(state)),
+            _digest_file(context.solution_path),
+        )
         prompt = _verification_prompt(
-            template, problem, asset, pair, corroborating, source_context
+            template,
+            problem,
+            asset,
+            pair,
+            corroborating,
+            source_context,
+            order_context,
         )
         learning = self._learning_prompt(context, state, problem, asset)
         if (
@@ -7771,7 +8140,18 @@ class SolutionRuntimeAdapter:
         directory = context.run_dir / "solutions" / "detections" / "verifications"
         suffix = "" if not tag else "-" + re.sub(r"[^0-9A-Za-z_-]+", "-", tag)
         stem = f"{problem.item_id}-{asset.asset_id}{suffix}"
-        gemini = self._provider_result(context, "astra", prompt, envelope, images, directory / f"{stem}-astra.json", problem=problem, asset=asset, cache_only=cache_only)
+        gemini = self._provider_result(
+            context,
+            "astra",
+            prompt,
+            envelope,
+            images,
+            directory / f"{stem}-astra.json",
+            problem=problem,
+            asset=asset,
+            order_context=order_context,
+            cache_only=cache_only,
+        )
         gemini = self._valid_verification_result(gemini, problem, asset)
         qwen = None
         verification = self._verification_pair(gemini, "astra-quality-pending") if gemini is not None else None

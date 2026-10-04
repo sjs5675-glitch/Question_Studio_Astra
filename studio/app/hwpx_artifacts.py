@@ -33,6 +33,8 @@ DEFAULT_PROFILE_REFS = {
 }
 LEGACY_DEFAULT_ENGINE_CONTRACTS = frozenset(
     {
+        ("question-json-studio.native_ordered.v1.0", "fe0c725b292d271d7c7f952b0503eb23bf3038e9b8038cae0383bf820a443b5d"),
+        ("question-json-studio.native_ordered.v0.9", "def5f90357e4ef2ca5741526d2e05ce65656acde74889f343d6391483e8b34b8"),
         (
             "question-json-studio.native_ordered.v0.1",
             "fd8bbfd55bdf6f52144f8f2dfa8b7692a05b3c3699977ef4bf802832d1c9a8b9",

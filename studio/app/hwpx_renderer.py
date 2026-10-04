@@ -17,7 +17,7 @@ import tempfile
 import unicodedata
 import zipfile
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 from xml.etree import ElementTree
@@ -570,6 +570,11 @@ def _load_template_context(output: OutputPlan) -> _TemplateContext:
 
 
 def _equation_geometry(script: str, writable_width: int) -> tuple[int, int, int, int]:
+    if re.fullmatch(r"[A-Za-z0-9_{}\s,~+\-]+", script) and re.search(r"\bvec\b", script):
+        vector_count = len(re.findall(r"\bvec\b", script))
+        visible = re.sub(r"\bvec\b|[{}_~\s]", "", script)
+        width = min(max(len(visible) * 450 + vector_count * 625, 525), writable_width)
+        return width, 1125, 85, 956
     reduced = re.sub(
         r"\b(?:LEFT|RIGHT|over|sqrt|times|leq|geq|rm|it|bar|sigma)\b",
         ".",
@@ -2351,10 +2356,7 @@ class _Renderer:
             raise HwpxRenderError(
                 f"item {item.item_id} has unknown question render mode: {item.question_render_mode!r}"
             )
-        identity = item.value.get("identity")
-        printed = identity.get("printed_number") if isinstance(identity, Mapping) else None
-        number = str(printed).strip() if printed is not None else ""
-        number = number or str(ordinal)
+        number = str(ordinal)
         marker = self._paragraph(
             text_xml(f"{number}."),
             f"{number}.",
@@ -2462,10 +2464,7 @@ class _Renderer:
         include_answer: bool,
         include_explanation: bool,
     ) -> None:
-        identity = item.value.get("identity")
-        printed = identity.get("printed_number") if isinstance(identity, Mapping) else None
-        number = str(printed).strip() if printed is not None else ""
-        number = number or str(ordinal)
+        number = str(ordinal)
         self._paragraph(
             text_xml(f"{number}번"),
             f"{number}번",
@@ -3105,6 +3104,19 @@ def _render_one(
     project: Mapping[str, Any],
 ) -> _RenderedPackage:
     context = _load_template_context(output)
+    if int(context.column_control.find(f"{{{HP_NS}}}colPr").get("colCount")) != 2:
+        control = copy.deepcopy(context.column_control)
+        column = control.find(f"{{{HP_NS}}}colPr")
+        if column is None:
+            raise HwpxRenderError("template column control is missing")
+        gap = round(8 * 7200 / 25.4)
+        column.set("colCount", "2")
+        column.set("sameGap", str(gap))
+        context = replace(
+            context,
+            column_control=control,
+            writable_width=(context.page_writable_width - gap) // 2,
+        )
     renderer = _Renderer(output.document_kind, context)
     export = project.get("export")
     if not isinstance(export, Mapping):
@@ -3260,6 +3272,7 @@ def render_export_plan(plan: ExportPlan) -> dict[str, Any]:
 
     plan = _fresh_plan(plan)
     receipt = copy.deepcopy(dict(plan.receipt))
+    receipt["column_count"] = 2
     project_expected_sha = str(receipt["project"]["sha256"])
     project = _json_bytes(
         _read_exact(plan.project_path, project_expected_sha, "project"), "project"

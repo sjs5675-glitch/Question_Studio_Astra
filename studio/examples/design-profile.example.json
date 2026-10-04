@@ -1,0 +1,48 @@
+{
+  "$schema": "../schemas/design-profile.schema.json",
+  "schema_version": "0.1.0",
+  "profile_id": "sample-question-a4",
+  "document_kind": "question",
+  "approval": {
+    "status": "approved",
+    "reviewer": "sample-reviewer",
+    "approved_at": "2026-08-24T20:00:00+09:00"
+  },
+  "template": {
+    "source": "user_approved_clean_hwpx",
+    "path": "templates/approved-clean-question.hwpx",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "design": {
+    "page": {
+      "width_mm": 210,
+      "height_mm": 297,
+      "orientation": "portrait",
+      "margins_mm": {
+        "top": 15,
+        "right": 15,
+        "bottom": 15,
+        "left": 15
+      }
+    },
+    "columns": {
+      "count": 1,
+      "gap_mm": 0,
+      "mixed_columns": false
+    },
+    "flow": {
+      "section_count": 1,
+      "mode": "natural",
+      "figure_placement": "inline",
+      "choice_layout": "vertical",
+      "unsupported_table": "error",
+      "page_break_between_items": false
+    },
+    "styles": {
+      "paragraph": "Body",
+      "equation": "Equation",
+      "choice": "Choice",
+      "figure_caption": "Caption"
+    }
+  }
+}

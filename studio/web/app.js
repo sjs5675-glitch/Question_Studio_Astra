@@ -6,6 +6,8 @@ import {
   selectBankSearch, updateBankSearch, bankGroupIsExpanded, setBankGroupExpanded
 } from "./bank-search-state.mjs";
 import { createDualViewState, readingAsset, readingMode, resetDualViewState, saveDualViewDraft } from "./saved-dual-view.mjs";
+import { mountExamRegion } from "./exam-region.mjs";
+import { batchAttemptPresentation } from "./device-shell.mjs";
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,7 +24,8 @@ const elements = {
   recoveryProgressStage: $("recoveryProgressStage"), recoveryProgressItem: $("recoveryProgressItem"),
   recoveryVerificationCount: $("recoveryVerificationCount"), recoveryCropCount: $("recoveryCropCount"),
   recoveryProgressUpdated: $("recoveryProgressUpdated"),
-  batchForm: $("batchForm"), sourcePdfFile: $("sourcePdfFile"), solutionPdfFile: $("solutionPdfFile"),
+  batchForm: $("batchForm"), batchProjectName: $("batchProjectName"),
+  sourcePdfFile: $("sourcePdfFile"), solutionPdfFile: $("solutionPdfFile"),
   sourcePdfPath: $("sourcePdfPath"), solutionPdfPath: $("solutionPdfPath"),
   batchPages: $("batchPages"), batchProviderProfile: $("batchProviderProfile"),
   providerProfileFull: $("providerProfileFull"), providerProfileCodexOnly: $("providerProfileCodexOnly"),
@@ -42,6 +45,7 @@ const elements = {
   coverageRegistered: $("coverageRegistered"), coverageDetailed: $("coverageDetailed"),
   coverageQuickOnly: $("coverageQuickOnly"), coverageReview: $("coverageReview"),
   coverageMissing: $("coverageMissing"), coverageVerified: $("coverageVerified"),
+  coverageConflict: $("coverageConflict"), coverageCandidates: $("coverageCandidates"),
   firstBlockerSummary: $("firstBlockerSummary"),
   welcome: $("welcomePanel"), workspace: $("itemWorkspace"), itemContext: $("itemContext"),
   itemTitle: $("itemTitle"), workflow: $("workflowValue"), revision: $("revisionValue"),
@@ -114,7 +118,11 @@ const elements = {
   selectBankPage: $("selectBankPage"), addSelectedBankItems: $("addSelectedBankItems"), bankTargetSet: $("bankTargetSet"), bankSavedSetLink: $("bankSavedSetLink"), bankSelectionStatus: $("bankSelectionStatus"),
   createQuestionSet: $("createQuestionSet"), setsEmpty: $("setsEmpty"), questionSetList: $("questionSetList"),
   setWorkspace: $("setWorkspace"), setWelcome: $("setWelcome"), setEditor: $("setEditor"), setTitle: $("setTitle"),
-  saveQuestionSet: $("saveQuestionSet"), buildQuestionSetHwpx: $("buildQuestionSetHwpx"), setItemCount: $("setItemCount"),
+  saveQuestionSet: $("saveQuestionSet"), buildQuestionSetHwpx: $("buildQuestionSetHwpx"), buildQuestionSetPdf: $("buildQuestionSetPdf"),
+  cancelQuestionSetPdf: $("cancelQuestionSetPdf"), deleteQuestionSet: $("deleteQuestionSet"), openSetPicker: $("openSetPicker"),
+  setPicker: $("setPicker"), closeSetPicker: $("closeSetPicker"), setPickerProject: $("setPickerProject"),
+  setPickerQuery: $("setPickerQuery"), retrySetPicker: $("retrySetPicker"), setPickerStatus: $("setPickerStatus"),
+  setPickerList: $("setPickerList"), setPickerCount: $("setPickerCount"), addSetPickerItems: $("addSetPickerItems"), setItemCount: $("setItemCount"),
   setItemsEmpty: $("setItemsEmpty"), setItemList: $("setItemList"), setOrderAnnouncement: $("setOrderAnnouncement"),
   setBuildResult: $("setBuildResult"), setBuildStatus: $("setBuildStatus"), setBuildChecks: $("setBuildChecks"), setDownloadLinks: $("setDownloadLinks")
 };
@@ -136,7 +144,8 @@ const state = {
   dirty: false, busy: false, taggingAll: false, previewTimer: null, messageTimer: null,
   view: "work", bankItems: [], bankBusy: false, bankSelection: new Set(), bankPending: new Set(), questionSets: [], activeSetId: null,
   bankSearch: createBankSearchState(), bankLoadError: null,
-  activeSet: null, setBusy: false, setDirty: false, draggedSetIndex: null
+  activeSet: null, setBusy: false, setDirty: false, draggedSetIndex: null,
+  setPickerSelection: new Set(), setPickerLoading: false
 };
 
 const BBOX_STEP = 0.005;
@@ -280,16 +289,40 @@ function registrationLabel(value) {
 
 function explanationInputLabel(value) {
   const link = value?.solution_link;
-  if (link?.transcribed === true) return "해설 타이핑 완료";
-  if (link?.transcription_state === "failed") return "해설 타이핑 실패";
-  if (link?.transcription_state === "running") return "해설 타이핑 중";
-  return link?.source_present ? "해설 원본 있음 · 타이핑 대기" : "해설 원본 없음";
+  const integrity = String(link?.source_integrity || "");
+  if (integrity === "missing_file") return "해설 원본 파일 없음";
+  if (integrity === "hash_mismatch") return "해설 원본 해시 불일치";
+  if (link?.transcribed === true && link?.answer_only_transcribed === true) return "정답 타이핑 완료 · 해설 비어 있음";
+  if (link?.transcribed === true) return link?.quick_answer_only ? "정답 타이핑 완료 · 상세 해설 없음" : "해설 타이핑 완료";
+  if (link?.transcription_state === "failed") return link?.quick_answer_only ? "정답 타이핑 실패 · 상세 해설 없음" : "해설 타이핑 실패";
+  if (link?.transcription_state === "running") return link?.quick_answer_only ? "정답 타이핑 중 · 상세 해설 없음" : "해설 타이핑 중";
+  if (link?.transcription_state === "generated_pending_apply") return "해설 원본 있음 · 초안 있음";
+  if (link?.quick_answer_only === true && solutionAssetPresent(link)) return "정답 원본만 있음 · 상세 해설 없음";
+  if (link?.previous_transcription_present === true) return "기존 타이핑 있음 · 현재 해설 원본 확인 필요";
+  if (solutionAssetPresent(link) && solutionLinkState(link) === "review") return "해설 원본 있음 · 검토 필요";
+  return solutionAssetPresent(link) ? "해설 원본 있음 · 타이핑 대기" : "해설 원본 없음";
 }
 
 function needsAttention(value) {
   const link = value?.solution_link;
-  return !link?.source_present || link?.transcription_state === "failed"
-    || (link?.transcribed && ["review", "mismatch", "failed"].includes(link?.verification_state));
+  return !solutionAssetPresent(link) || ["missing_file", "hash_mismatch"].includes(link?.source_integrity)
+    || link?.transcription_state === "failed"
+    || ["no_candidate", "unverified", "review", "mismatch", "conflict"].includes(solutionLinkState(link));
+}
+
+function solutionAssetPresent(summary) {
+  return typeof summary?.source_asset_present === "boolean"
+    ? summary.source_asset_present
+    : summary?.source_present === true;
+}
+
+function solutionLinkState(summary) {
+  const state = String(summary?.link_state || "");
+  if (["no_candidate", "unverified", "review", "verified", "mismatch", "conflict"].includes(state)) return state;
+  if (summary?.status === "verified") return "verified";
+  if (summary?.verification_state === "mismatch") return "mismatch";
+  if (["review", "failed"].includes(summary?.verification_state) || summary?.status === "review") return "review";
+  return solutionAssetPresent(summary) ? "unverified" : "no_candidate";
 }
 
 function tagsOf(value) {
@@ -612,6 +645,19 @@ function progressPercent(value) {
 function batchSummary(job) {
   const summary = job?.summary;
   if (!summary || typeof summary !== "object" || Array.isArray(summary)) return "";
+  const linking = summary.solution_linking;
+  if (linking && typeof linking === "object" && !Array.isArray(linking)) {
+    const counts = linking.counts && typeof linking.counts === "object" ? linking.counts : {};
+    const count = (state) => Math.max(0, Number(counts[state]) || 0);
+    const total = Math.max(0, Number(linking.total) || 0);
+    const remaining = Math.max(0, Number(linking.remaining_count) || 0);
+    return [
+      `연결 대상 ${total}문항`, `검증 완료 ${count("verified")}`, `검토 ${count("review")}`,
+      `후보 불일치 ${count("mismatch")}`, `정답 표기 충돌 ${count("conflict")}`,
+      `해설 후보 없음 ${count("no_candidate")}`, `연결 대기 ${count("unverified")}`,
+      `남은 문항 ${remaining}`
+    ].join(" · ");
+  }
   const saved = Number(summary.registered ?? summary.items ?? summary.item_count ?? 0);
   const recognized = Number(summary.transcribed ?? summary.completed_items ?? 0);
   const failed = Number(summary.failed ?? 0);
@@ -824,6 +870,7 @@ async function retractLearningExample(exampleId, button) {
 }
 
 function batchSourceName(job) {
+  if (job?.project_name) return job.project_name;
   if (job?.source_name) return job.source_name;
   if (["solution_pipeline", "solution_operation"].includes(job?.kind)) return "해설 자동 타이핑";
   return String(job?.kind || "").includes("figure") ? "선택 문항 그림 재생성" : "문제 PDF";
@@ -864,21 +911,26 @@ function renderBatches() {
     header.className = "batch-card-heading";
     const names = document.createElement("div");
     names.append(textNode("strong", batchSourceName(job), "batch-source"));
+    if (job?.project_name && job?.source_name) names.append(textNode("span", `문제: ${job.source_name}`, "batch-solution"));
     if (job?.solution_name) names.append(textNode("span", `해설: ${job.solution_name}`, "batch-solution"));
+    const solutionCounts = job?.summary?.solution_linking?.counts;
     const solutionEnd = status === "completed" && (Number(job?.summary?.solution_transcription?.failed || 0)
-      + Number(job?.summary?.solution_transcription?.no_source || 0) > 0);
+      + Number(job?.summary?.solution_transcription?.no_source || 0) > 0
+      || (solutionCounts && ["no_candidate", "unverified", "review", "mismatch", "conflict"]
+        .some((linkState) => Number(solutionCounts[linkState]) > 0)));
     const badge = textNode("span", upstreamRunning ? "Crop 처리 중" : upstreamDone ? "Studio 반영 대기" : solutionEnd ? "처리 종료 · 예외 있음" : batchStatusLabel(status), "batch-status");
     badge.dataset.status = displayStatus;
     header.append(names, badge);
 
     const progressRow = document.createElement("div");
     progressRow.className = "batch-progress-row";
-    const phase = textNode("span", upstreamRunning ? "해설 검증 중" : upstreamDone ? "반영 대기" : status === "completed" ? (solutionEnd ? "예외 확인" : "완료") : phaseLabel(batchStage(job)), "batch-phase");
+    const attempt = batchAttemptPresentation(status, progress);
+    const phase = textNode("span", upstreamRunning ? "해설 검증 중" : upstreamDone ? "반영 대기" : status === "completed" ? (solutionEnd ? "예외 확인" : "완료") : attempt.phase || phaseLabel(batchStage(job)), "batch-phase");
     const progressBar = document.createElement("progress");
     progressBar.max = 100;
     if (!upstreamRunning && !upstreamDone) progressBar.value = progress;
     progressBar.setAttribute("aria-label", upstreamRunning || upstreamDone ? phase.textContent : `${phase.textContent} 진행률`);
-    const percent = textNode("span", upstreamRunning || upstreamDone ? "진행 중" : `${progress}%`, "batch-percent");
+    const percent = textNode("span", upstreamRunning || upstreamDone ? "진행 중" : attempt.percent, "batch-percent");
     progressRow.append(phase, progressBar, percent);
 
     article.append(header, progressRow);
@@ -1076,6 +1128,12 @@ async function loadBatches(silent = false) {
 async function startBatch(event) {
   event.preventDefault();
   if (state.busy || state.batchSubmitting) return;
+  const projectName = elements.batchProjectName.value.trim();
+  if (!projectName || Array.from(projectName).length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(projectName)) {
+    notify("프로젝트명을 1~200자로 입력해 주세요. 제어 문자는 사용할 수 없습니다.", "error");
+    elements.batchProjectName.focus();
+    return;
+  }
   const sourcePath = elements.sourcePdfPath.value.trim();
   const solutionPath = elements.solutionPdfPath.value.trim();
   const sourceFile = elements.sourcePdfFile.files?.[0] || null;
@@ -1107,6 +1165,7 @@ async function startBatch(event) {
     ]);
     elements.startBatch.textContent = "작업 등록 중…";
     const requestBody = {
+      project_name: projectName,
       pages,
       workers: 2,
       crop_dpi: 450,
@@ -1132,6 +1191,7 @@ async function startBatch(event) {
       state.batches = [job, ...state.batches.filter((entry) => batchId(entry) !== id)];
       renderBatches();
     }
+    elements.batchProjectName.value = "";
     elements.sourcePdfFile.value = "";
     elements.solutionPdfFile.value = "";
     notify("일괄 저장 작업을 등록했습니다. 이 화면에서 진행 상황을 확인할 수 있습니다.");
@@ -1265,7 +1325,12 @@ function renderProjects() {
     remove.setAttribute("aria-label", `${title} 프로젝트를 휴지통으로 이동`);
     remove.disabled = state.busy;
     remove.addEventListener("click", () => moveToTrash("project", id));
-    li.append(remove);
+    const management = document.createElement("details");
+    management.className = "project-removal-disclosure";
+    const managementLabel = textNode("summary", "관리");
+    managementLabel.setAttribute("aria-label", `${title} 프로젝트 관리`);
+    management.append(managementLabel, remove);
+    li.append(management);
     elements.projectList.append(li);
   }
   elements.archiveProject.disabled = state.busy || !state.projectId
@@ -1594,7 +1659,10 @@ async function selectProject(id, guard = true) {
     if (state.projectId !== id) return;
     state.items = asArray(payload, "items");
     renderItems();
-    if (state.items.length === 1) await selectItem(itemId(state.items[0]), false);
+    const initialParams = new URLSearchParams(window.location.search);
+    const requestedItem = initialParams.get("project") === id ? initialParams.get("item") : null;
+    if (requestedItem && state.items.some((item) => itemId(item) === requestedItem)) await selectItem(requestedItem, false);
+    else if (state.items.length === 1) await selectItem(itemId(state.items[0]), false);
   } catch (error) {
     if (state.projectId !== id) return;
     state.items = [];
@@ -1619,7 +1687,10 @@ function filteredItems() {
     const matchesStatus = filter === "all"
       || (filter === "needs_attention" && needsAttention(item))
       || (filter === "missing_explanation" && item?.solution_link?.transcribed !== true)
-      || (filter === "complete" && item?.registration?.content_mode === "structured" && item?.solution_link?.transcribed === true);
+      || (filter === "complete" && item?.registration?.content_mode === "structured" && item?.solution_link?.transcribed === true)
+      || (["no_candidate", "unverified", "review", "verified", "mismatch", "conflict"].includes(filter)
+        && solutionLinkState(item?.solution_link) === filter)
+      || (filter === "source_integrity_error" && ["missing_file", "hash_mismatch"].includes(item?.solution_link?.source_integrity));
     const matchesTag = tagFilter === "all"
       || (tagFilter === "needs_review" && tagsNeedReview(tags))
       || (tagFilter === "figure" && features.has_figure === true)
@@ -1639,21 +1710,21 @@ const FIRST_BLOCKER_LABELS = {
 
 function renderSolutionCoverage() {
   const registered = state.items.filter(isRegistered).length;
-  const detailed = state.items.filter((item) => item?.solution_link?.source_present === true).length;
-  const quickOnly = state.items.filter((item) => item?.solution_link?.quick_answer_only === true).length;
-  const review = state.items.filter((item) => item?.solution_link?.review_candidate_present === true).length;
-  const missing = state.items.filter((item) => item?.solution_link?.source_present !== true).length;
-  const verified = state.items.filter((item) => item?.solution_link?.status === "verified").length;
+  const countState = (linkState) => state.items.filter((item) => solutionLinkState(item?.solution_link) === linkState).length;
+  const candidateCount = state.items.reduce((total, item) => total + Math.max(0, Number(item?.solution_link?.candidate_count) || 0), 0);
+  const sourceErrors = state.items.filter((item) => ["missing_file", "hash_mismatch"].includes(item?.solution_link?.source_integrity)).length;
   elements.coverageRegistered.textContent = String(registered);
-  elements.coverageDetailed.textContent = String(detailed);
-  elements.coverageQuickOnly.textContent = String(quickOnly);
-  elements.coverageReview.textContent = String(review);
-  elements.coverageMissing.textContent = String(missing);
-  elements.coverageVerified.textContent = String(verified);
+  elements.coverageDetailed.textContent = String(countState("verified"));
+  elements.coverageQuickOnly.textContent = String(countState("review"));
+  elements.coverageReview.textContent = String(countState("unverified"));
+  elements.coverageMissing.textContent = String(countState("no_candidate"));
+  elements.coverageVerified.textContent = String(countState("mismatch"));
+  elements.coverageConflict.textContent = String(countState("conflict"));
+  elements.coverageCandidates.textContent = String(candidateCount);
 
   const blockers = new Map();
   state.items.forEach((item) => {
-    if (item?.solution_link?.source_present === true) return;
+    if (solutionLinkState(item?.solution_link) !== "no_candidate") return;
     const code = String(item?.solution_link?.first_blocker || "");
     if (!code) return;
     const label = FIRST_BLOCKER_LABELS[code] || "기타 연결 사유";
@@ -1663,8 +1734,10 @@ function renderSolutionCoverage() {
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "ko-KR"))
     .map(([label, count]) => `${label} ${count}`)
     .join(" · ");
-  elements.firstBlockerSummary.hidden = !blockerText;
-  elements.firstBlockerSummary.textContent = blockerText ? `상세 해설 미확보 원인 · ${blockerText}` : "";
+  elements.firstBlockerSummary.hidden = !blockerText && !sourceErrors;
+  elements.firstBlockerSummary.textContent = blockerText
+    ? `해설 후보 없음 원인 · ${blockerText}`
+    : sourceErrors ? `해설 원본 파일 확인 필요 ${sourceErrors}` : "";
 }
 
 function renderItems() {
@@ -1725,14 +1798,21 @@ function statusLabel(status) {
 }
 
 function solutionLinkLabel(summary) {
-  const status = String(summary?.status || "missing");
-  if (status === "verified") return "AI 자동 확인됨";
-  if (status === "review") return ["review", "mismatch", "failed"].includes(summary?.verification_state) ? "AI 연결 검토 필요" : "AI 연결 확인 전";
-  return summary?.source_present ? "AI 연결 확인 전" : "해설 원본 없음";
+  if (summary?.source_integrity === "missing_file") return "해설 원본 파일 없음";
+  if (summary?.source_integrity === "hash_mismatch") return "해설 원본 해시 불일치";
+  return ({
+    no_candidate: "해설 후보 없음",
+    unverified: "AI 연결 확인 전",
+    review: "AI 연결 검토 필요",
+    verified: "AI 자동 확인됨",
+    mismatch: "후보 불일치",
+    conflict: "정답 표기 충돌"
+  })[solutionLinkState(summary)];
 }
 
 function solutionLinkDisplayLabel(summary, value) {
-  if (summary?.manually_confirmed === true) {
+  if (["missing_file", "hash_mismatch"].includes(summary?.source_integrity)) return solutionLinkLabel(summary);
+  if (summary?.manually_confirmed === true && !summary?.link_state) {
     return Number(summary?.confidence || 0) < 0.8 || Number(summary?.review_reason_count || 0) > 0
       ? "저신뢰 · 직접 확인됨"
       : "직접 확인됨";
@@ -1762,8 +1842,8 @@ function renderReviewQueue() {
   elements.reviewProgress.value = explanationDone;
   const percent = total ? Math.round(explanationDone / total * 100) : 0;
   elements.reviewProgress.textContent = `${percent}%`;
-  const sources = state.items.filter((item) => item?.solution_link?.source_present).length;
-  const verified = state.items.filter((item) => item?.solution_link?.status === "verified").length;
+  const sources = state.items.filter((item) => solutionAssetPresent(item?.solution_link)).length;
+  const verified = state.items.filter((item) => solutionLinkState(item?.solution_link) === "verified").length;
   elements.reviewQueueStatus.textContent = !total
     ? "프로젝트를 선택하세요."
     : `해설 원본 ${sources}/${total} · 타이핑 완료 ${explanationDone}/${total} · AI 확인 완료 ${verified} · 수정 필요 ${needed}`;
@@ -1804,13 +1884,17 @@ async function selectItem(id, guard = true) {
     notify("진행 중인 작업이 끝난 뒤 문항을 바꿔 주세요.");
     return;
   }
-  if (guard && id === state.itemId) return;
+  if (guard && id === state.itemId) {
+    if (!elements.workspace.hidden) document.dispatchEvent(new CustomEvent("astra:item-opened", { detail: { projectId: state.projectId, itemId: id } }));
+    return;
+  }
   if (guard && !confirmDiscard()) return;
   state.itemId = id;
   state.itemSummary = state.items.find((item) => itemId(item) === id) ?? null;
   closeWorkspace();
   renderItems();
   await loadItem();
+  if (guard && state.itemId === id && !elements.workspace.hidden) document.dispatchEvent(new CustomEvent("astra:item-opened", { detail: { projectId: state.projectId, itemId: id } }));
 }
 
 async function loadItem() {
@@ -2090,7 +2174,7 @@ function renderHeader() {
   elements.solutionLink.dataset.status = String(state.solutionLink?.status || "missing");
   elements.revision.textContent = String(state.revision);
   elements.approve.disabled = state.busy || !canConfirmReview(state.package);
-  elements.approve.textContent = APPROVED_STATUSES.has(workflowOf(state.package)) ? "확인 완료됨" : "이대로 확인하고 다음";
+  elements.approve.textContent = APPROVED_STATUSES.has(workflowOf(state.package)) ? "검토 확인 완료됨" : "검토 확인 완료 · 다음";
   renderSectionLabels();
 }
 
@@ -2107,13 +2191,16 @@ function renderSolutionLinkDetails() {
   })[0] || null;
   const quickAnswer = rawLink?.quick_answer_agreement;
   const confidence = Number(state.solutionLink?.confidence ?? selected?.confidence ?? 0);
-  const status = String(state.solutionLink?.status || "missing");
+  const status = solutionLinkState(state.solutionLink);
   const descriptions = {
+    no_candidate: "현재 문항의 상세 해설 후보를 찾지 못했습니다.",
+    unverified: "해설 후보는 있으나 AI 연결 확인 전입니다.",
+    mismatch: "선택 후보가 현재 문항과 일치하지 않아 연결에서 제외됐습니다.",
+    conflict: "문항과 해설의 정답 표기가 충돌해 확인이 필요합니다.",
     verified: "문항 번호와 정답을 비교해 같은 문항의 해설로 연결했습니다.",
     review: ["review", "mismatch", "failed"].includes(state.solutionLink?.verification_state)
       ? "AI 연결 검토가 필요합니다. 저장된 타이핑은 별도로 사용할 수 있습니다."
-      : "AI 연결 확인 전입니다. 저장된 타이핑은 별도로 사용할 수 있습니다.",
-    missing: "AI 연결 확인 전입니다. 후보·출처 정보를 확인하세요."
+      : "연결 근거를 더 확인해야 합니다. 저장된 타이핑은 별도로 사용할 수 있습니다."
   };
   elements.solutionLinkSummary.textContent = `${explanationInputLabel({ solution_link: state.solutionLink })} · ${solutionLinkDisplayLabel(state.solutionLink, state.package)}${status === "verified" && confidence > 0 ? ` · 신뢰도 ${Math.round(Math.min(1, confidence) * 100)}%` : ""}`;
   const reasonLabels = {
@@ -2129,9 +2216,13 @@ function renderSolutionLinkDetails() {
     ...(Array.isArray(selected?.review_reasons) ? selected.review_reasons : []),
     ...(!selected && Array.isArray(rawLink?.review_reasons) ? rawLink.review_reasons : [])
   ];
-  const evidence = [state.solutionLink?.manually_confirmed
+  const integrityDescription = ({
+    missing_file: "선택한 해설 원본 파일을 찾지 못했습니다.",
+    hash_mismatch: "선택한 해설 원본 파일의 해시가 기록과 다릅니다."
+  })[state.solutionLink?.source_integrity];
+  const evidence = [integrityDescription || (state.solutionLink?.manually_confirmed && !state.solutionLink?.link_state
     ? "직접 확인한 해설입니다. 자동 연결 신뢰도 기록은 그대로 보존합니다."
-    : descriptions[status]];
+    : descriptions[status])];
   for (const reason of rawReasons) {
     const key = Object.keys(reasonLabels).find((candidate) => String(reason).includes(candidate));
     if (key) evidence.push(reasonLabels[key]);
@@ -2775,7 +2866,8 @@ function sourceAssets(section) {
 
 function sourceAsset(section) {
   const assets = sourceAssets(section);
-  const selectedId = state.assetIdBySection[section];
+  const selectedId = state.assetIdBySection[section]
+    ?? (section === "explanation" ? state.package?.provenance?.solution_selection?.source_asset_id : null);
   const selected = assets.find((asset) => asset.asset_id === selectedId);
   const asset = selected ?? assets[0] ?? null;
   state.assetIdBySection[section] = asset?.asset_id ?? null;
@@ -3758,7 +3850,11 @@ function renderDualReading() {
     const assets = sourceAssets(section);
     const blocks = packageData.content?.[section]?.blocks;
     const mode = readingMode(view, assets.length > 0, Array.isArray(blocks) && blocks.length > 0);
-    const selected = readingAsset(view, assets);
+    const selected = readingAsset(
+      view,
+      assets,
+      section === "explanation" ? packageData.provenance?.solution_selection?.source_asset_id : null
+    );
     view.assetId = selected?.asset_id ?? null;
     panel.querySelectorAll("[data-view-mode]").forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.viewMode === mode));
@@ -3793,7 +3889,7 @@ function renderDualReading() {
       reading.className = "reading-preview";
       blocks.forEach((block) => reading.append(renderReadableBlock(block, packageData)));
       body.append(reading);
-    } else body.append(textNode("p", `${section === "question" ? "문제" : "해설"} 타이핑 내용이 없습니다.`, "empty-note"));
+    } else if (section !== "explanation" || state.solutionLink?.answer_only_transcribed !== true) body.append(textNode("p", `${section === "question" ? "문제" : "해설"} 타이핑 내용이 없습니다.`, "empty-note"));
     body.scrollTop = view.scrollTop;
     panel.querySelector(".dual-reading-status").textContent = state.dirty && !parseEditor(false)
       ? "기술 정보 오류로 읽기 갱신을 멈췄습니다." : "";
@@ -4491,18 +4587,22 @@ function bankDuplicateWarning(item) {
 
 function setBankBusy(busy) {
   state.bankBusy = busy;
-  state.setBusy = busy;
-  [elements.refreshBank, elements.createSetFromBank, elements.createQuestionSet,
-    elements.saveQuestionSet, elements.buildQuestionSetHwpx, elements.regenerateSelectedFigures]
+  [elements.refreshBank, elements.createSetFromBank, elements.regenerateSelectedFigures]
     .forEach((control) => { if (control) control.disabled = busy; });
   elements.bankList.querySelectorAll('input[type="checkbox"][data-bank-selection]').forEach((control) => {
     control.disabled = busy;
   });
   elements.bankView.setAttribute("aria-busy", String(busy));
-  elements.setWorkspace.setAttribute("aria-busy", String(busy));
   syncBankFigureSelectionUi();
   syncBankQuestionSelectionUi();
-  if (!busy && state.activeSet) renderActiveQuestionSet();
+}
+
+function setSetBusy(busy) {
+  state.setBusy = busy;
+  elements.setWorkspace.setAttribute("aria-busy", String(busy));
+  for (const control of [elements.createQuestionSet, elements.saveQuestionSet, elements.openSetPicker,
+    elements.deleteQuestionSet, elements.buildQuestionSetHwpx, elements.buildQuestionSetPdf]) control.disabled = busy;
+  if (!busy) renderActiveQuestionSet();
 }
 
 function renderBankFilterOptions() {
@@ -4726,6 +4826,10 @@ function expandedFilteredBankItems() {
 }
 
 function bankSelectionSavePlan(selectedKeys = state.bankSelection) {
+  return bankSelectionSavePlanForTarget(selectedKeys, elements.bankTargetSet.value);
+}
+
+function bankSelectionSavePlanForTarget(selectedKeys, targetId) {
   const chosen = state.bankItems.filter((item) => selectedKeys.has(bankRefKey(item)));
   const expanded = new Map();
   for (const item of chosen) {
@@ -4736,7 +4840,7 @@ function bankSelectionSavePlan(selectedKeys = state.bankSelection) {
       : [item];
     siblings.forEach((candidate) => expanded.set(bankRefKey(candidate), candidate));
   }
-  const existing = state.activeSetId === elements.bankTargetSet.value
+  const existing = state.activeSetId === targetId
     ? new Set(questionSetItems().map(bankRefKey)) : new Set();
   const items = [...expanded.values()].filter((item) => !existing.has(bankRefKey(item)));
   return { items, extraCount: items.filter((item) => !selectedKeys.has(bankRefKey(item))).length };
@@ -4867,7 +4971,41 @@ function syncBankFigureSelectionUi() {
     : "그림 재생성 대상을 먼저 선택해 주세요.";
 }
 
+const bankImageQueue = [];
+let bankImagesLoading = 0;
+let bankImageGeneration = 0;
+
+function loadBankImages() {
+  while (bankImagesLoading < 4 && bankImageQueue.length) {
+    const task = bankImageQueue.shift();
+    if (!task.image.isConnected || task.generation !== bankImageGeneration) continue;
+    bankImagesLoading += 1;
+    const finish = (loaded) => {
+      if (task.generation !== bankImageGeneration) return;
+      bankImagesLoading -= 1;
+      if (!loaded && task.image.isConnected) {
+        if (task.attempt < 2) {
+          setTimeout(() => {
+            if (task.generation !== bankImageGeneration) return;
+            bankImageQueue.push({ ...task, attempt: task.attempt + 1 });
+            loadBankImages();
+          }, 300 * (task.attempt + 1));
+        } else {
+          task.onFailure();
+        }
+      }
+      loadBankImages();
+    };
+    task.image.onload = () => finish(true);
+    task.image.onerror = () => finish(false);
+    task.image.src = task.url + (task.attempt ? `?retry=${task.attempt}` : "");
+  }
+}
+
 function renderBankItems() {
+  bankImageGeneration += 1;
+  bankImageQueue.length = 0;
+  bankImagesLoading = 0;
   clearChildren(elements.bankList);
   const matchingItems = filteredBankItems();
   const search = activeBankSearch(state.bankSearch);
@@ -4944,16 +5082,19 @@ function renderBankItems() {
         const frame = document.createElement("div");
         frame.className = "bank-image-frame";
         const image = document.createElement("img");
-        image.src = endpoint("projects", reference.project_id, "items", reference.item_id, "assets", asset.asset_id);
+        const imageUrl = endpoint("projects", reference.project_id, "items", reference.item_id, "assets", asset.asset_id);
         image.alt = `${bankItemNumber(item)} 원본 문제 이미지 ${index + 1}`;
-        image.loading = "lazy";
+        image.loading = "eager";
         if (Number.isInteger(asset.width_px) && asset.width_px > 0) image.width = asset.width_px;
         if (Number.isInteger(asset.height_px) && asset.height_px > 0) image.height = asset.height_px;
-        image.addEventListener("error", () => {
+        const onFailure = () => {
           frame.hidden = true;
           failed += 1;
-          if (failed === imageAssets.length) fallback.hidden = false;
-        }, { once: true });
+          if (failed === imageAssets.length) {
+            fallback.replaceChildren(textNode("strong", "이미지를 불러오지 못했습니다."), textNode("span", "잠시 후 문제은행을 새로고침해 주세요."));
+            fallback.hidden = false;
+          }
+        };
         const link = document.createElement("a");
         link.href = `/?view=saved&project=${encodeURIComponent(reference.project_id)}&item=${encodeURIComponent(reference.item_id)}&mode=read`;
         link.addEventListener("click", (event) => {
@@ -4964,6 +5105,7 @@ function renderBankItems() {
         link.append(image);
         frame.append(link);
         images.append(frame);
+        bankImageQueue.push({ image, url: imageUrl, attempt: 0, generation: bankImageGeneration, onFailure });
       });
       fallback.hidden = true;
     }
@@ -5037,6 +5179,7 @@ function renderBankItems() {
       if (nextExpanded && childGrid.dataset.rendered !== "true") {
         visibleSiblings.forEach((sibling) => appendCard(sibling, childGrid));
         childGrid.dataset.rendered = "true";
+        loadBankImages();
       }
     });
     groupActions.prepend(toggle);
@@ -5052,6 +5195,7 @@ function renderBankItems() {
   elements.bankSimilarityNotice.hidden = !similarityNotChecked;
   syncBankQuestionSelectionUi();
   syncBankFigureSelectionUi();
+  loadBankImages();
 }
 
 function syncBankQuestionSelectionUi() {
@@ -5138,7 +5282,7 @@ function renderQuestionSetList() {
     const button = textNode("button", String(value?.title || `문제지 ${index + 1}`), "nav-button");
     button.type = "button";
     button.setAttribute("aria-current", String(questionSetId(value) === state.activeSetId));
-    button.addEventListener("click", () => selectQuestionSet(questionSetId(value)));
+    button.addEventListener("click", () => selectQuestionSet(questionSetId(value), { reveal: true }));
     li.append(button);
     elements.questionSetList.append(li);
   });
@@ -5201,12 +5345,15 @@ function renderActiveQuestionSet() {
   if (!value) return;
   elements.createDocument.disabled = state.setBusy || state.setDirty || !value.items.length;
   elements.documentEntryPayload.textContent = JSON.stringify(documentCreationPayload(value), null, 2);
-  elements.setTitle.value = String(value.title || "새 문제지");
+  if (!state.setDirty) elements.setTitle.value = String(value.title || "새 문제지");
   const mode = String(value.output_mode || "separate");
-  document.querySelectorAll('input[name="setOutputMode"]').forEach((input) => { input.checked = input.value === mode; });
+  if (!state.setDirty) document.querySelectorAll('input[name="setOutputMode"]').forEach((input) => { input.checked = input.value === mode; });
   const items = questionSetItems(value);
   elements.setItemCount.textContent = String(items.length);
   elements.setItemsEmpty.hidden = items.length > 0;
+  elements.buildQuestionSetHwpx.disabled = state.setBusy || !items.length;
+  elements.buildQuestionSetPdf.disabled = state.setBusy || !items.length;
+  if (!items.length) elements.setItemsEmpty.textContent = "문항을 먼저 담아 주세요.";
   clearChildren(elements.setItemList);
   items.forEach((reference, index) => {
     const summary = setResolvedSummary(reference);
@@ -5264,25 +5411,33 @@ function renderActiveQuestionSet() {
   renderBankItems();
 }
 
-async function selectQuestionSet(setId) {
+async function selectQuestionSet(setId, { reveal = false } = {}) {
   if (!setId || state.setBusy) return;
-  setBankBusy(true);
+  if (reveal && setId === state.activeSetId && state.activeSet) {
+    if (reveal) document.dispatchEvent(new CustomEvent("astra:set-opened", { detail: { setId } }));
+    return;
+  }
+  if (state.setDirty && !await ensureSavedActiveSet()) return;
+  setSetBusy(true);
   try {
     const payload = await api(endpoint("question-sets", setId));
     state.activeSet = questionSetFrom(payload);
     state.activeSetId = questionSetId(state.activeSet);
     state.setDirty = false;
+    if (!elements.setBuildResult.hidden) elements.setBuildStatus.textContent = "이전 출력입니다. 현재 문제지의 새 출력은 생성 버튼을 누르세요.";
     renderActiveQuestionSet();
+    if (reveal) document.dispatchEvent(new CustomEvent("astra:set-opened", { detail: { setId: state.activeSetId } }));
   } catch (error) {
     notify(error.message || "문제지를 불러오지 못했습니다.", "error");
   } finally {
-    setBankBusy(false);
+    setSetBusy(false);
   }
 }
 
 async function createNewQuestionSet() {
   if (state.setBusy) return null;
-  setBankBusy(true);
+  if (state.setDirty && !await ensureSavedActiveSet()) return null;
+  setSetBusy(true);
   try {
     const payload = await api(endpoint("question-sets"), {
       method: "POST",
@@ -5293,32 +5448,38 @@ async function createNewQuestionSet() {
     state.activeSetId = questionSetId(created);
     await loadQuestionSets(state.activeSetId);
     renderActiveQuestionSet();
+    document.dispatchEvent(new CustomEvent("astra:set-opened", { detail: { setId: state.activeSetId } }));
     return created;
   } catch (error) {
     notify(error.message || "새 문제지를 만들지 못했습니다.", "error");
     return null;
   } finally {
-    setBankBusy(false);
+    setSetBusy(false);
   }
 }
 
+let setSavePromise = null;
 async function saveActiveQuestionSet(items = questionSetItems(), announcement = "문제지를 저장했습니다.") {
   if (!state.activeSet || state.setBusy) return false;
-  setBankBusy(true);
+  if (setSavePromise) await setSavePromise;
+  if (!state.activeSet || state.setBusy) return false;
+  const title = elements.setTitle.value.trim() || "새 문제지";
+  const outputMode = document.querySelector('input[name="setOutputMode"]:checked')?.value || state.activeSet.output_mode || "separate";
+  const saving = (async () => {
   try {
-    const outputMode = document.querySelector('input[name="setOutputMode"]:checked')?.value || state.activeSet.output_mode || "separate";
     const payload = await api(endpoint("question-sets", state.activeSetId), {
       method: "PATCH",
       body: {
         expected_revision: Number(state.activeSet.revision),
-        title: elements.setTitle.value.trim() || "새 문제지",
+        title,
         output_mode: outputMode,
         items: items.map((value) => ({ project_id: String(value.project_id), item_id: String(value.item_id) }))
       }
     });
     state.activeSet = questionSetFrom(payload);
     state.activeSetId = questionSetId(state.activeSet);
-    state.setDirty = false;
+    state.setDirty = elements.setTitle.value.trim() !== title ||
+      document.querySelector('input[name="setOutputMode"]:checked')?.value !== outputMode;
     const index = state.questionSets.findIndex((value) => questionSetId(value) === state.activeSetId);
     if (index >= 0) state.questionSets[index] = state.activeSet;
     else state.questionSets.push(state.activeSet);
@@ -5327,10 +5488,24 @@ async function saveActiveQuestionSet(items = questionSetItems(), announcement = 
     return true;
   } catch (error) {
     notify(error.status === 409 ? "문제지가 다른 화면에서 변경되었습니다. 다시 불러와 주세요." : error.message || "문제지를 저장하지 못했습니다.", "error");
+    state.setDirty = true;
     return false;
-  } finally {
-    setBankBusy(false);
   }
+  })();
+  setSavePromise = saving;
+  try { return await saving; }
+  finally { if (setSavePromise === saving) setSavePromise = null; }
+}
+
+async function ensureSavedActiveSet() {
+  if (setSavePromise && !await setSavePromise) return null;
+  if (!state.activeSet) return null;
+  const title = elements.setTitle.value.trim() || "새 문제지";
+  const mode = document.querySelector('input[name="setOutputMode"]:checked')?.value;
+  if (state.setDirty || title !== state.activeSet.title || mode !== state.activeSet.output_mode) {
+    if (!await saveActiveQuestionSet(undefined, null)) return null;
+  }
+  return state.activeSet;
 }
 
 async function addSelectedBankItems() {
@@ -5364,6 +5539,116 @@ async function addSelectedBankItems() {
   const added = [...attempted].filter((key) => !existing.has(key) && saved.has(key)).length;
   elements.bankSelectionStatus.textContent = plan.extraCount || added !== selectedKeys.size
     ? `선택 ${selectedKeys.size}개 중 ${added}개 담았습니다.${plan.extraCount ? ` 묶음 ${plan.extraCount}개 포함.` : ""}` : "";
+}
+
+function renderSetPicker() {
+  const projects = new Map(state.bankItems.map((item) => [item.ref.project_id, bankItemSource(item)]));
+  const currentProject = elements.setPickerProject.value;
+  elements.setPickerProject.replaceChildren(new Option("전체 교재", ""),
+    ...[...projects].map(([id, name]) => new Option(name, id)));
+  elements.setPickerProject.value = currentProject;
+  const query = elements.setPickerQuery.value.trim().toLocaleLowerCase("ko-KR");
+  const filtered = state.bankItems.filter((item) =>
+    (!currentProject || item.ref.project_id === currentProject) &&
+    (!query || `${bankItemNumber(item)} ${bankItemSource(item)} ${bankItemPreview(item)}`.toLocaleLowerCase("ko-KR").includes(query)));
+  elements.setPickerCount.textContent = `${state.setPickerSelection.size}개 선택`;
+  elements.addSetPickerItems.disabled = state.setBusy || !state.setPickerSelection.size;
+  elements.retrySetPicker.hidden = !state.bankLoadError;
+  elements.setPickerStatus.textContent = state.bankLoadError
+    ? `문항을 불러오지 못했습니다: ${state.bankLoadError}`
+    : state.setPickerLoading ? "저장 문항을 불러오는 중입니다…"
+    : !state.bankItems.length ? "저장된 문항이 없습니다."
+    : !filtered.length ? "검색 결과가 없습니다." : `${filtered.length}개 문항`;
+  elements.setPickerList.replaceChildren();
+  const existing = new Set(questionSetItems().map(bankRefKey));
+  for (const item of filtered) {
+    const key = bankRefKey(item);
+    const card = document.createElement("label");
+    card.className = "set-picker-card";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.setPickerSelection.has(key);
+    checkbox.disabled = existing.has(key) || state.setBusy;
+    checkbox.setAttribute("aria-label", `${bankItemSource(item)} ${bankItemNumber(item)} 선택`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.setPickerSelection.add(key);
+      else state.setPickerSelection.delete(key);
+      elements.setPickerCount.textContent = `${state.setPickerSelection.size}개 선택`;
+      elements.addSetPickerItems.disabled = !state.setPickerSelection.size;
+    });
+    const copy = document.createElement("span");
+    copy.append(textNode("strong", `${bankItemNumber(item)} · ${bankItemSource(item)}`),
+      textNode("span", existing.has(key) ? "이미 담긴 문항" : bankItemPreview(item)));
+    const image = (item.preview?.images || [])[0];
+    card.append(checkbox, copy);
+    if (image?.asset_id) {
+      const thumb = document.createElement("img");
+      thumb.src = endpoint("projects", item.ref.project_id, "items", item.ref.item_id, "assets", image.asset_id);
+      thumb.alt = `${bankItemNumber(item)} 원본 이미지`;
+      thumb.loading = "lazy";
+      card.append(thumb);
+    }
+    elements.setPickerList.append(card);
+  }
+}
+
+async function openSetPicker() {
+  if (!state.activeSet) return;
+  state.setPickerSelection.clear();
+  elements.setPicker.showModal();
+  renderSetPicker();
+  if (!state.bankItems.length || state.bankLoadError) {
+    state.setPickerLoading = true;
+    renderSetPicker();
+    await loadBankItems();
+    state.setPickerLoading = false;
+    renderSetPicker();
+  }
+}
+
+async function addSetPickerItems() {
+  if (!state.setPickerSelection.size || state.setBusy || !state.activeSet) return;
+  const selected = new Set(state.setPickerSelection);
+  const plan = bankSelectionSavePlanForTarget(selected, state.activeSetId);
+  if (!plan.items.length) {
+    elements.setPickerStatus.textContent = "선택한 문항이 이미 문제지에 있습니다.";
+    return;
+  }
+  const refs = [...questionSetItems(), ...plan.items.map((item) => item.ref)];
+  if (!await saveActiveQuestionSet(refs, null)) {
+    elements.setPickerStatus.textContent = "저장에 실패했습니다. 선택은 유지됩니다.";
+    return;
+  }
+  const saved = new Set(questionSetItems().map(bankRefKey));
+  for (const key of selected) if (saved.has(key)) state.setPickerSelection.delete(key);
+  renderSetPicker();
+  elements.setPickerStatus.textContent = `${plan.items.length}개 문항을 담았습니다.`;
+}
+
+async function deleteActiveQuestionSet() {
+  if (!state.activeSet || state.setBusy) return;
+  const current = await ensureSavedActiveSet();
+  if (!current) return;
+  if (!window.confirm(`“${current.title}” 문제지를 삭제할까요? 문제지만 삭제하며 원본 문항은 유지됩니다.`)) return;
+  setSetBusy(true);
+  let nextId = null;
+  try {
+    await api(endpoint("question-sets", current.set_id), { method: "DELETE", body: { expected_revision: current.revision } });
+    state.questionSets = state.questionSets.filter((item) => questionSetId(item) !== current.set_id);
+    state.activeSet = null;
+    state.activeSetId = null;
+    state.setDirty = false;
+    elements.setBuildResult.hidden = true;
+    renderQuestionSetList();
+    renderActiveQuestionSet();
+    if (state.questionSets.length) nextId = questionSetId(state.questionSets[0]);
+    notify("문제지만 삭제했습니다. 원본 문항은 유지됩니다.");
+  } catch (error) {
+    notify(error.message || "문제지를 삭제하지 못했습니다.", "error");
+  } finally {
+    setSetBusy(false);
+  }
+  if (nextId) await selectQuestionSet(nextId);
 }
 
 function selectedFigureRequestItems() {
@@ -5480,7 +5765,7 @@ async function moveSetItem(fromIndex, toIndex) {
     : targetRange.end + 1 - moved.length;
   items.splice(insertAt, 0, ...moved);
   const label = sourceRange.key ? `${sourceRange.label} 세트` : `${sourceRange.start + 1}번 문항`;
-  const message = `${label}가 ${insertAt + 1}번 위치로 이동했습니다.`;
+  const message = `${label}${sourceRange.key ? "가" : "이"} ${insertAt + 1}번 위치로 이동했습니다.`;
   if (await saveActiveQuestionSet(items, "")) {
     elements.setOrderAnnouncement.textContent = message;
     const focusIndex = Math.min(insertAt, elements.setItemList.children.length - 1);
@@ -5497,43 +5782,147 @@ async function removeSetItem(index) {
   }
 }
 
-function renderQuestionSetBuild(payload) {
+function renderQuestionSetBuild(payload, owner) {
   elements.setBuildResult.hidden = false;
   elements.setBuildResult.dataset.state = "success";
-  elements.setBuildStatus.textContent = state.activeSet?.output_mode === "combined_end_section"
+  elements.setBuildStatus.textContent = owner.output_mode === "combined_end_section"
     ? "문제와 답·풀이 미주를 한 파일로 만들었습니다."
     : "문제와 해설 HWPX를 따로 만들었습니다.";
-  clearChildren(elements.setBuildChecks);
-  clearChildren(elements.setDownloadLinks);
   const outputs = hwpxOutputList(payload);
+  const expected = owner.output_mode === "combined_end_section" ? ["combined"] : ["question", "explanation"];
+  if (outputs.length !== expected.length || !expected.every((kind) => outputs.some((item) =>
+    String(item.document_kind) === kind && typeof item.download_url === "string" && item.download_url.startsWith("/api/")))) {
+    throw new Error("문제지 HWPX 출력 파일이 일부 누락되었습니다.");
+  }
   outputs.forEach((output) => {
     const kind = String(output?.document_kind ?? output?.artifact_kind ?? output?.kind ?? "question");
     const label = kind === "combined" ? "문제+미주 해설" : hwpxKindLabel(kind);
-    if (typeof output?.download_url !== "string" || !output.download_url.startsWith("/api/")) return;
-    const link = textNode("a", `${label} HWPX 받기`, "button");
+    const link = textNode("a", `${owner.title} · r${owner.revision} · ${label} HWPX 받기`, "button");
     link.href = output.download_url;
-    link.download = String(output.name || `${state.activeSet?.title || "문제지"}-${label}.hwpx`);
+    link.download = String(output.name || `${owner.title}-${label}.hwpx`);
     elements.setDownloadLinks.append(link);
   });
-  if (!elements.setDownloadLinks.children.length) throw new Error("문제지 다운로드 정보를 받지 못했습니다.");
+  const warningLabels = {
+    answer_missing: "저장된 답 없음", explanation_missing: "저장된 해설 없음",
+    question_source_crop_fallback: "원본 문제 이미지 사용", figure_original_used: "원본 그림 사용",
+    solution_link_needs_review: "해설 연결 검토 필요", stored_review_issues: "기존 검토 항목 남음",
+    item_workflow_not_ready: "문항 최종 검토 전", unreviewed_canonical_blocks: "타이핑 내용 검토 전"
+  };
+  const counts = new Map();
+  for (const warning of payload.receipt?.warnings || []) {
+    const code = String(warning.code || "other");
+    counts.set(code, (counts.get(code) || 0) + 1);
+  }
+  for (const [code, count] of counts) elements.setBuildChecks.append(
+    textNode("li", `${warningLabels[code] || code} · ${count}건`));
 }
 
 async function buildActiveQuestionSetHwpx() {
-  if (!state.activeSet || state.setBusy || !questionSetItems().length) return;
-  setBankBusy(true);
+  if (!state.activeSet || state.setBusy) return;
+  const saved = await ensureSavedActiveSet();
+  if (!saved) return;
+  if (!questionSetItems(saved).length) {
+    elements.setItemsEmpty.textContent = "문항을 먼저 담아 주세요.";
+    return;
+  }
+  const owner = { set_id: saved.set_id, revision: saved.revision, title: saved.title, output_mode: saved.output_mode };
+  setSetBusy(true);
   elements.setBuildResult.hidden = false;
+  elements.setBuildResult.dataset.state = "building";
   elements.setBuildStatus.textContent = "HWPX를 만드는 중입니다…";
-  clearChildren(elements.setBuildChecks);
-  clearChildren(elements.setDownloadLinks);
   try {
-    const payload = await api(endpoint("question-sets", state.activeSetId, "hwpx", "build"), { method: "POST", body: {} });
-    renderQuestionSetBuild(payload);
+    const payload = await api(endpoint("question-sets", owner.set_id, "hwpx", "build"), { method: "POST", body: {} });
+    renderQuestionSetBuild(payload, owner);
   } catch (error) {
     elements.setBuildResult.dataset.state = "error";
-    elements.setBuildStatus.textContent = error.message || "문제지 HWPX를 만들지 못했습니다.";
+    elements.setBuildStatus.textContent = `${error.message || "문제지 HWPX를 만들지 못했습니다."} 다시 시도할 수 있습니다. 이전 출력은 유지됩니다.`;
     notify(elements.setBuildStatus.textContent, "error");
   } finally {
-    setBankBusy(false);
+    setSetBusy(false);
+  }
+}
+
+let setPdfSession = null;
+async function buildActiveQuestionSetPdf() {
+  if (!state.activeSet || state.setBusy) return;
+  const saved = await ensureSavedActiveSet();
+  if (!saved) return;
+  if (!questionSetItems(saved).length) {
+    elements.setItemsEmpty.textContent = "문항을 먼저 담아 주세요.";
+    return;
+  }
+  const mode = saved.output_mode;
+  const roles = mode === "separate" ? ["question_only", "explanation_only"] : ["combined_end_section"];
+  const owner = { set_id: saved.set_id, revision: saved.revision, title: saved.title, output_mode: mode };
+  if (!setPdfSession || setPdfSession.setId !== owner.set_id || setPdfSession.setRevision !== owner.revision || setPdfSession.mode !== mode ||
+      roles.every((role) => setPdfSession.receipts.has(role))) {
+    setPdfSession = { setId: owner.set_id, setRevision: owner.revision, mode, title: owner.title,
+      documentId: null, documentRevision: null, receipts: new Map(), activeBuild: null, pending: null };
+  }
+  const session = setPdfSession;
+  setSetBusy(true);
+  elements.setBuildResult.hidden = false;
+  elements.setBuildResult.dataset.state = "building";
+  elements.setBuildStatus.textContent = "PDF를 만드는 중입니다…";
+  try {
+    if (!session.documentId) {
+      const created = await api("/api/documents", { method: "POST",
+        body: { set_id: owner.set_id, expected_revision: owner.revision } });
+      session.documentId = created.document?.document_id;
+      session.documentRevision = created.document?.revision;
+      if (!session.documentId || !Number.isInteger(session.documentRevision)) throw new Error("문서 스냅샷을 확인할 수 없습니다.");
+      const link = textNode("a", `${owner.title} · 출력에 사용한 문서 보기`, "button");
+      link.href = `/document.html?id=${encodeURIComponent(session.documentId)}`;
+      elements.setDownloadLinks.append(link);
+    }
+    for (const role of roles) {
+      if (session.receipts.has(role)) continue;
+      const started = session.pending?.role === role
+        ? await api(endpoint("documents", session.documentId, "exports", session.pending.buildId))
+        : await api(endpoint("documents", session.documentId, "exports"), { method: "POST",
+          body: { expected_revision: session.documentRevision, format: "pdf", output_role: role } });
+      if (!started.build_id) throw new Error("PDF 작업 번호를 받지 못했습니다.");
+      session.pending = { role, buildId: started.build_id };
+      session.activeBuild = started.build_id;
+      elements.cancelQuestionSetPdf.hidden = false;
+      let receipt = started;
+      while (receipt.status === "building") {
+        await new Promise((resolve) => window.setTimeout(resolve, 400));
+        receipt = await api(endpoint("documents", session.documentId, "exports", started.build_id));
+      }
+      session.pending = null;
+      session.activeBuild = null;
+      elements.cancelQuestionSetPdf.hidden = true;
+      if (receipt.status !== "ready" || typeof receipt.download !== "string" || !receipt.download.startsWith("/api/") || !receipt.bytes) {
+        throw new Error(receipt.message || receipt.error || "PDF 생성에 실패했습니다.");
+      }
+      session.receipts.set(role, receipt);
+      const label = role === "question_only" ? "문제" : role === "explanation_only" ? "해설" : "문제+끝부분 해설";
+      const link = textNode("a", `${owner.title} · r${owner.revision} · ${label} PDF 받기`, "button");
+      link.href = receipt.download;
+      link.download = `${owner.title}-${label}.pdf`;
+      elements.setDownloadLinks.append(link);
+      elements.setBuildStatus.textContent = `${label} PDF ${receipt.pages}쪽 준비됨`;
+    }
+    elements.setBuildResult.dataset.state = "success";
+  } catch (error) {
+    elements.setBuildResult.dataset.state = "error";
+    elements.setBuildStatus.textContent = `${error.message || "PDF 생성 실패"} 다시 시도할 수 있습니다. 완성된 파일은 유지됩니다.`;
+  } finally {
+    session.activeBuild = session.pending?.buildId || null;
+    elements.cancelQuestionSetPdf.hidden = !session.activeBuild;
+    setSetBusy(false);
+  }
+}
+
+async function cancelActiveQuestionSetPdf() {
+  if (!setPdfSession?.activeBuild) return;
+  try {
+    await api(endpoint("documents", setPdfSession.documentId, "exports", setPdfSession.activeBuild, "cancel"),
+      { method: "POST", body: {} });
+    elements.setBuildStatus.textContent = "PDF 취소 중입니다…";
+  } catch (error) {
+    elements.setBuildStatus.textContent = error.message || "취소 요청에 실패했습니다.";
   }
 }
 
@@ -5621,7 +6010,7 @@ elements.transcribe.addEventListener("click", transcribeItem);
 elements.save.addEventListener("click", saveItem);
 elements.tagForm.addEventListener("submit", saveItemTags);
 elements.autoTagItem.addEventListener("click", autoTagCurrentItem);
-const bankClassificationQuery = window.matchMedia("(max-width: 900px)");
+const bankClassificationQuery = window.matchMedia("(max-width: 760px)");
 let bankClassificationExpanded = !bankClassificationQuery.matches;
 let bankClassificationWasNarrow = bankClassificationQuery.matches;
 function syncBankClassification() {
@@ -5680,6 +6069,15 @@ elements.createSetFromBank.addEventListener("click", createNewQuestionSet);
 elements.createQuestionSet.addEventListener("click", createNewQuestionSet);
 elements.saveQuestionSet.addEventListener("click", () => saveActiveQuestionSet());
 elements.buildQuestionSetHwpx.addEventListener("click", buildActiveQuestionSetHwpx);
+elements.buildQuestionSetPdf.addEventListener("click", buildActiveQuestionSetPdf);
+elements.cancelQuestionSetPdf.addEventListener("click", cancelActiveQuestionSetPdf);
+elements.deleteQuestionSet.addEventListener("click", deleteActiveQuestionSet);
+elements.openSetPicker.addEventListener("click", openSetPicker);
+elements.closeSetPicker.addEventListener("click", () => elements.setPicker.close());
+elements.setPickerProject.addEventListener("change", renderSetPicker);
+elements.setPickerQuery.addEventListener("input", renderSetPicker);
+elements.retrySetPicker.addEventListener("click", async () => { await loadBankItems(); renderSetPicker(); });
+elements.addSetPickerItems.addEventListener("click", addSetPickerItems);
 elements.createDocument.addEventListener("click", async () => {
   if (!state.activeSet || state.setBusy || state.setDirty) {
     document.getElementById("documentEntryStatus").textContent = "문제지 변경을 먼저 저장해 주세요.";
@@ -5905,6 +6303,7 @@ async function initialize() {
   }
 }
 
+mountExamRegion();
 initialize();
 
 // Visual solution crop keeps each page's rectangle until the user applies it.

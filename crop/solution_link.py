@@ -374,12 +374,17 @@ class StartAnchor:
     segment_id: str
     page_range: PrintedPageRange
     confidence: float = 1.0
+    reference_document: str = "unknown"
 
     def __post_init__(self) -> None:
         if not self.anchor_id or not self.item_ids or not self.scope_id or not self.segment_id:
             raise ValueError("anchor identity fields are required")
         if not 0 <= self.confidence <= 1:
             raise ValueError("anchor confidence must be 0..1")
+        document = str(self.reference_document).strip().casefold()
+        if document not in {"problem", "solution", "unknown"}:
+            raise ValueError("anchor reference_document must be problem/solution/unknown")
+        object.__setattr__(self, "reference_document", document)
 
 
 @dataclass(frozen=True)
@@ -393,6 +398,24 @@ class AnchorSpan:
     resolved: bool
     boundary_source: str | None
     review_reasons: tuple[str, ...] = ()
+    reference_document: str = "unknown"
+
+    def __post_init__(self) -> None:
+        document = str(self.reference_document).strip().casefold()
+        if document not in {"problem", "solution", "unknown"}:
+            raise ValueError("anchor reference_document must be problem/solution/unknown")
+        object.__setattr__(self, "reference_document", document)
+
+
+def _scope_identity_tokens(scope: NumberingScope) -> frozenset[str]:
+    values: set[str] = set()
+    for raw in scope.section_path:
+        text = unicodedata.normalize("NFKC", raw).casefold().split(":", 1)[-1]
+        text = text.replace("대학수학능력시험", "수능").replace("학년도", "")
+        normalized = re.sub(r"[^0-9a-z가-힣]+", "", text)
+        if normalized:
+            values.add(normalized)
+    return frozenset(values)
 
 
 def propagate_problem_anchors(
@@ -433,6 +456,50 @@ def propagate_problem_anchors(
     for scoped in ordered_items:
         item_id = scoped.item.item_id
         anchor = first_anchor_by_scope.get(scoped.scope.identity)
+        if anchor is None:
+            current_tokens = _scope_identity_tokens(scoped.scope)
+            for candidate in ordered_anchors:
+                if candidate.sequence <= scoped.item.sequence:
+                    continue
+                candidate_item = next(
+                    (
+                        value
+                        for value in ordered_items
+                        if value.item.sequence == candidate.sequence
+                    ),
+                    None,
+                )
+                if (
+                    candidate_item is None
+                    or not current_tokens
+                    or not (
+                        current_tokens
+                        & _scope_identity_tokens(candidate_item.scope)
+                    )
+                    or any(
+                        scoped.item.sequence < boundary <= candidate.sequence
+                        for boundary in boundary_sequences
+                    )
+                ):
+                    continue
+                run = [
+                    value
+                    for value in ordered_items
+                    if scoped.item.sequence
+                    <= value.item.sequence
+                    <= candidate.sequence
+                ]
+                numbers = [
+                    int(value.parent_number)
+                    for value in run
+                    if value.parent_number.isdigit()
+                ]
+                if len(numbers) == len(run) and all(
+                    right == left + 1
+                    for left, right in zip(numbers, numbers[1:], strict=False)
+                ):
+                    anchor = candidate
+                    break
         if (
             item_id in result
             or anchor is None
@@ -465,6 +532,7 @@ def expand_start_anchors(
             anchor.page_range.start,
             anchor.page_range.end,
             anchor.page_range.mode,
+            anchor.reference_document,
         )
         previous_key = None
         if merged:
@@ -475,6 +543,7 @@ def expand_start_anchors(
                 previous.page_range.start,
                 previous.page_range.end,
                 previous.page_range.mode,
+                previous.reference_document,
             )
         if key == previous_key:
             prior = merged[-1]
@@ -512,6 +581,7 @@ def expand_start_anchors(
                     covered,
                     "explicit_range" if covered else None,
                     () if covered else ("explicit_range_not_in_page_map",),
+                    anchor.reference_document,
                 )
             )
             continue
@@ -536,6 +606,7 @@ def expand_start_anchors(
                     False,
                     None,
                     ("same_start_scope_conflict",),
+                    anchor.reference_document,
                 )
             )
             continue
@@ -570,6 +641,7 @@ def expand_start_anchors(
                     False,
                     None,
                     ("anchor_range_cannot_be_expanded",),
+                    anchor.reference_document,
                 )
             )
             continue
@@ -589,6 +661,8 @@ def expand_start_anchors(
                 anchor.confidence,
                 True,
                 next_boundary[1] if next_boundary else "segment_end",
+                (),
+                anchor.reference_document,
             )
         )
     return tuple(result)
@@ -831,6 +905,7 @@ class ProblemItem:
                 "resolved": self.anchor.resolved,
                 "boundary_source": self.anchor.boundary_source,
                 "review_reasons": list(self.anchor.review_reasons),
+                "reference_document": self.anchor.reference_document,
             },
             "fingerprints": list(self.fingerprints),
             "crop_verified": self.crop_verified,
@@ -1090,7 +1165,9 @@ def _location_compatible(problem: ProblemItem, asset: SolutionAsset) -> bool:
     if (
         problem.scope_id != asset.scope_id
         or problem.parent_number != asset.parent_number
-        or anchor.segment_id != asset.segment_id
+        or anchor.reference_document not in {"unknown", asset.source_document}
+        or anchor.reference_document != "unknown"
+        and anchor.segment_id != asset.segment_id
         or not asset.printed_pages
     ):
         return False
@@ -1107,8 +1184,7 @@ def _location_compatible(problem: ProblemItem, asset: SolutionAsset) -> bool:
 
 def _strict_candidate_compatible(problem: ProblemItem, asset: SolutionAsset) -> bool:
     return (
-        asset.source_document == "solution"
-        and asset.review_reason is None
+        asset.review_reason is None
         and problem.subquestion_label == asset.subquestion_label
         and _location_compatible(problem, asset)
     )
@@ -1120,8 +1196,7 @@ def _strict_compatible(problem: ProblemItem, asset: SolutionAsset) -> bool:
 
 def _shared_parent_compatible(problem: ProblemItem, asset: SolutionAsset) -> bool:
     return (
-        asset.source_document == "solution"
-        and asset.role == SolutionRole.DETAILED_SOLUTION
+        asset.role == SolutionRole.DETAILED_SOLUTION
         and asset.subquestion_label is None
         and problem.subquestion_label is not None
         and problem.subquestion_label in asset.covered_child_labels
@@ -1218,13 +1293,16 @@ def expanded_candidate_pairs(
                       fingerprint_similarity(problem.fingerprints, asset.fingerprints))
         for problem in problems for asset in assets
         if problem.crop_is_search_eligible and not problem.cache_only_detailed_review
-        and ((_anchor_review_reason(problem) is None and asset.segment_id == problem.anchor.segment_id)
+        and ((_anchor_review_reason(problem) is None
+              and problem.anchor.reference_document in {"unknown", asset.source_document}
+              and (problem.anchor.reference_document == "unknown"
+                   or asset.segment_id == problem.anchor.segment_id))
              or (problem.anchor is None and problem_source_sha256 is not None and solution_source_sha256 is not None
                  and asset.expanded_source_binding == ExpandedSourceBinding(
                      problem_source_sha256, solution_source_sha256,
                      quality.identity(problem.signature()),
                      quality.identity(replace(asset, expanded_source_binding=None).signature()))))
-        and asset.source_document == 'solution' and asset.review_reason is None
+        and asset.review_reason is None
         and asset.scope_id == problem.scope_id
         and asset.parent_number == problem.parent_number
         and (asset.subquestion_label == problem.subquestion_label
@@ -2311,6 +2389,7 @@ def build_link_manifest(
     assets: Mapping[str, Mapping[str, Any]],
     *,
     cache_key: str,
+    problem_path: Path | None = None,
     solution_path: Path,
     scope_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -2325,6 +2404,7 @@ def build_link_manifest(
         "created_at": utc_now(),
         "problem": {
             "source_sha256": problem.source_sha256,
+            **({"source_pdf": str(problem_path)} if problem_path is not None else {}),
             "page_map": [page.to_dict() for page in problem.page_map],
             "item_ids": [item.item_id for item in problem.items],
         },
@@ -2548,6 +2628,9 @@ def validate_link_manifest(manifest: Any) -> None:
     if asset_contract not in {None, ASSET_SELECTION_CONTRACT}:
         raise ManifestError("unsupported asset selection contract")
     strict_assets = asset_contract == ASSET_SELECTION_CONTRACT
+    source_bound_assets = strict_assets and isinstance(
+        manifest.get("problem", {}).get("source_pdf"), str
+    )
     if not isinstance(manifest["assets"], dict) or not isinstance(manifest["items"], dict):
         raise ManifestError("assets/items must be objects")
     asset_ids = set(manifest["assets"])
@@ -2570,6 +2653,11 @@ def validate_link_manifest(manifest: Any) -> None:
             relative = Path(str(asset["output_file"]))
             if relative.is_absolute() or ".." in relative.parts:
                 raise ManifestError("asset output_file must be a safe relative path")
+            if source_bound_assets:
+                if asset.get("source_document") not in {"problem", "solution"}:
+                    raise ManifestError("materialized asset source_document is invalid")
+                if not _valid_sha256(asset.get("source_sha256")):
+                    raise ManifestError("materialized asset source_sha256 is invalid")
     for document_name in ("problem", "solution"):
         document = manifest.get(document_name)
         if not isinstance(document, dict) or not isinstance(document.get("page_map"), list):
@@ -3412,12 +3500,27 @@ def run_link_pipeline(
         }
         for asset_id, record in rendered_assets.items()
     }
+    run_manifest = json.loads(
+        (context.run_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    problem_source_value = run_manifest.get("source_pdf")
+    if not problem_source_value:
+        run_state = json.loads(
+            (context.run_dir / "run_state.json").read_text(encoding="utf-8")
+        )
+        problem_source_value = run_state.get("source_pdf")
+    if not isinstance(problem_source_value, str) or not problem_source_value.strip():
+        raise ManifestError("problem source PDF path is missing")
+    problem_path = Path(problem_source_value)
+    if not problem_path.is_absolute():
+        problem_path = context.run_dir / problem_path
     manifest = build_link_manifest(
         problem,
         solution,
         decisions,
         manifest_assets,
         cache_key=cache_key,
+        problem_path=problem_path.resolve(),
         solution_path=context.solution_path,
         scope_contract=scope_contract,
     )

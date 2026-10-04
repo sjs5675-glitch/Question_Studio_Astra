@@ -1429,7 +1429,7 @@
       ],
       "properties": {
         "name": {
-          "const": "question_crop"
+          "enum": ["question_crop", "exam_region"]
         },
         "pipeline_version": {
           "type": "string",
@@ -1649,6 +1649,12 @@
         },
         "source_origin": {
           "const": "pdf"
+        },
+        "source_document": {
+          "enum": [
+            "problem",
+            "solution"
+          ]
         },
         "document_sha256": {
           "$ref": "#/$defs/sha256"
@@ -2166,6 +2172,9 @@
         "source_system": {
           "$ref": "#/$defs/source_system"
         },
+        "exam_region": {
+          "$ref": "#/$defs/exam_region_provenance"
+        },
         "problem": {
           "$ref": "#/$defs/problem_provenance"
         },
@@ -2248,7 +2257,40 @@
           }
         },
         "raw_snapshot": {
-          "$ref": "#/$defs/raw_snapshot"
+          "oneOf": [{"$ref": "#/$defs/raw_snapshot"}, {"type": "null"}]
+        }
+      },
+      "allOf": [
+        {"if": {"properties": {"source_system": {"properties": {"name": {"const": "exam_region"}}}}},
+         "then": {"required": ["exam_region"], "properties": {"raw_snapshot": {"type": "null"}}}},
+        {"if": {"properties": {"source_system": {"properties": {"name": {"const": "question_crop"}}}}},
+         "then": {"properties": {"raw_snapshot": {"$ref": "#/$defs/raw_snapshot"}}}}
+      ]
+    },
+    "exam_region_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["draft_id", "region_id", "selection_revision", "display_order", "group_label", "input_parts"],
+      "properties": {
+        "draft_id": {"$ref": "#/$defs/id"},
+        "region_id": {"$ref": "#/$defs/id"},
+        "selection_revision": {"type": "integer", "minimum": 1},
+        "display_order": {"type": "integer", "minimum": 1},
+        "group_label": {"type": ["string", "null"]},
+        "input_parts": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["page_number", "role", "bbox", "source_mode", "input_sha256", "input_revision"],
+            "properties": {
+              "page_number": {"type": "integer", "minimum": 1},
+              "role": {"type": "string", "minLength": 1},
+              "bbox": {"$ref": "#/$defs/bbox"},
+              "source_mode": {"enum": ["cleaned", "original_unprocessed"]},
+              "input_sha256": {"$ref": "#/$defs/sha256"},
+              "input_revision": {"type": "integer", "minimum": 1}
+            }
+          }
         }
       }
     },

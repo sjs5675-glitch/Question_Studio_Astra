@@ -10244,12 +10244,12 @@
       "format": "esm"
     },
     "document-output.js": {
-      "bytes": 4793,
+      "bytes": 4877,
       "imports": [],
       "format": "esm"
     },
     "document-render.js": {
-      "bytes": 6696,
+      "bytes": 7709,
       "imports": [
         {
           "path": "document-math-policy.js",
@@ -10265,7 +10265,7 @@
       "format": "esm"
     },
     "document-layout.js": {
-      "bytes": 16555,
+      "bytes": 16930,
       "imports": [
         {
           "path": "document-render.js",
@@ -10349,7 +10349,7 @@
       "format": "esm"
     },
     "document-math.js": {
-      "bytes": 10525,
+      "bytes": 11108,
       "imports": [
         {
           "path": "node_modules/mathlive/mathlive.min.mjs",
@@ -10365,7 +10365,7 @@
       "format": "esm"
     },
     "document-layout-controls.js": {
-      "bytes": 9726,
+      "bytes": 11585,
       "imports": [
         {
           "path": "document-layout.js",
@@ -10542,7 +10542,7 @@
           "bytesInOutput": 22
         },
         "node_modules/@tiptap/core/dist/index.js": {
-          "bytesInOutput": 83459
+          "bytesInOutput": 83467
         },
         "node_modules/@tiptap/core/dist/jsx-runtime/jsx-runtime.js": {
           "bytesInOutput": 702
@@ -10578,7 +10578,7 @@
           "bytesInOutput": 1242
         },
         "node_modules/linkifyjs/dist/linkify.mjs": {
-          "bytesInOutput": 19921
+          "bytesInOutput": 19918
         },
         "node_modules/@tiptap/extension-link/dist/index.js": {
           "bytesInOutput": 9137
@@ -10629,22 +10629,22 @@
           "bytesInOutput": 1941
         },
         "node_modules/mathlive/mathlive.min.mjs": {
-          "bytesInOutput": 833723
+          "bytesInOutput": 833761
         },
         "node_modules/katex/dist/katex.mjs": {
-          "bytesInOutput": 267956
+          "bytesInOutput": 268035
         },
         "document-math-policy.js": {
           "bytesInOutput": 5634
         },
         "document-output.js": {
-          "bytesInOutput": 2429
+          "bytesInOutput": 2483
         },
         "document-render.js": {
-          "bytesInOutput": 4369
+          "bytesInOutput": 4963
         },
         "document-layout.js": {
-          "bytesInOutput": 10783
+          "bytesInOutput": 10857
         },
         "document-formulas.js": {
           "bytesInOutput": 2616
@@ -10662,10 +10662,10 @@
           "bytesInOutput": 4121
         },
         "document-math.js": {
-          "bytesInOutput": 7959
+          "bytesInOutput": 8296
         },
         "document-layout-controls.js": {
-          "bytesInOutput": 7614
+          "bytesInOutput": 8905
         },
         "document-export.js": {
           "bytesInOutput": 3737
@@ -10692,7 +10692,7 @@
           "bytesInOutput": 0
         }
       },
-      "bytes": 1550865
+      "bytes": 1553337
     },
     "dist/document/fonts/KaTeX_AMS-Regular-U6PRYMIZ.woff2": {
       "imports": [],

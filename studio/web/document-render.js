@@ -39,6 +39,25 @@ export function renderEquation(element, node) {
   element.append(label, raw);
 }
 
+function shortChoiceGrid(node, nodes) {
+  if (!["horizontal", "grid"].includes(node.payload.source_layout)) return false;
+  return node.children.every((id) => {
+    const choice = nodes.get(id);
+    if (choice?.kind !== "choice" || choice.children.length !== 1) return false;
+    const paragraph = nodes.get(choice.children[0]);
+    if (paragraph?.kind !== "paragraph") return false;
+    let weight = 0;
+    for (const inlineId of paragraph.children) {
+      const inline = nodes.get(inlineId);
+      if (inline?.kind === "equation") weight += 8;
+      else if (inline?.kind === "text" && !/[\r\n]/.test(inline.payload.text)) {
+        weight += inline.payload.text.replace(/\s/g, "").length;
+      } else return false;
+    }
+    return weight <= 36;
+  });
+}
+
 export function renderDocument(target, current, handlers = {}) {
   const nodes = new Map(current.content.nodes.map(node => [node.id, node]));
   const answers = answerLabels(current);
@@ -51,6 +70,10 @@ export function renderDocument(target, current, handlers = {}) {
     const element = document.createElement(tag);
     element.dataset.nodeId = id;
     element.dataset.kind = node.kind;
+    if (node.kind === 'box') {
+      element.dataset.boxRole = node.payload.role;
+      if (node.payload.role === 'choices' && shortChoiceGrid(node, nodes)) element.dataset.choiceGrid = 'true';
+    }
     element.className = `document-node document-${node.kind}`;
     if (node.kind === 'paragraph') applyStyle(element, { paragraph_spacing_mm });
     applyStyle(element, current.styles.node_overrides[id] ?? {});
@@ -78,7 +101,7 @@ export function renderDocument(target, current, handlers = {}) {
       }
       case 'question': case 'choice': case 'box': case 'answer': {
         const label = document.createElement('span'); label.className = 'document-label';
-        label.textContent = node.kind === 'question' ? `문항 ${node.payload.label}` : node.kind === 'box' ? (node.payload.title_visible ? node.payload.title : '') : node.kind === 'answer' ? `답 ${node.payload.label ?? node.payload.part_id ?? ''} ${node.payload.text ?? answers.get(id) ?? ''}` : node.payload.label;
+        label.textContent = node.kind === 'question' ? (handlers.compactPrint ? `${node.payload.label}.` : `문항 ${node.payload.label}`) : node.kind === 'box' ? (node.payload.title_visible ? node.payload.title : '') : node.kind === 'answer' ? `답 ${node.payload.label ?? node.payload.part_id ?? ''} ${node.payload.text ?? answers.get(id) ?? ''}` : node.payload.label;
         element.append(label); break;
       }
       case 'table': element.setAttribute('role', 'table'); break;

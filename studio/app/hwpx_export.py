@@ -39,7 +39,7 @@ OCF_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 ODF_NS = "urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"
 RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 
-NATIVE_RENDERER_ENGINE_ID = "question-json-studio.native_ordered.v0.6"
+NATIVE_RENDERER_ENGINE_ID = "question-json-studio.native_ordered.v1.1"
 HANCOM_VERIFIED_QUESTION_PROMPT_VERSIONS = ("transcribe-exam-crop-v2",)
 MAX_BLOCK_DEPTH = 12
 REQUIRED_STYLE_BINDINGS = {
@@ -61,7 +61,7 @@ BLOCK_CAPABILITY_MATRIX = {
     "table": frozenset({"paragraph", "figure"}),
 }
 NATIVE_RENDERER_CONTRACT = {
-    "contract_version": "0.6.0",
+    "contract_version": "1.1.0",
     "approval_status": "approved",
     "engine_id": NATIVE_RENDERER_ENGINE_ID,
     "renderer": "native_ordered",
@@ -83,6 +83,7 @@ NATIVE_RENDERER_CONTRACT = {
         "verified_question_prompt_versions": list(
             HANCOM_VERIFIED_QUESTION_PROMPT_VERSIONS
         ),
+        "verified_equation_prompt_versions": ["transcribe-exam-crop-v5"],
         "unverified_native_risk": "ready_source_crop_item_fallback",
         "native_risk_features": ["block.box", "block.table", "equation"],
         "workflow_or_review_state_mutation": False,
@@ -93,7 +94,7 @@ NATIVE_RENDERER_CONTRACT = {
     "required_styles": REQUIRED_STYLE_BINDINGS,
     "max_block_depth": MAX_BLOCK_DEPTH,
     "line_layout": {
-        "implementation_revision": "0.3.0",
+        "implementation_revision": "0.5.0",
         "line_segments": "single_textpos_zero_per_paragraph",
         "wrap_policy": "editable_paragraph_expansion",
         "explicit_newline": "paragraph_boundary",
@@ -115,6 +116,7 @@ NATIVE_RENDERER_CONTRACT = {
         "numbering": "continuous_1_to_n",
         "generated_labels": ["[답]", "[풀이]"],
     },
+    "project_assembly": {"columns": 2, "numbering": "continuous_1_to_n"},
     "question_set_layout": {
         "columns": 2,
         "gap_mm": 8,
@@ -154,7 +156,7 @@ _NATIVE_RENDERER_CONTRACT_DIGEST = hashlib.sha256(
 # This literal is an approval pin. Changing capabilities requires a version and
 # fingerprint update, not a silent re-hash of the accepted project contract.
 NATIVE_RENDERER_ENGINE_FINGERPRINT_SHA256 = (
-    "694b9b64fc65378e06d2805ad93c47cac7f55ff4a4ddc6913fe1ef3d551d6604"
+    "dbd99b91f951b280903d1f28c219bb8aa89ef17c67a0efbf408b59fd5f445228"
 )
 if _NATIVE_RENDERER_CONTRACT_DIGEST != NATIVE_RENDERER_ENGINE_FINGERPRINT_SHA256:
     raise RuntimeError("approved native renderer contract fingerprint is stale")
@@ -828,6 +830,8 @@ def _hancom_compatibility_quarantine(
                 visit(child)
 
     visit(question)
+    if prompt_version == "transcribe-exam-crop-v5" and features == {"equation"}:
+        return None
     return (prompt_version, tuple(sorted(features))) if features else None
 
 

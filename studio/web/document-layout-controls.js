@@ -3,6 +3,22 @@ import { layoutDocument } from './document-layout.js';
 export function mountLayoutControls(host, options) {
   let generation = 0, controller, receipt;
   const fields = new Map(); const target = document.getElementById('document-preview'); const status = document.getElementById('document-layout-error');
+  function group(title, open = false) {
+    const details = document.createElement('details'); details.className = 'inspector-group'; details.open = open;
+    const summary = document.createElement('summary'); summary.textContent = title;
+    const body = document.createElement('div'); body.className = 'inspector-fields';
+    details.append(summary, body); host.append(details); return body;
+  }
+  const pageFields = group('출력 내용 · 용지', true);
+  const spacingFields = group('여백 · 간격', true);
+  const labelFields = group('안내 · 머리말 · 쪽 번호');
+  const breakFields = group('문항 나눔');
+  const figureFields = group('그림 크기');
+  function fieldGroup(path) {
+    if (path.includes('margins_mm') || ['layout.column_gap_mm', 'layout.question_gap_mm'].includes(path)) return spacingFields;
+    if (['layout.instructions', 'layout.unit', 'layout.type', 'layout.header', 'layout.footer', 'layout.page_start', 'layout.cover_number_visible'].includes(path)) return labelFields;
+    return pageFields;
+  }
   const specifications = [
     ['layout.template', '지면 종류', ['mock_exam|모의고사', 'workbook|문제집']], ['output_role', '출력 내용', ['question_only|문제만', 'explanation_only|답과 해설만', 'combined_end_section|문제 뒤 답과 해설']],
     ['layout.paper', '용지', ['A4|A4 · 210×297mm', 'B4|B4 · 250×353mm', 'custom|사용자 지정']], ['layout.first_page', '첫 쪽', ['title_questions|제목과 문제', 'cover|표지 전용']],
@@ -25,25 +41,28 @@ export function mountLayoutControls(host, options) {
       if (kind === 'number' && (!Number.isFinite(value) || value < min || value > max)) { status.textContent = '지면 치수의 허용 범위를 확인해 주세요.'; return; }
       options.change(document => { set(document, path, value); if (path === 'layout.paper' && value !== 'custom') { const size = value === 'A4' ? [210, 297] : [250, 353]; document.layout.width_mm = size[0]; document.layout.height_mm = size[1]; } });
     });
-    wrapper.append(control); host.append(wrapper); fields.set(path, { wrapper, control, kind });
+    if (Array.isArray(kind) || kind === 'textarea' || ['layout.header', 'layout.footer'].includes(path)) wrapper.classList.add('field-wide');
+    if (kind === 'checkbox') wrapper.classList.add('checkbox-field');
+    wrapper.append(control); fieldGroup(path).append(wrapper); fields.set(path, { wrapper, control, kind });
   }
-  function select(label) { const control = document.createElement('select'); control.setAttribute('aria-label', label); host.append(control); return control; }
-  function button(label, action) { const control = document.createElement('button'); control.type = 'button'; control.textContent = label; control.addEventListener('click', action); host.append(control); return control; }
-  const breaks = select('나눔 위치 문항');
-  button('선택 문항 앞 새 단 전환', () => { if (breaks.value) options.change(document => { const ids = document.layout.break_before; document.layout.break_before = ids.includes(breaks.value) ? ids.filter(id => id !== breaks.value) : [...ids, breaks.value]; }); });
-  button('공통 지문 반복 배치 초기화', () => options.change(document => { document.layout.context_repeats = []; }));
-  const breakNote = document.createElement('p'); breakNote.className = 'document-help'; host.append(breakNote);
-  const figures = select('크기 조정 그림');
+  function select(label, parent) { const wrapper = document.createElement('label'); wrapper.className = 'field-wide'; wrapper.textContent = label; const control = document.createElement('select'); control.setAttribute('aria-label', label); wrapper.append(control); parent.append(wrapper); return control; }
+  function button(label, action, parent) { const control = document.createElement('button'); control.type = 'button'; control.textContent = label; control.addEventListener('click', action); parent.append(control); return control; }
+  const breaks = select('나눔 위치 문항', breakFields);
+  button('선택 문항 앞 새 단 전환', () => { if (breaks.value) options.change(document => { const ids = document.layout.break_before; document.layout.break_before = ids.includes(breaks.value) ? ids.filter(id => id !== breaks.value) : [...ids, breaks.value]; }); }, breakFields);
+  button('공통 지문 반복 배치 초기화', () => options.change(document => { document.layout.context_repeats = []; }), breakFields);
+  const breakNote = document.createElement('p'); breakNote.className = 'document-help'; breakFields.append(breakNote);
+  const figures = select('크기 조정 그림', figureFields);
+  const figureDescription = document.createElement('p'); figureDescription.className = 'figure-description'; figureFields.append(figureDescription);
   for (const [key, label, max] of [['width_mm', '그림 너비(mm)', 400], ['height_mm', '그림 높이(mm) · 비우면 자동', 600]]) {
     const wrapper = document.createElement('label'); wrapper.textContent = label; const input = document.createElement('input'); input.type = 'number'; input.min = 1; input.max = max; input.setAttribute('aria-label', label);
     input.addEventListener('change', () => { if (!figures.value) return; const value = input.value === '' && key === 'height_mm' ? null : Number(input.value); if (value !== null && (!Number.isFinite(value) || value < 1 || value > max)) return;
       options.change(document => { document.content.nodes.find(node => node.id === figures.value).payload[key] = value; }); });
-    wrapper.append(input); host.append(wrapper); fields.set(`figure.${key}`, { control: input });
+    wrapper.append(input); figureFields.append(wrapper); fields.set(`figure.${key}`, { control: input });
   }
   const aspect = document.createElement('input'); aspect.type = 'checkbox'; aspect.setAttribute('aria-label', '그림 비율 유지');
-  const aspectLabel = document.createElement('label'); aspectLabel.textContent = '그림 비율 유지'; aspectLabel.append(aspect); host.append(aspectLabel);
+  const aspectLabel = document.createElement('label'); aspectLabel.textContent = '그림 비율 유지'; aspectLabel.className = 'checkbox-field'; aspectLabel.append(aspect); figureFields.append(aspectLabel);
   aspect.addEventListener('change', () => { if (figures.value) options.change(document => { document.content.nodes.find(node => node.id === figures.value).payload.keep_aspect = aspect.checked; }); });
-  function figureValues(current) { const node = current.content.nodes.find(node => node.id === figures.value); for (const key of ['width_mm', 'height_mm']) fields.get(`figure.${key}`).control.value = node?.payload[key] ?? ''; aspect.checked = node?.payload.keep_aspect ?? true; }
+  function figureValues(current) { const node = current.content.nodes.find(node => node.id === figures.value); for (const key of ['width_mm', 'height_mm']) fields.get(`figure.${key}`).control.value = node?.payload[key] ?? ''; aspect.checked = node?.payload.keep_aspect ?? true; figureDescription.textContent = node?.payload.alt_text ?? '선택한 그림이 없습니다.'; }
   figures.addEventListener('change', () => figureValues(options.snapshot()));
   function invalidate() { generation++; controller?.abort(); receipt = null; target.replaceChildren(); status.replaceChildren(); }
   async function build() {
@@ -69,7 +88,7 @@ export function mountLayoutControls(host, options) {
     for (const [path, field] of fields) { if (path.startsWith('figure.')) continue; if (field.kind === 'checkbox') field.control.checked = read(current, path); else field.control.value = read(current, path);
       if (['layout.width_mm', 'layout.height_mm'].includes(path)) field.wrapper.hidden = current.layout.paper !== 'custom'; }
     for (const [select, nodes, label] of [[breaks, current.content.nodes.filter(node => current.content.roots.includes(node.id) && node.kind === 'question'), node => `문항 ${node.payload.label}`],
-      [figures, current.content.nodes.filter(node => node.kind === 'figure'), (node, index) => `그림 ${index + 1} · ${node.payload.alt_text}`]]) {
+      [figures, current.content.nodes.filter(node => node.kind === 'figure'), (node, index) => `그림 ${index + 1}`]]) {
       const selected = select.value; select.replaceChildren(); for (const [index, node] of nodes.entries()) { const option = document.createElement('option'); option.value = node.id; option.textContent = label(node, index); select.append(option); }
       if (nodes.some(node => node.id === selected)) select.value = selected;
     }

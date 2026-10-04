@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -72,6 +73,23 @@ def selected_sources(workspace: Path, set_id: str, expected_revision: int) -> tu
     return selected, sources
 
 
+def _suffix_start(package: JsonMap) -> int:
+    printed = mapping(package.get('identity', {}), 'identity').get('printed_number', '')
+    label = re.search(r'(\([^()]+\))\s*$', str(printed))
+    question = mapping(package.get('content'), 'content').get('question')
+    if not label or question is None:
+        return 0
+    for index, raw_block in enumerate(sequence(mapping(question, 'question').get('blocks', []), 'question.blocks')):
+        block = mapping(raw_block, 'block')
+        if block.get('type') != 'paragraph':
+            continue
+        visible = ''.join(str(mapping(inline, 'inline').get('text', ''))
+                          for inline in sequence(block.get('inlines', []), 'inlines'))
+        if visible.lstrip().startswith(label.group(1)):
+            return index
+    return 0
+
+
 def import_content(workspace: Path, sources: list[Snapshot]) -> tuple[list[Import], list[Asset], Content, list[Group], dict[str, bytes]]:
     imports: list[Import] = []
     assets: list[Asset] = []
@@ -80,7 +98,8 @@ def import_content(workspace: Path, sources: list[Snapshot]) -> tuple[list[Impor
     files: dict[str, bytes] = {}
     parent_roots: dict[tuple[str, str], str] = {}
     parent_sources: dict[tuple[str, str], Snapshot] = {}
-    for source in sources:
+    previous_group: str | None = None
+    for ordinal, source in enumerate(sources, 1):
         record = source.record
         copied, binaries, asset_ids = collect_assets(source.item_root, source.package)
         record['asset_bindings'] = asset_ids
@@ -88,8 +107,15 @@ def import_content(workspace: Path, sources: list[Snapshot]) -> tuple[list[Impor
         files.update(binaries)
         files[record['relative_path']] = source.data
         imports.append(record)
-        builder = TreeBuilder(record['snapshot_id'], asset_ids)
-        question = builder.question(source.package)
+        widths = {asset['id']: asset['width_px'] for asset in copied}
+        builder = TreeBuilder(record['snapshot_id'], asset_ids,
+                              {source_id: widths[owned_id] for source_id, owned_id in asset_ids.items()})
+        start = 0
+        if source.group_key and source.group_key == previous_group and source.parent_id is None:
+            start = _suffix_start(source.package)
+        question = builder.question(source.package, question_start=start)
+        next(node for node in builder.nodes if node['id'] == question)['payload']['label'] = str(ordinal)
+        previous_group = source.group_key
         content['roots'].append(question)
         content['nodes'].extend(builder.nodes)
         if source.group_key is not None:
@@ -114,7 +140,9 @@ def import_content(workspace: Path, sources: list[Snapshot]) -> tuple[list[Impor
                     files.update(binaries)
                     files[parent.record['relative_path']] = parent.data
                     imports.append(parent.record)
-                    parent_builder = TreeBuilder(parent.record['snapshot_id'], asset_ids)
+                    widths = {asset['id']: asset['width_px'] for asset in copied}
+                    parent_builder = TreeBuilder(parent.record['snapshot_id'], asset_ids,
+                                                 {source_id: widths[owned_id] for source_id, owned_id in asset_ids.items()})
                     parent_root = parent_builder.question(parent.package, selected=False)
                     parent_roots[key] = parent_root
                     content['nodes'].extend(parent_builder.nodes)

@@ -17,6 +17,8 @@ from .equation_bridge import normalize_equations
 
 from astra_runtime import inside
 from astra_cli.quality_manifest import stored_reason
+from astra_cli.quality_reads import file_sha256
+from astra_cli.quality_studio import current_receipt_result
 
 
 SCHEMA_VERSION = "0.1.0"
@@ -396,13 +398,94 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
     assets = document.get("resources", {}).get("assets", [])
     selected_id = selection.get("source_asset_id") if isinstance(selection, Mapping) else None
     selected_sha = selection.get("source_sha256") if isinstance(selection, Mapping) else None
+    if not isinstance(selection, Mapping):
+        # A printed answer key is not an alternative detailed-solution source.
+        # Keep explicit selections authoritative and leave multiple detail candidates unresolved.
+        preferred_links = [
+            link for link in detailed
+            if link.get("status") in {"verified", "review"}
+        ]
+        if not preferred_links:
+            preferred_links = [
+                link for link in quick_answers
+                if link.get("status") in {"verified", "review"}
+            ]
+        preferred = preferred_links[0] if len(preferred_links) == 1 else None
+        selected_id = preferred.get("source_asset_id") if preferred else None
+        selected_sha = next(
+            (asset.get("sha256") for asset in assets
+             if isinstance(asset, Mapping) and asset.get("asset_id") == selected_id), None
+        )
+    current_candidate_ids = {
+        value for value in raw_candidates if isinstance(value, str)
+    } if isinstance(raw_candidates, list) else None
+    physical_links = [*detailed, *quick_answers]
+    physical_link = next(
+        (link for link in physical_links if link.get("source_asset_id") == selected_id), None
+    )
+    if physical_link is None:
+        physical_link = next(
+            (link for link in physical_links
+             if current_candidate_ids is None or link.get("external_asset_id") in current_candidate_ids), None
+        )
+    physical_asset_id = physical_link.get("source_asset_id") if isinstance(physical_link, Mapping) else None
+    selected_asset = next(
+        (asset for asset in assets if isinstance(asset, Mapping) and asset.get("asset_id") == physical_asset_id),
+        None,
+    )
+    source_asset_present = selected_asset is not None
+    source_integrity = "ready" if source_asset_present or physical_link is None else "missing_file"
+    if isinstance(selected_asset, Mapping) and isinstance(selected_asset.get("path"), str) and item_root is not None:
+        root = item_root.resolve()
+        source_path = (root / selected_asset["path"]).resolve()
+        source_asset_present = source_path.is_relative_to(root) and source_path.is_file()
+        source_integrity = "ready" if source_asset_present else "missing_file"
+        if source_asset_present:
+            actual_sha = file_sha256(source_path)
+            expected_sha = (
+                selected_sha if selected_asset.get("asset_id") == selected_id
+                else selected_asset.get("sha256")
+            )
+            if isinstance(expected_sha, str) and actual_sha != expected_sha:
+                source_integrity = "hash_mismatch"
+    selected_link = next(
+        (link for link in detailed if link.get("source_asset_id") == selected_id), None
+    )
+    selected_reasons = selected_link.get("review_reasons") or [] if isinstance(selected_link, Mapping) else []
+    receipt_result = (
+        current_receipt_result(dict(document), item_root)
+        if isinstance(selection, Mapping) and item_root is not None else None
+    )
+    receipt_identity_mismatch = isinstance(receipt_result, Mapping) and any(
+        receipt_result.get(field) == "mismatch"
+        for field in ("same_question", "content_match", "number_consistency")
+    )
+    receipt_answer_conflict = (
+        isinstance(receipt_result, Mapping)
+        and receipt_result.get("same_question") == "match"
+        and receipt_result.get("content_match") == "match"
+        and receipt_result.get("number_consistency") != "mismatch"
+        and receipt_result.get("answer_consistency") == "conflict"
+    )
+    if receipt_identity_mismatch:
+        link_state = "mismatch"
+    elif receipt_answer_conflict:
+        link_state = "conflict"
+    elif any("pair_mismatch" in str(reason) or "wrong_link" in str(reason) for reason in selected_reasons):
+        link_state = "mismatch"
+    elif any("conflict" in str(reason) for reason in selected_reasons):
+        link_state = "conflict"
+    elif isinstance(selected_link, Mapping) and selected_link.get("status") == "verified" and source_integrity == "ready":
+        link_state = "verified"
+    elif isinstance(selected_link, Mapping) and (selected_link.get("status") == "review" or selected_reasons):
+        link_state = "review"
+    elif detailed or (isinstance(raw_candidates, list) and raw_candidates):
+        link_state = "unverified"
+    else:
+        link_state = "no_candidate"
     if any(link.get("source_asset_id") == selected_id and "pair_mismatch_rejected" in (link.get("review_reasons") or [])
            for link in detailed):
         selected_id = selected_sha = None
-    if not isinstance(selection, Mapping):
-        preferred = next((link for link in [*detailed, *quick_answers] if link.get("status") in {"verified", "review"}), None)
-        selected_id = preferred.get("source_asset_id") if preferred else None
-        selected_sha = next((asset.get("sha256") for asset in assets if isinstance(asset, Mapping) and asset.get("asset_id") == selected_id), None)
     attempts_for_source = provenance.get("transcriptions", []) if isinstance(provenance, Mapping) else []
     current_transcription = any(
         isinstance(attempt, Mapping)
@@ -418,7 +501,23 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
                         if isinstance(attempt, Mapping) and attempt.get("section") == "explanation"
                         and selected_id in (attempt.get("input_asset_ids") or [])
                         and (not isinstance(selection, Mapping) or attempt.get("selection_revision") == selection.get("revision"))]
-    transcription_state = ("complete" if current_transcription and explanation_blocks else
+    answer = content.get("answer") if isinstance(content, Mapping) else None
+    answer_fields = {"choice": "choice_ids", "content": "blocks", "true_false": "items"}
+    answer_values = (
+        answer.get(answer_fields.get(str(answer.get("kind")), ""))
+        if isinstance(answer, Mapping) else None
+    )
+    has_answer = isinstance(answer_values, list) and bool(answer_values)
+    answer_only_transcribed = bool(
+        has_answer and not explanation_blocks and current_transcription
+        and source_present and source_integrity == "ready"
+        and link_state not in {"mismatch", "conflict"}
+    )
+    transcribed = bool(
+        (isinstance(explanation_blocks, list) and explanation_blocks and current_transcription)
+        or answer_only_transcribed
+    )
+    transcription_state = ("complete" if transcribed else
                            "failed" if current_attempts and current_attempts[-1].get("status") == "failed" else
                            "pending" if source_present else "no_source")
 
@@ -497,10 +596,14 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
             isinstance(raw_link, Mapping) and raw_link.get("best_effort_exhausted") is True
         ),
         "manually_confirmed": manually_confirmed,
-        "transcribed": isinstance(explanation_blocks, list) and bool(explanation_blocks) and current_transcription,
+        "transcribed": transcribed,
+        "answer_only_transcribed": answer_only_transcribed,
         "source_present": source_present,
+        "source_asset_present": source_asset_present,
+        "source_integrity": source_integrity,
+        "link_state": link_state,
         "transcription_state": transcription_state,
-        "previous_transcription_present": bool(explanation_blocks) and not current_transcription,
+        "previous_transcription_present": bool(explanation_blocks or has_answer) and not current_transcription,
         "source_asset_id": selected_id,
         "source_sha256": selected_sha,
         "selection_revision": selection.get("revision") if isinstance(selection, Mapping) else None,

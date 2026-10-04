@@ -4,34 +4,53 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>문서 편집 · Question Studio</title>
   <link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/dist/document/document.css"><link rel="stylesheet" href="/document.css">
+  <link rel="stylesheet" href="/workspace.css"><link rel="stylesheet" href="/workspace-document.css">
+  <link rel="stylesheet" href="/device-ui.css"><link rel="stylesheet" href="/device-document.css">
   <script type="module" src="/dist/document/document.js"></script>
+  <script type="module" src="/device-shell.mjs"></script>
+  <script type="module" src="/device-document.mjs"></script>
 </head>
-<body>
+<body class="astra-ui astra-document">
   <a class="skip-link" href="#document-flow">본문으로 이동</a>
-  <header class="app-header"><div><p class="eyebrow">QUESTION STUDIO</p><h1>문서 편집</h1></div><a class="button" href="/">문제지로 돌아가기</a></header>
+<header class="app-header"><a class="app-brand" href="/?view=work" aria-label="Astra 새 작업"><svg class="brand-mark" viewBox="0 0 32 36" aria-hidden="true"><path d="M4 30 16 4l12 26M9 21h14" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/></svg><span class="brand-copy"><strong>ASTRA</strong><span>문항 작업실</span></span></a><nav class="workspace-nav" aria-label="주요 메뉴"><a id="workNav" href="/?view=work"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4"/><path d="M4 16v5h16v-5"/></svg><span>새 작업</span></a><a id="savedNav" href="/?view=saved"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6l2 3h8v13H4z"/><path d="M8 11h8M8 15h6"/></svg><span>저장된 문항</span></a><a id="bankNav" href="/?view=bank"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v16H4zM14 4h6v16h-6zM4 8h6m4 0h6"/></svg><span>문제은행</span></a><a id="setsNav" href="/?view=sets"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10v18H7zM4 7H2v14h11"/><path d="M10 8h4m-4 4h4m-4 4h4"/></svg><span>문제지 만들기</span></a><a id="documentNav" href="/document.html" aria-current="page"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h10v16H4zM13 13l6-6 2 2-6 6-3 1z"/></svg><span>문서 편집</span></a><a id="learningNav" href="/?view=learning"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10m5 10V5m5 15v-8m5 8V3"/></svg><span>분석 참고 사례</span></a></nav><p class="rail-foot">문항을 모으고, 다듬고, 출력하세요.</p></header>
   <main id="document-app">
-    <aside class="document-library" aria-label="저장된 문서"><h2>내 문서</h2><button id="document-refresh-list" class="button" type="button">목록 새로고침</button><div id="document-list"></div><p class="document-help">원본 문제는 바뀌지 않습니다.<br>편집한 내용은 이 문서에만 저장됩니다.</p></aside>
+    <aside class="document-library" aria-label="저장된 문서"><details id="device-document-library" open><summary>내 문서 목록</summary><button id="document-refresh-list" class="button" type="button">목록 새로고침</button><div id="document-list"></div><p class="document-help">원본 문제는 바뀌지 않습니다.<br>편집한 내용은 이 문서에만 저장됩니다.</p></details></aside>
     <section class="document-main" aria-label="문서 작업 공간">
+      <div class="document-page-heading"><h1>문서 편집</h1><p>본문과 수식을 다듬고 완성된 지면을 확인하세요.</p></div>
+      <div class="device-document-reading-heading"><h2 id="device-document-title">현재 문서</h2><p>읽기 모드 · 내용을 바꾸려면 편집을 누르세요. 서식·문서 속성을 열어도 편집 모드로 전환됩니다.</p></div>
       <p id="document-status" role="status">문서 목록을 불러오는 중입니다.</p>
+      <p id="device-document-revision" class="document-help" role="status" aria-live="polite"></p>
       <div class="document-toolbar document-actions">
+        <button id="device-document-mode" class="button" type="button" aria-pressed="false" aria-controls="document-flow" disabled>편집</button>
         <button id="document-save" class="button primary" type="button" disabled>문서 저장</button><button id="document-undo" class="button" type="button" disabled>실행 취소</button><button id="document-redo" class="button" type="button" disabled>다시 실행</button>
+      </div>
+      <details id="device-document-output" class="device-document-panel" open><summary>출력 / 다운로드</summary>
+        <p class="document-help">출력 파일은 저장본 기준입니다. 저장하지 않은 편집은 먼저 문서 저장 후 출력하세요. 이전 파일의 저장본 번호를 확인하세요.</p>
+        <div class="document-toolbar document-output-actions">
         <button id="document-pdf-download" class="button" type="button" disabled>PDF 만들기</button><button id="document-pdf-cancel" class="button" type="button" hidden>PDF 취소</button><a id="document-pdf-file" class="button" hidden>PDF 내려받기</a>
         <button id="document-hwpx-download" class="button" type="button" disabled>현재 HWPX 만들기</button><button id="document-hwpx-cancel" class="button" type="button" hidden>HWPX 취소</button><a id="document-hwpx-file" class="button" hidden>HWPX 내려받기</a>
         <button id="document-zip-download" class="button" type="button" disabled>문서 백업 ZIP 만들기 (정답·원본 포함)</button><button id="document-zip-cancel" class="button" type="button" hidden>ZIP 취소</button><a id="document-zip-file" class="button" hidden>문서 백업 ZIP 내려받기</a>
-      </div>
+        </div>
+      </details>
       <div id="document-workspace" hidden>
         <label class="document-title-label">문서 제목<input id="document-title" maxlength="300" autocomplete="off"></label>
-        <div class="document-toolbar" aria-label="본문 서식">
+        <div class="document-editor-grid"><div class="document-canvas-pane">
+        <details id="device-document-format" class="device-document-panel" open><summary>서식</summary>
+        <div class="document-toolbar document-formatbar" aria-label="본문 서식">
           <button type="button" data-mark="bold" aria-label="굵게"><strong>B</strong></button><button type="button" data-mark="italic" aria-label="기울임"><em>I</em></button><button type="button" data-mark="underline" aria-label="밑줄"><u>U</u></button><button type="button" data-mark="superscript" aria-label="위 첨자">x²</button><button type="button" data-mark="subscript" aria-label="아래 첨자">x₂</button>
           <label>글꼴<select id="document-font"><option>Noto Sans KR</option><option>Noto Serif KR</option></select></label>
           <label>크기(pt)<input id="document-font-size" type="number" min="6" max="72" value="10"></label><label>줄 간격<input id="document-line-spacing" type="number" min="1" max="3" step="0.1" value="1.6"></label><label>문단 간격(mm)<input id="document-paragraph-spacing" type="number" min="0" max="30" value="3"></label>
           <button id="document-add-math" type="button">수식 삽입</button>
         </div>
-        <details class="document-layout-settings"><summary>지면 설정 · 용지와 출력 내용</summary><div id="document-layout-controls" class="document-layout-controls"></div></details>
-        <button id="document-preview-button" type="button">쪽 나눔 미리보기 계산</button>
-        <p class="document-help">문단을 눌러 바로 편집하세요. Enter: 새 문단 · Shift+Enter: 줄바꿈 · 수식 클릭: 수식 편집. 선택한 글자의 서식만 바꿀 수 있습니다.</p><p class="document-help">연속 편집 화면에는 전체 내용이 보입니다. 선택한 출력 내용과 쪽 나눔은 아래 미리보기에 적용됩니다.</p>
-        <article id="document-flow" aria-label="현재 문서 본문"></article>
+        </details>
+
+        <div class="document-canvas-heading"><h2>본문 편집</h2></div>
+        <p class="document-help device-document-edit-help">문단을 눌러 바로 편집하세요. Enter: 새 문단 · Shift+Enter: 줄바꿈 · 수식 클릭: 수식 편집. 선택한 글자의 서식만 바꿀 수 있습니다.</p><p class="document-help device-document-edit-help">연속 편집 화면에는 전체 내용이 보입니다. 선택한 출력 내용과 쪽 나눔은 아래 미리보기에 적용됩니다.</p>
+        <article id="document-flow" aria-label="현재 문서 본문" tabindex="-1"></article>
+        <p class="document-help device-document-boundary">원본 문제는 바뀌지 않습니다. 편집한 내용은 이 문서에만 저장됩니다.</p>
+        <button id="document-preview-button" class="button" type="button">쪽 나눔 미리보기 계산</button>
         <div id="document-layout-error" role="status"></div><section id="document-preview" aria-label="쪽 나눔 미리보기"></section>
+        </div><aside class="document-inspector" aria-label="문서 속성"><details id="device-document-properties" class="device-document-panel" open><summary>문서 속성</summary><p class="document-help">2단 고정 · 문항 번호는 출력 순서대로</p><div id="document-layout-controls" class="document-layout-controls"></div></details></aside></div>
       </div>
     </section>
   </main>

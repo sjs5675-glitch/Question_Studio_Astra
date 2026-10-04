@@ -136,6 +136,45 @@ def _prepare_uploads(item_path: Path, upload_ids: list[str]) -> tuple[dict[str, 
     return _write_immutable(item_path, canvas), image_sources
 
 
+def _source_pdf_path(leaf: Path, link: Mapping[str, Any]) -> Path | None:
+    digest = link.get("document_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return None
+    manifest = load_json_object(leaf / "solutions" / "link_manifest.json")
+
+    def resolved(record: Mapping[str, Any]) -> Path | None:
+        if record.get("source_sha256") != digest or not isinstance(record.get("source_pdf"), str):
+            return None
+        path = Path(record["source_pdf"]).expanduser()
+        path = path if path.is_absolute() else leaf / path
+        return path if path.is_file() and sha256_file(path) == digest else None
+
+    source_document = link.get("source_document")
+    if source_document in {"problem", "solution"}:
+        record = manifest.get(source_document)
+        if isinstance(record, Mapping):
+            source = resolved(record)
+            if source is not None:
+                return source
+            if record.get("source_sha256") != digest:
+                return None
+        if source_document != "problem":
+            return None
+        for name in ("manifest.json", "run_state.json"):
+            path = leaf / name
+            if path.is_file():
+                source = resolved(load_json_object(path))
+                if source is not None:
+                    return source
+        return None
+    if source_document is not None:
+        return None
+    candidates = [source for name in ("problem", "solution")
+                  if isinstance(record := manifest.get(name), Mapping)
+                  and (source := resolved(record)) is not None]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _pdf_pages(item_path: Path, link: Mapping[str, Any], import_roots: tuple[Path, ...]) -> list[dict[str, Any]]:
     from .solution_reconciliation import locate_leaf_run
 
@@ -145,11 +184,9 @@ def _pdf_pages(item_path: Path, link: Mapping[str, Any], import_roots: tuple[Pat
     leaf = locate_leaf_run(project_path, import_roots)
     if leaf is None:
         return []
-    manifest = load_json_object(leaf / "solutions" / "link_manifest.json")
-    solution = manifest.get("solution", {})
-    source = Path(str(solution.get("source_pdf", ""))).expanduser()
     digest = link.get("document_sha256")
-    if not source.is_file() or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or sha256_file(source) != digest:
+    source = _source_pdf_path(leaf, link)
+    if source is None or not isinstance(digest, str):
         return []
     indexes = {part.get("pdf_index") for part in link.get("parts", []) if isinstance(part, dict)}
     import pypdfium2 as pdfium
@@ -230,9 +267,8 @@ def _render_pdf_page(item_path: Path, pdf_page: int, import_roots: tuple[Path, .
     leaf = locate_leaf_run(item_path.parents[2] / "project.json", import_roots)
     if not isinstance(link, dict) or leaf is None:
         raise SolutionSourceError("현재 PDF 해설 원본을 찾을 수 없습니다.", 409)
-    manifest = load_json_object(leaf / "solutions" / "link_manifest.json")
-    pdf_path = Path(str(manifest.get("solution", {}).get("source_pdf", ""))).expanduser()
-    if not pdf_path.is_file() or sha256_file(pdf_path) != link.get("document_sha256"):
+    pdf_path = _source_pdf_path(leaf, link)
+    if pdf_path is None:
         raise SolutionSourceError("PDF 해설 원본이 변경되었습니다.", 409)
     pdf = pdfium.PdfDocument(str(pdf_path))
     try:

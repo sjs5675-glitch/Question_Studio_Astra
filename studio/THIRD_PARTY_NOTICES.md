@@ -6,7 +6,7 @@
 - Reviewed commit: `bd97d15ed67e325692455b60c483d5e592d0d1c4`
 - Copyright: © 2026 Exam Studio / PNKmath
 - Repository notice: source modification and teaching use are allowed; software redistribution, relicensing, rebranding, and commercializing the software itself are restricted unless separately authorized.
-- Project-specific authorization: the user reports receiving permission from the original developer. The written authorization and its scope must be retained outside the public source tree before redistribution.
+- Project-specific authorization: the publisher confirmed that permission from the original developer includes public GitHub redistribution of the incorporated code and modifications. The authorization itself is not included in this public source tree; this confirmation does not relicense the upstream code or grant unrestricted redistribution to others.
 
 This project does not import the complete Exam Studio application. Selected algorithms, contracts, and tests may be adapted with file-level provenance recorded in a source manifest. The solver and AI-generated explanation pipeline are explicitly excluded.
 

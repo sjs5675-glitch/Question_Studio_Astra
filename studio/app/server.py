@@ -44,6 +44,8 @@ from .hwpx_artifacts import (
 from .hwpx_export import ExportPreflightError
 from .hwpx_renderer import HwpxRenderError
 from .importer import ImportConflictError, import_leaf_run
+from astra_cli.quality_reads import quality_read_scope
+
 from .model import (
     ModelError,
     ModelNotFound,
@@ -64,6 +66,7 @@ from .pdf_uploads import (
     MAX_PDF_UPLOAD_BYTES,
     PdfUploadError,
     PdfUploadNotFound,
+    PdfUploadTimeout,
     cleanup_pdf_uploads,
     resolve_pdf_upload,
     store_pdf_upload,
@@ -75,6 +78,8 @@ from .project_archive import (
 )
 from .question_bank import (
     create_question_set,
+    delete_question_set,
+    QuestionSetArchiveConflict,
     get_question_set,
     list_bank_items,
     list_question_sets,
@@ -132,6 +137,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = ASTRA.studio_port
 MAX_JSON_BYTES = 8 * 1024 * 1024
 SESSION_COOKIE = "astra_studio_session"
+PDF_UPLOAD_IDLE_TIMEOUT_SECONDS = 60.0
 
 
 def _normalize_origin(
@@ -252,6 +258,8 @@ class StudioApplication:
                 content_length=content_length,
                 original_name=original_name,
             )
+        except PdfUploadTimeout as exc:
+            raise ApiError(HTTPStatus.REQUEST_TIMEOUT, str(exc)) from exc
         except PdfUploadError as exc:
             status = (
                 HTTPStatus.INSUFFICIENT_STORAGE
@@ -745,6 +753,9 @@ class StudioApplication:
         )
         return get_question_set(self.config.workspace_root, saved["set_id"])
 
+    def delete_question_set(self, set_id: str, expected_revision: Any) -> dict[str, Any]:
+        return delete_question_set(self.config.workspace_root, set_id, expected_revision)
+
     def build_question_set_hwpx(self, set_id: str) -> dict[str, Any]:
         try:
             build = create_question_set_hwpx_build(self.config.workspace_root, set_id)
@@ -814,6 +825,7 @@ class StudioApplication:
             artifact.sha256,
         )
 
+    @quality_read_scope()
     def list_items(self, project_id: str) -> list[dict[str, Any]]:
         project_dir, project = self._project(project_id)
         target_states = self._solution_target_states(project_id)
@@ -1675,6 +1687,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         self._handle("PATCH")
 
+    def do_DELETE(self) -> None:
+        self._handle("DELETE")
+
     def do_OPTIONS(self) -> None:
         self._handle("OPTIONS")
 
@@ -1693,10 +1708,21 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 if self.app.token_matches(query):
                     self._send_redirect_with_session()
                     return
+            if parsed.path == "/api/integrations/homework/local/v1" or parsed.path.startswith("/api/integrations/homework/local/v1/"):
+                from .homework_local import handle as handle_homework_local
+                handle_homework_local(self, method, parsed)
+                return
             if parsed.path.startswith("/api/"):
                 if not self.app.is_authorized(self.headers, method=method):
                     raise ApiError(HTTPStatus.UNAUTHORIZED, "세션 토큰이 필요합니다.")
-                if method in {"POST", "PATCH"}:
+                if parsed.path.startswith("/api/exam/"):
+                    from .exam_routes import handle_exam_api
+                    handle_exam_api(self, method, parsed.path.strip("/").split("/"))
+                    return
+                if method == "POST" and parsed.path.rstrip("/") == "/api/uploads/pdf":
+                    self._handle_api(method, parsed.path)
+                    return
+                if method in {"POST", "PATCH", "DELETE"}:
                     with self.app.trash.lock:
                         self._handle_api(method, parsed.path)
                 else:
@@ -1722,6 +1748,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     "current_revision": exc.current,
                 },
             )
+        except QuestionSetArchiveConflict as exc:
+            self._send_json(HTTPStatus.CONFLICT, {"error": "question_set_archive_conflict", "message": str(exc)})
         except ImportConflictError:
             self._send_json(HTTPStatus.CONFLICT, {"error": "import_conflict", "message": "원본이 다른 동일 프로젝트가 이미 있습니다."})
         except BatchError as exc:
@@ -1923,6 +1951,13 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if method == "DELETE":
+                body = self._read_json()
+                if set(body) != {"expected_revision"}:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "expected_revision만 필요합니다.")
+                deleted = self.app.delete_question_set(parts[2], body["expected_revision"])
+                self._send_json(HTTPStatus.OK, {"deleted_set_id": deleted["set_id"]})
+                return
         if (
             method == "POST"
             and len(parts) == 5
@@ -2116,6 +2151,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and parts == ["api", "batches"]:
             body = self._read_json()
             allowed = {
+                "project_name",
                 "source_path",
                 "solution_path",
                 "source_upload_id",
@@ -2555,6 +2591,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         except (UnicodeError, ValueError) as exc:
             self.close_connection = True
             raise ApiError(HTTPStatus.BAD_REQUEST, "PDF 파일명이 올바르지 않습니다.") from exc
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(PDF_UPLOAD_IDLE_TIMEOUT_SECONDS)
         try:
             return self.app.store_pdf_upload(
                 self.rfile,
@@ -2564,6 +2602,8 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
         except ApiError:
             self.close_connection = True
             raise
+        finally:
+            self.connection.settimeout(previous_timeout)
 
     def _send_redirect_with_session(self) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)

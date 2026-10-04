@@ -64,7 +64,7 @@ export async function layoutDocument(current, target, signal, resources = {}) {
     const changed = new Map(overrides.map(node => [node.id, node])); const local = [];
     function collect(id) { const node = changed.get(id) ?? viewNodes.get(view).get(id); local.push(node); for (const child of node.children) collect(child); }
     for (const id of roots) collect(id);
-    renderDocument(body, { ...view, content: { roots, nodes: local } }, { assetBase: resources.assetBase });
+    renderDocument(body, { ...view, content: { roots, nodes: local } }, { assetBase: resources.assetBase, compactPrint: true });
     body.style.margin = '0'; measure.append(outer);
     return { outer, roots, key, questionId, section, height: 0 };
   }
@@ -77,12 +77,15 @@ export async function layoutDocument(current, target, signal, resources = {}) {
     }
     for (const node of item.outer.querySelectorAll('[data-node-id], .katex, img')) {
       const box = node.getBoundingClientRect();
-      if (box.right > bounds.left + width + .75 || box.left < bounds.left - .75) throw new LayoutError('가로 넘침', node.closest('[data-node-id]')?.dataset.nodeId ?? item.key,
+      // Inline glyph bounds can overhang their wrapping box by a few pixels.
+      const tolerance = node.dataset.kind === 'text' ? 4 : .75;
+      if (box.right > bounds.left + width + tolerance || box.left < bounds.left - tolerance) throw new LayoutError('가로 넘침', node.closest('[data-node-id]')?.dataset.nodeId ?? item.key,
         { width: rounded(box.width), height: rounded(box.height) }, { width: rounded(width), height: rounded(activePage.height) });
     }
   }
   function place(item, numbered = false) {
-    abort.throwIfAborted(); const needed = item.height + (used ? gap : 0);
+    abort.throwIfAborted(); const itemGap = item.section === 'solutions' ? .5 * mm : gap;
+    const needed = item.height + (used ? itemGap : 0);
     if (needed > activePage.height - used + .5 || numbered && count >= 2) throw new LayoutError('문항 높이 초과', item.questionId ?? item.key,
       { height: rounded(item.height), width: rounded(width) }, { height: rounded(activePage.height), width: rounded(width) });
     activePage.columns[column].append(item.outer); item.outer.style.width = '100%'; used += needed; if (numbered) count++;
@@ -98,8 +101,13 @@ export async function layoutDocument(current, target, signal, resources = {}) {
     if (questionIds.length > 800) throw new LayoutError('200쪽 한도', 'content', { questions: questionIds.length }, { maximumQuestions: 800 });
     const questionItems = questionIds.map(id => unit(questions, [id], id, id, 'questions'));
     const contextItems = new Map((questions?.groups.flatMap(group => group.common_node_ids) ?? []).map(id => [id, unit(questions, [id], id, null, 'context')]));
-    const solutionItems = solutions ? solutionUnits(solutions).map(item => unit(solutions, item.roots, item.key, item.questionId, 'solutions', item.overrides,
-      `문항 ${item.label} · 답과 해설${item.missing ? ' · 등록된 내용 없음' : ''}`)) : [];
+    const seenSolutionQuestions = new Set();
+    const solutionItems = solutions ? solutionUnits(solutions).map(item => {
+      const label = seenSolutionQuestions.has(item.questionId) ? ''
+        : `문항 ${item.label} · 답과 해설${item.missing ? ' · 등록된 내용 없음' : ''}`;
+      seenSolutionQuestions.add(item.questionId);
+      return unit(solutions, item.roots, item.key, item.questionId, 'solutions', item.overrides, label);
+    }) : [];
     const requiredFonts = new Map(); const walker = document.createTreeWalker(measure, NodeFilter.SHOW_TEXT); let textNode;
     while ((textNode = walker.nextNode())) {
       const parent = textNode.parentElement; if (!textNode.textContent || parent.closest('.katex-mathml')) continue;
@@ -158,8 +166,7 @@ export async function layoutDocument(current, target, signal, resources = {}) {
       place(item, true);
     }
     if (questions && usedRepeats.size !== layout.context_repeats.length) throw new LayoutError('이전 반복 배치 재확인 필요', 'layout.context_repeats', {}, {});
-    if (solutionItems.length && questionItems.length) advance(true);
-    for (const item of solutionItems) { if (used && item.height + gap > activePage.height - used) advance(); place(item); }
+    for (const item of solutionItems) { if (used && item.height + .5 * mm > activePage.height - used) advance(); place(item); }
     const manifestResponse = await fetch('/dist/document/manifest.json', { signal: abort }); const manifestText = await manifestResponse.text();
     const manifest = JSON.parse(manifestText); const css = await (await fetch('/document.css', { signal: abort })).text();
     const roleContent = views.map(view => ({ role: view.output_role, content: view.content, assets: view.assets, groups: view.groups }));

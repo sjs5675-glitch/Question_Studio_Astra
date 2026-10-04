@@ -1946,8 +1946,21 @@ class _Normalizer:
             if block["runs"]:
                 children.append(self.paragraph(block["runs"], "body", bbox, f"{path}.text"))
             if block["items"]:
-                label_mode = self.bogi_label_mode(block["items"], f"{path}.items")
-                if label_mode == "all_empty":
+                # Printed bullets are visible text, not unique bogi identifiers.
+                # Preserve them in ordinary box paragraphs; do not relax bogi validation.
+                label_mode = (
+                    "bullets" if all(item.get("label") == "•" for item in block["items"])
+                    else self.bogi_label_mode(block["items"], f"{path}.items")
+                )
+                if label_mode == "bullets":
+                    for index, item in enumerate(block["items"]):
+                        visible_item = dict(item, runs=[
+                            {"type": "text", "text": "• "}, *item["runs"]
+                        ])
+                        children.extend(self.labeled_blocks(
+                            visible_item, bbox, "body", f"{path}.items[{index}]", "shared_box"
+                        ))
+                elif label_mode == "all_empty":
                     children.extend(
                         self.unlabeled_item_blocks(
                             block["items"], bbox, path, "shared_box"
@@ -2621,7 +2634,11 @@ def apply_candidate_job(
         normalized["figure_assets"],
     )
     updated = copy.deepcopy(current)
-    updated["content"][section] = normalized["section"]
+    # A missing explanation is null in the canonical contract, not an empty section.
+    updated["content"][section] = (
+        None if section == "explanation" and not normalized["section"]["blocks"]
+        else normalized["section"]
+    )
     assets = updated["resources"]["assets"]
     assets_by_id = {
         asset.get("asset_id"): asset for asset in assets if isinstance(asset, Mapping)

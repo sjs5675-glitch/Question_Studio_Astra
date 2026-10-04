@@ -1,0 +1,72 @@
+/* Device-specific presentation; existing editor/model/export handlers remain authoritative. */
+.astra-document .device-document-reading-heading,
+.astra-document #device-document-mode { display: none; }
+.astra-document .device-document-panel { min-width: 0; margin-bottom: 16px; }
+.astra-document .device-document-panel > summary { cursor: pointer; font-weight: 600; min-height: 40px; padding: 8px 0; color: var(--text); }
+.astra-document .device-document-panel > summary:focus-visible,
+.astra-document #device-document-mode:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.astra-document #device-document-revision { margin: 0 0 12px; padding: 6px 10px; border-radius: 6px; background: var(--surface-muted); border-left: 3px solid var(--brand); }
+.astra-document #device-document-revision[data-kind="unknown"] { display: none; }
+.astra-document #device-document-revision[data-kind="unsaved"] { background: #fff4dd; border-left-color: #a26e1e; color: #65430f; font-weight: 600; }
+.astra-document .document-output-actions { padding-top: 8px; }
+.astra-document .document-output-actions .button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.astra-document .document-output-actions a:not([hidden]) { background: var(--surface-muted); border: 1px solid var(--brand); color: var(--brand-dark); }
+.astra-document #document-preview-button { margin-top: 16px; }
+.astra-document .document-inspector { order: 1; }
+@media (min-width: 761px) {
+  .astra-document .document-editor-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 24px; align-items: start; }
+  .astra-document .document-canvas-pane { width: auto; }
+  .astra-document .document-inspector { width: auto; position: sticky; top: 20px; max-height: calc(100dvh - 40px); overflow: auto; }
+  .astra-document .document-layout-controls { display: block; }
+  .astra-document #document-flow { min-height: 600px; }
+}
+@media (max-width: 760px) {
+  .astra-document #document-app { padding: 12px; }
+  .astra-document .document-library { padding: 4px 12px; margin-bottom: 12px; }
+  .astra-document .document-library summary { min-height: 44px; display: list-item; padding: 12px 0; }
+  .astra-document #document-list { display: grid; grid-template-columns: 1fr; max-height: 38dvh; }
+  .astra-document .document-list-item { min-width: 0; max-width: none; min-height: 44px; }
+  .astra-document .document-page-heading h1 { font-size: 1.25rem; margin: 0 0 8px; }
+  .astra-document .document-page-heading p { display: none; }
+  .astra-document #document-status { margin: 0 0 8px; min-height: 0; font-size: .8rem; }
+  .astra-document #device-document-revision { font-size: .75rem; line-height: 1.5; margin-bottom: 8px; }
+  .astra-document #device-document-mode { display: inline-flex; justify-content: center; align-items: center; }
+  .astra-document .document-actions { margin: 0 0 8px; padding: 0; border: 0; gap: 8px; }
+  .astra-document .document-actions .button { min-height: 44px; flex: 1 1 40%; }
+  .astra-document #device-document-output,
+  .astra-document #device-document-format { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; }
+  .astra-document .device-document-panel > summary { min-height: 44px; padding: 12px; font-size: .85rem; }
+  .astra-document .device-document-panel > .document-help { margin: 0; padding: 0 12px 12px; }
+  .astra-document .document-output-actions { padding: 0 12px 12px; margin: 0; }
+  .astra-document .document-output-actions .button { min-height: 44px; flex: 1 1 100%; }
+  .astra-document .document-title-label { margin-bottom: 12px; }
+  .astra-document #document-title { font-size: 1.15rem; padding: 10px 12px; }
+  .astra-document .document-editor-grid { display: flex; flex-direction: column; gap: 12px; }
+  .astra-document .document-canvas-pane { width: 100%; }
+  .astra-document .document-inspector { order: 1; width: 100%; padding: 0; }
+  .astra-document #device-document-properties { margin: 0; }
+  .astra-document .document-layout-controls { display: block; padding: 0 12px 12px; }
+  .astra-document .document-formatbar { border: 0; margin: 0; padding: 0 12px 12px; }
+  .astra-document .document-formatbar :is(button,input,select) { min-height: 44px; }
+  .astra-document .document-canvas-heading { margin: 8px 0; }
+  .astra-document .document-canvas-heading h2 { font-size: .9rem; }
+  .astra-document .device-document-edit-help { margin: 6px 0; }
+  .astra-document #document-flow { min-height: 240px; padding: 16px; border: 1px solid var(--line); box-shadow: 0 2px 8px #23382b0a; }
+  .astra-document #document-flow .document-question { margin-bottom: 16px; padding-bottom: 16px; }
+  .astra-document #document-flow .document-table { display: block; overflow-x: auto; }
+  .astra-document #document-preview { max-width: 100%; }
+  .astra-document #document-app[data-document-mode="reading"] .document-page-heading,
+  .astra-document #document-app[data-document-mode="reading"] .document-title-label,
+  .astra-document #document-app[data-document-mode="reading"] .document-canvas-heading,
+  .astra-document #document-app[data-document-mode="reading"] .device-document-edit-help,
+  .astra-document #document-app[data-document-mode="reading"] .document-move,
+  .astra-document #document-app[data-document-mode="reading"] #document-undo,
+  .astra-document #document-app[data-document-mode="reading"] #document-redo { display: none; }
+  .astra-document #document-app[data-document-mode="reading"] .device-document-reading-heading { display: block; }
+  .astra-document .device-document-reading-heading h2 { margin: 0 0 4px; font-size: 1.2rem; line-height: 1.4; overflow-wrap: anywhere; }
+  .astra-document .device-document-reading-heading p { font-size: .75rem; line-height: 1.5; color: var(--muted); margin: 0 0 8px; }
+  .astra-document #document-app[data-document-mode="reading"] :is(.document-paragraph,.document-equation) { cursor: default; }
+  .astra-document #document-app[data-document-mode="reading"] :is(.document-paragraph,.document-equation,.tiptap) { outline: none; }
+  .astra-document .document-math-dialog { max-height: calc(100dvh - 24px); padding: 16px; }
+  .astra-document .document-math-options { grid-template-columns: 1fr; }
+}

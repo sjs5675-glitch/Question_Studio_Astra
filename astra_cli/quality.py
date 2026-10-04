@@ -10,6 +10,8 @@ from typing import Final, Literal
 
 from .contracts import AstraError, Json, JsonMap, MODEL, POLICY_VERSION, digest, effort_for, json_object, check_schema
 
+from .quality_reads import file_sha256, read_json
+
 QUALITY_POLICY: Final = 'astra-link-quality-v1'
 ROOT: Final = Path(__file__).resolve().parents[1]
 
@@ -38,7 +40,7 @@ def check_file(value: Json, label: str) -> Path:
     if not isinstance(record.get('path'), str) or not isinstance(record.get('sha256'), str):
         raise AstraError('quality_receipt_malformed')
     path = Path(record['path'])
-    if not path.is_file() or digest(path.read_bytes()) != record['sha256']:
+    if not path.is_file() or file_sha256(path) != record['sha256']:
         raise AstraError(f'quality_current_{label}_changed')
     return path.resolve()
 
@@ -55,7 +57,7 @@ def source_path(leaf: Path, value: Json) -> Path:
 
 
 def manifest_input(leaf: Path, unit_id: str) -> JsonMap:
-    manifest = json_object((leaf / 'manifest.json').read_text(encoding='utf-8'))
+    manifest = read_json(leaf / 'manifest.json')
     items = manifest.get('items')
     if not isinstance(items, list):
         raise AstraError('quality_manifest_malformed')
@@ -65,7 +67,7 @@ def manifest_input(leaf: Path, unit_id: str) -> JsonMap:
     declared = matches[0].get('output_sha256')
     if not isinstance(declared, str) or re.fullmatch(r'[0-9a-fA-F]{64}', declared) is None:
         raise AstraError('quality_declared_problem_crop_missing_or_invalid')
-    if digest(source_path(leaf, matches[0].get('output_file')).read_bytes()) != declared.casefold():
+    if file_sha256(source_path(leaf, matches[0].get('output_file'))) != declared.casefold():
         raise AstraError('quality_declared_problem_crop_mismatch')
     return {'source_pdf': manifest.get('source_pdf'), 'source_sha256': manifest.get('source_sha256'), 'item': matches[0]}
 
@@ -156,7 +158,7 @@ def _read_current_lineage(receipt: Json, leaf: Path, *, problem: JsonMap | None 
         if current != target.get('manifest'):
             raise AstraError('quality_current_manifest_changed')
         source = source_path(leaf, current.get('source_pdf'))
-        if check_file(files.get('problem_pdf'), 'problem_pdf') != source or digest(source.read_bytes()) != current.get('source_sha256'):
+        if check_file(files.get('problem_pdf'), 'problem_pdf') != source or file_sha256(source) != current.get('source_sha256'):
             raise AstraError('quality_current_problem_source_mismatch')
         item = mapping(current.get('item'))
         crop_path = source_path(leaf, item.get('output_file'))
@@ -182,13 +184,13 @@ def _read_current_lineage(receipt: Json, leaf: Path, *, problem: JsonMap | None 
         expected = {'requested_model': MODEL, 'selected_model': MODEL, 'policy_version': POLICY_VERSION,
                     'requested_effort': effort_for(stage), 'selected_effort': effort_for(stage),
                     'stage': stage, 'prompt_sha256': value.get('prompt_sha256'),
-                    'schema_sha256': digest(json.dumps(json_object(schema.read_text(encoding='utf-8')), sort_keys=True, ensure_ascii=False)),
+                    'schema_sha256': digest(json.dumps(read_json(schema), sort_keys=True, ensure_ascii=False)),
                     'image_sha256': [mapping(image).get('sha256') for image in images],
                     'status': 'succeeded', 'terminal_completed': True}
         if any(runtime.get(key) != entry for key, entry in expected.items()):
             raise AstraError('quality_current_runtime_contract_mismatch')
         raw_path = check_file(value.get('raw'), 'raw_invocation')
-        raw_wrapper = json_object(raw_path.read_text(encoding='utf-8'))
+        raw_wrapper = read_json(raw_path)
         raw_meta = mapping(raw_wrapper.get('meta'))
         request_prompt = raw_meta.get('request_prompt')
         if not isinstance(request_prompt, str) or digest(request_prompt) != value.get('prompt_sha256') or ('CURRENT_EVIDENCE_TARGET_SHA256=' + identity(target)) not in request_prompt.splitlines():
@@ -197,12 +199,12 @@ def _read_current_lineage(receipt: Json, leaf: Path, *, problem: JsonMap | None 
             raise AstraError('quality_runtime_receipt_changed')
         check_result_lineage(raw_wrapper, target, stage, runtime, result)
         result_path = check_file(files.get('raw_result'), 'raw_result')
-        if json_object(result_path.read_text(encoding='utf-8')).get('result') != result:
+        if read_json(result_path).get('result') != result:
             raise AstraError('quality_current_result_changed')
-        head = json_object(pointer(leaf, unit_id, asset_id).read_text(encoding='utf-8'))
+        head = read_json(pointer(leaf, unit_id, asset_id))
         if head != value:
             raise AstraError('quality_current_pair_evidence_changed')
-        check_schema(result, json_object(schema.read_text(encoding='utf-8')))
+        check_schema(result, read_json(schema))
         if is_scope and (result.get('problem_scope_id') != bound_problem.get('scope_id') or 'episode:' + str(result.get('solution_scope_id')) != bound_asset.get('scope_id')):
             raise AstraError('quality_result_scope_mismatch')
         return is_scope, bound_problem, bound_asset, result

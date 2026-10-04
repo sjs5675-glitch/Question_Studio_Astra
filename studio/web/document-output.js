@@ -31,6 +31,7 @@ export function outputDocument(current, section) {
     const children = node.children.map(child => copy(child, inside)).filter(Boolean);
     if (section === 'solutions' && !inside && node.kind !== 'question') return null;
     const payload = structuredClone(node.payload);
+    if (node.kind === 'question') payload.label = String(selected.indexOf(id) + 1);
     if (node.kind === 'answer') { payload.text = labels.get(id); payload.choice_ids = []; payload.label ??= payload.part_id; }
     kept.push({ id, kind: node.kind, children, payload, provenance: null });
     return id;

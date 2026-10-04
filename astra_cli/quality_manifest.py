@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .contracts import AstraError, JsonMap
+from .quality_reads import read_json
 from .quality import QUALITY_POLICY, check_file, identity, mapping, source_path, validate_receipt
 
 
@@ -89,9 +90,8 @@ def stored_reason(document: JsonMap, item_root: Path | None = None) -> str | Non
         leaf_value, unit_id = origin.get('leaf'), origin.get('unit_id')
         if not isinstance(leaf_value, str) or not isinstance(unit_id, str):
             return 'quality_import_origin_missing'
-        from .contracts import json_object
         leaf = Path(leaf_value)
-        current = json_object((leaf / 'solutions/link_manifest.json').read_text(encoding='utf-8'))
+        current = read_json(leaf / 'solutions/link_manifest.json')
         current_link = mapping(mapping(current.get('items')).get(unit_id))
         if origin.get('decision_sha256') != identity(current_link):
             return 'quality_current_import_decision_changed'

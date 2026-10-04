@@ -130,7 +130,7 @@ def serve_owned(settings: Settings, arguments: argparse.Namespace) -> int:
             pdf_roots=[Path(value) for value in arguments.pdf_root] if arguments.pdf_root else [settings.workspace / '.uploads'], crop_root=settings.crop_root,
             recovery_root=Path(arguments.recovery_root) if arguments.recovery_root else None, web_root=Path(arguments.web_root) if arguments.web_root else None,
             host='127.0.0.1', port=settings.studio_port, token=_owned_session_token(directory, arguments.owner_id, settings.workspace),
-            trusted_origins=[f'https://aidestkop.taile27542.ts.net:{settings.studio_port}'],
+            trusted_origins=[f'https://astra.example.ts.net:{settings.studio_port}'],
             tailnet_owner_login=_tailnet_owner_login())
         state.update(status='running', port=server.server_address[1])
         atomic_write_json(directory / 'owner.json', state)

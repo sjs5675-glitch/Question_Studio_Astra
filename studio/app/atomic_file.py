@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import os
+import time
 from pathlib import Path
 
 
@@ -38,7 +39,12 @@ def replace_file(source: Path, target: Path) -> None:
     if handle == ctypes.c_void_p(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
-        if not rename(handle, 22, buffer, len(buffer)):
-            raise ctypes.WinError(ctypes.get_last_error())
+        for attempt in range(10):
+            if rename(handle, 22, buffer, len(buffer)):
+                break
+            error = ctypes.get_last_error()
+            if error != 32 or attempt == 9:
+                raise ctypes.WinError(error)
+            time.sleep(.02)
     finally:
         close(handle)

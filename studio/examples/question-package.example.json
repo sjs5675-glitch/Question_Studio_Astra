@@ -1,0 +1,557 @@
+{
+  "$schema": "../schemas/question-package.schema.json",
+  "schema_version": "0.1.0",
+  "item_id": "item-physics-0001",
+  "language": "ko-KR",
+  "workflow": {
+    "status": "needs_review",
+    "revision": 1,
+    "created_at": "2026-08-24T18:00:00+09:00",
+    "updated_at": "2026-08-24T18:00:00+09:00"
+  },
+  "identity": {
+    "printed_number": "1",
+    "unit_kind": "question",
+    "answer_type": "multiple_choice",
+    "score": "2",
+    "parent_item_id": null,
+    "group_id": null
+  },
+  "provenance": {
+    "imported_at": "2026-08-24T18:00:00+09:00",
+    "source_system": {
+      "name": "question_crop",
+      "pipeline_version": "0.1.0"
+    },
+    "problem": {
+      "document_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "document_page_count": 30,
+      "original_filename": "sample-problems.pdf",
+      "unit_id": "p0001-q1",
+      "owner_question_id": "p0001-q1",
+      "source_pages": [
+        {
+          "raw_source_page": 1,
+          "raw_page_base": "one_based",
+          "pdf_page_index": 0,
+          "page_asset_id": null,
+          "render_dpi": null,
+          "rotation_degrees": 0,
+          "flip_horizontal": false
+        }
+      ],
+      "source_parts": [
+        {
+          "role": "stem",
+          "raw_source_page": 1,
+          "raw_page_base": "one_based",
+          "pdf_page_index": 0,
+          "region": {
+            "source_asset_id": "source-question",
+            "bbox": {
+              "unit": "ratio",
+              "origin": "top-left",
+              "left": 0.05,
+              "top": 0.05,
+              "right": 0.95,
+              "bottom": 0.95
+            }
+          }
+        }
+      ],
+      "crop_asset_id": "source-question",
+      "rotation_degrees": 0,
+      "flip_horizontal": false
+    },
+    "solution_links": [
+      {
+        "kind": "detailed_solution",
+        "external_asset_id": "explanation-p0001-b01-e01",
+        "source_asset_id": "source-explanation",
+        "document_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "document_page_count": 20,
+        "status": "verified",
+        "confidence": 0.98,
+        "evidence": ["gemini+qwen=true"],
+        "review_reasons": [],
+        "parts": [
+          {
+            "pdf_index": 9,
+            "pdf_page": 10,
+            "printed_page": 10,
+            "segment_id": "solution-1",
+            "render_dpi": 300,
+            "bbox": {
+              "unit": "ratio",
+              "origin": "top-left",
+              "left": 0.066,
+              "top": 0.035,
+              "right": 0.924,
+              "bottom": 0.485
+            }
+          }
+        ]
+      }
+    ],
+    "transcriptions": [],
+    "raw_snapshot": {
+      "leaf_run_id": "sample-book_111111111111",
+      "source_files": [
+        {
+          "role": "manifest",
+          "relative_path": "manifest.json",
+          "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "schema_version": "0.1.0"
+        },
+        {
+          "role": "detection",
+          "relative_path": "detections/page-0001.json",
+          "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "schema_version": null
+        },
+        {
+          "role": "link_manifest",
+          "relative_path": "solutions/link_manifest.json",
+          "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "schema_version": 1
+        }
+      ],
+      "manifest_item": {
+        "unit_id": "p0001-q1",
+        "owner_question_id": "p0001-q1",
+        "unit_kind": "question",
+        "printed_number": "1",
+        "output_file": "crops/00001_1_question.png"
+      },
+      "detection_items": [
+        {
+          "source_page": 1,
+          "role": "stem",
+          "bbox": [50, 50, 950, 950]
+        }
+      ],
+      "ensemble_item": {
+        "verdict": "pass"
+      },
+      "link_item": {
+        "status": "verified",
+        "confidence": 0.98
+      },
+      "link_assets": [
+        {
+          "asset_id": "explanation-p0001-b01-e01",
+          "kind": "detailed_solution"
+        }
+      ]
+    }
+  },
+  "content": {
+    "question": {
+      "blocks": [
+        {
+          "block_id": "q-block-001",
+          "type": "paragraph",
+          "role": "stem",
+          "inlines": [
+            {
+              "type": "text",
+              "text": "질량이 2 kg인 물체에 일정한 힘 ",
+              "source_text": "질량이 2 kg인 물체에 일정한 힘 "
+            },
+            {
+              "type": "equation",
+              "source_format": "latex",
+              "source_text": "F",
+              "latex": "F",
+              "hwp_script": "F",
+              "confidence": 0.99
+            },
+            {
+              "type": "text",
+              "text": "를 가했더니 가속도가 2 m/s²가 되었다. 다음 중 옳은 것을 고르시오.",
+              "source_text": "를 가했더니 가속도가 2 m/s²가 되었다. 다음 중 옳은 것을 고르시오."
+            }
+          ],
+          "source_region": {
+            "source_asset_id": "source-question",
+            "bbox": {
+              "unit": "ratio",
+              "origin": "top-left",
+              "left": 0.05,
+              "top": 0.05,
+              "right": 0.95,
+              "bottom": 0.25
+            }
+          },
+          "confidence": 0.97,
+          "review_status": "unreviewed"
+        },
+        {
+          "block_id": "q-block-002",
+          "type": "figure",
+          "role": "main",
+          "asset_id": "figure-q-001-original",
+          "original_asset_id": "figure-q-001-original",
+          "alt_text": "수평면 위 물체에 오른쪽 방향의 힘이 작용하는 그림",
+          "caption": [],
+          "confidence": 0.93,
+          "review_status": "unreviewed"
+        },
+        {
+          "block_id": "q-block-003",
+          "type": "bogi",
+          "title": {
+            "visible": true,
+            "text": "보기"
+          },
+          "items": [
+            {
+              "item_id": "bogi-item-a",
+              "label": "ㄱ",
+              "blocks": [
+                {
+                  "block_id": "q-block-004",
+                  "type": "paragraph",
+                  "role": "body",
+                  "inlines": [
+                    {
+                      "type": "text",
+                      "text": "물체에 작용한 알짜힘은 4 N이다.",
+                      "source_text": "물체에 작용한 알짜힘은 4 N이다."
+                    }
+                  ],
+                  "confidence": 0.98,
+                  "review_status": "unreviewed"
+                }
+              ]
+            },
+            {
+              "item_id": "bogi-item-b",
+              "label": "ㄴ",
+              "blocks": [
+                {
+                  "block_id": "q-block-005",
+                  "type": "paragraph",
+                  "role": "body",
+                  "inlines": [
+                    {
+                      "type": "text",
+                      "text": "물체의 속력은 매초 2 m/s씩 증가한다.",
+                      "source_text": "물체의 속력은 매초 2 m/s씩 증가한다."
+                    }
+                  ],
+                  "confidence": 0.98,
+                  "review_status": "unreviewed"
+                }
+              ]
+            }
+          ],
+          "confidence": 0.96,
+          "review_status": "unreviewed"
+        },
+        {
+          "block_id": "q-block-006",
+          "type": "choices",
+          "source_layout": "horizontal",
+          "items": [
+            {
+              "choice_id": "choice-1",
+              "label": "①",
+              "blocks": [
+                {
+                  "block_id": "q-block-007",
+                  "type": "paragraph",
+                  "role": "body",
+                  "inlines": [
+                    {
+                      "type": "text",
+                      "text": "ㄱ",
+                      "source_text": "ㄱ"
+                    }
+                  ],
+                  "review_status": "unreviewed"
+                }
+              ]
+            },
+            {
+              "choice_id": "choice-2",
+              "label": "②",
+              "blocks": [
+                {
+                  "block_id": "q-block-008",
+                  "type": "paragraph",
+                  "role": "body",
+                  "inlines": [
+                    {
+                      "type": "text",
+                      "text": "ㄴ",
+                      "source_text": "ㄴ"
+                    }
+                  ],
+                  "review_status": "unreviewed"
+                }
+              ]
+            },
+            {
+              "choice_id": "choice-3",
+              "label": "③",
+              "blocks": [
+                {
+                  "block_id": "q-block-009",
+                  "type": "paragraph",
+                  "role": "body",
+                  "inlines": [
+                    {
+                      "type": "text",
+                      "text": "ㄱ, ㄴ",
+                      "source_text": "ㄱ, ㄴ"
+                    }
+                  ],
+                  "review_status": "unreviewed"
+                }
+              ]
+            }
+          ],
+          "confidence": 0.99,
+          "review_status": "unreviewed"
+        }
+      ]
+    },
+    "answer": {
+      "kind": "choice",
+      "choice_ids": ["choice-3"]
+    },
+    "explanation": {
+      "blocks": [
+        {
+          "block_id": "e-block-001",
+          "type": "paragraph",
+          "role": "explanation",
+          "inlines": [
+            {
+              "type": "text",
+              "text": "뉴턴 운동 제2법칙에 따라 ",
+              "source_text": "뉴턴 운동 제2법칙에 따라 "
+            },
+            {
+              "type": "equation",
+              "source_format": "latex",
+              "source_text": "F=ma",
+              "latex": "F=ma",
+              "hwp_script": "F = ma",
+              "confidence": 0.99
+            },
+            {
+              "type": "text",
+              "text": "이므로 알짜힘은 4 N이다.",
+              "source_text": "이므로 알짜힘은 4 N이다."
+            }
+          ],
+          "confidence": 0.98,
+          "review_status": "unreviewed"
+        },
+        {
+          "block_id": "e-block-002",
+          "type": "table",
+          "semantic_type": "generic",
+          "column_count": 2,
+          "rows": [
+            {
+              "cells": [
+                {
+                  "role": "header",
+                  "row_span": 1,
+                  "col_span": 1,
+                  "blocks": [
+                    {
+                      "block_id": "e-block-003",
+                      "type": "paragraph",
+                      "role": "body",
+                      "inlines": [
+                        {
+                          "type": "text",
+                          "text": "물리량",
+                          "source_text": "물리량"
+                        }
+                      ],
+                      "review_status": "unreviewed"
+                    }
+                  ]
+                },
+                {
+                  "role": "header",
+                  "row_span": 1,
+                  "col_span": 1,
+                  "blocks": [
+                    {
+                      "block_id": "e-block-004",
+                      "type": "paragraph",
+                      "role": "body",
+                      "inlines": [
+                        {
+                          "type": "text",
+                          "text": "값",
+                          "source_text": "값"
+                        }
+                      ],
+                      "review_status": "unreviewed"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "cells": [
+                {
+                  "role": "body",
+                  "row_span": 1,
+                  "col_span": 1,
+                  "blocks": [
+                    {
+                      "block_id": "e-block-005",
+                      "type": "paragraph",
+                      "role": "body",
+                      "inlines": [
+                        {
+                          "type": "text",
+                          "text": "알짜힘",
+                          "source_text": "알짜힘"
+                        }
+                      ],
+                      "review_status": "unreviewed"
+                    }
+                  ]
+                },
+                {
+                  "role": "body",
+                  "row_span": 1,
+                  "col_span": 1,
+                  "blocks": [
+                    {
+                      "block_id": "e-block-006",
+                      "type": "paragraph",
+                      "role": "body",
+                      "inlines": [
+                        {
+                          "type": "text",
+                          "text": "4 N",
+                          "source_text": "4 N"
+                        }
+                      ],
+                      "review_status": "unreviewed"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "confidence": 0.96,
+          "review_status": "unreviewed"
+        }
+      ]
+    }
+  },
+  "resources": {
+    "assets": [
+      {
+        "asset_id": "source-question",
+        "section": "question",
+        "role": "source_crop",
+        "state": "pending",
+        "path": "source/question.png",
+        "media_type": "image/png",
+        "generation": null,
+        "review": {
+          "status": "unreviewed",
+          "boundary_uncertain": false,
+          "notes": []
+        }
+      },
+      {
+        "asset_id": "source-explanation",
+        "section": "explanation",
+        "role": "source_crop",
+        "state": "pending",
+        "path": "source/explanation.png",
+        "media_type": "image/png",
+        "generation": null,
+        "review": {
+          "status": "unreviewed",
+          "boundary_uncertain": false,
+          "notes": []
+        }
+      },
+      {
+        "asset_id": "figure-q-001-original",
+        "section": "question",
+        "role": "figure_original",
+        "state": "pending",
+        "path": "assets/figure-q-001-original.png",
+        "media_type": "image/png",
+        "source_region": {
+          "source_asset_id": "source-question",
+          "bbox": {
+            "unit": "ratio",
+            "origin": "top-left",
+            "left": 0.28,
+            "top": 0.28,
+            "right": 0.74,
+            "bottom": 0.52
+          }
+        },
+        "derived_from_asset_id": "source-question",
+        "generation": null,
+        "review": {
+          "status": "unreviewed",
+          "boundary_uncertain": false,
+          "notes": []
+        }
+      },
+      {
+        "asset_id": "figure-q-001-regenerated",
+        "section": "question",
+        "role": "figure_regenerated",
+        "state": "pending",
+        "path": "assets/figure-q-001-regenerated.png",
+        "media_type": "image/png",
+        "derived_from_asset_id": "figure-q-001-original",
+        "generation": {
+          "mode": "regenerate",
+          "provider": "codex-cli",
+          "model": null,
+          "prompt_version": "figure-v1",
+          "instruction": null,
+          "remove_blue_text": false,
+          "status": "queued",
+          "fallback_asset_id": "figure-q-001-original",
+          "failure_reason": null,
+          "job_id": null,
+          "started_at": null,
+          "completed_at": null,
+          "prompt_text": null,
+          "prompt_sha256": null
+        },
+        "review": {
+          "status": "unreviewed",
+          "boundary_uncertain": false,
+          "notes": []
+        }
+      }
+    ]
+  },
+  "review": {
+    "question": "unreviewed",
+    "answer": "unreviewed",
+    "explanation": "unreviewed",
+    "assets": "unreviewed",
+    "coverage": {
+      "question": "unreviewed",
+      "explanation": "unreviewed"
+    },
+    "approved_revision": null,
+    "approved_sha256": null,
+    "reviewer": null,
+    "reviewed_at": null,
+    "issues": []
+  }
+}

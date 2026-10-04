@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "name": "PNKmath/exam-studio",
+    "url": "https://github.com/PNKmath/exam-studio",
+    "commit": "bd97d15ed67e325692455b60c483d5e592d0d1c4",
+    "reviewed_at": "2026-08-24",
+    "verification_note": "Historical provenance preserved. The pinned exam-studio commit/README could not be re-fetched (HTTP 422/404) during this snapshot audit; no fresh upstream verification is claimed."
+  },
+  "authorization": {
+    "status": "publisher_confirmed_public_github_redistribution",
+    "evidence_path": null,
+    "evidence_type": "explicit_publisher_confirmation",
+    "note": "The publisher confirmed permission from the original developer covers public GitHub redistribution of incorporated code and modifications. Private authorization documents are not included here; no unrestricted downstream redistribution license is implied."
+  },
+  "adapted": [
+    {
+      "component": "ocr_output_protocol",
+      "status": "adapted",
+      "target": "app/ocr_protocol.py",
+      "sources": [
+        "studio/server/stages/equationSentinel.ts",
+        "studio/server/stages/modelHarness.ts#parseModelJsonOutput",
+        "studio/server/stages/extractor.ts#sanitizeExtractedChoices"
+      ],
+      "commit": "bd97d15ed67e325692455b60c483d5e592d0d1c4",
+      "changes": "Ported to Python stdlib; removed provider, solver, cache, and tool execution coupling."
+    },
+    {
+      "component": "latex_to_hwp_equation_core",
+      "status": "adapted_vendored",
+      "target": "app/equation_bridge.py",
+      "vendor_root": "vendor/exam_studio_equation",
+      "sources": [
+        "studio/lib/equation/ast.ts",
+        "studio/lib/equation/latexParser.ts",
+        "studio/lib/equation/latexToHwp.ts",
+        "studio/lib/equation/latexTokenizer.ts",
+        "studio/lib/equation/toHwpEqn.ts",
+        "studio/lib/equation/tokenTypes.ts",
+        "studio/lib/equation/utils.ts"
+      ],
+      "commit": "bd97d15ed67e325692455b60c483d5e592d0d1c4",
+      "vendored_files": [
+        "vendor/exam_studio_equation/src/ast.ts",
+        "vendor/exam_studio_equation/src/latexParser.ts",
+        "vendor/exam_studio_equation/src/latexToHwp.ts",
+        "vendor/exam_studio_equation/src/latexTokenizer.ts",
+        "vendor/exam_studio_equation/src/toHwpEqn.ts",
+        "vendor/exam_studio_equation/src/tokenTypes.ts",
+        "vendor/exam_studio_equation/src/utils.ts",
+        "vendor/exam_studio_equation/dist/ast.js",
+        "vendor/exam_studio_equation/dist/latexParser.js",
+        "vendor/exam_studio_equation/dist/latexToHwp.js",
+        "vendor/exam_studio_equation/dist/latexTokenizer.js",
+        "vendor/exam_studio_equation/dist/toHwpEqn.js",
+        "vendor/exam_studio_equation/dist/tokenTypes.js",
+        "vendor/exam_studio_equation/dist/utils.js",
+        "vendor/exam_studio_equation/cli.cjs",
+        "vendor/exam_studio_equation/README.md",
+        "vendor/exam_studio_equation/LICENSE.hwp-eqn-ts"
+      ],
+      "integration_files": [
+        "app/equation_bridge.py",
+        "tests/test_equation_bridge.py",
+        "licenses/hwp-eqn-ts-MIT.txt",
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "license": {
+        "scope": "hwp-eqn-ts-derived portions",
+        "spdx": "MIT",
+        "copyright": "Copyright (c) 2025 franknoh",
+        "vendor_copy": "vendor/exam_studio_equation/LICENSE.hwp-eqn-ts",
+        "project_copy": "licenses/hwp-eqn-ts-MIT.txt",
+        "verification": {
+          "result": "match_after_whitespace_normalization",
+          "vendor_sha256": "e8c8a2811e56b72fea27231049f5cb9691e01b7b11caad7a135f2bf29c4cb30b",
+          "project_sha256": "8788b652e1a25fad88163fc06dd9a5ec9279d0f5a0cc132059a6f7cd0350e145",
+          "note": "The two complete MIT texts differ only in line wrapping and whitespace."
+        }
+      },
+      "changes": "Vendored the selected TypeScript sources and mechanical CommonJS build; added a Python subprocess bridge and science-command review gates while preserving canonical source_text and latex."
+    },
+    {
+      "component": "native_hwpx_mechanics",
+      "status": "adapted",
+      "target": "app/hwpx_native.py",
+      "source_root": "exam-studio-multi (local reference; private filesystem path omitted)",
+      "sources": [
+        {
+          "path": "assemble.py",
+          "sha256": "c064e27db7ca23e6db368f0bb093b794a2788897e1227a9314a6ab5add473657",
+          "adapted_symbols": [
+            "make_paragraph",
+            "make_empty_para",
+            "make_pagebreak"
+          ]
+        },
+        {
+          "path": "equation.py",
+          "sha256": "9ed01601c9ff6ec9e3091b14fa0676bc6ed441d56f44fe91824b625e8aef5782",
+          "adapted_symbols": [
+            "xml_escape",
+            "make_equation_xml",
+            "make_lineseg"
+          ]
+        },
+        {
+          "path": "shapes.py",
+          "sha256": "624f62fb0e18f88a2d66f1c189e3156dbb8071cfcb1b0ffd4c9c25633637614a",
+          "adapted_symbols": [
+            "make_pic_xml",
+            "png_to_bmp_bytes"
+          ]
+        },
+        {
+          "path": "ids.py",
+          "sha256": "15636d95eff1650cb16ab21ff7049bcb945f0beb3a6fd187d3f069021300bda2",
+          "adapted_symbols": [
+            "reset_counters",
+            "next_eq_id",
+            "next_zorder",
+            "next_inst_id"
+          ]
+        }
+      ],
+      "changes": "Reimplemented neutral raw XML primitives and RGB BMP conversion. Replaced fixed global counters with a build-local allocator that scans template XML maxima; omitted source styles, fixed geometry, templates, and runtime imports."
+    },
+    {
+      "component": "native_hwpx_renderer",
+      "status": "adapted",
+      "target": "app/hwpx_renderer.py",
+      "source_root": "exam-studio-multi (local reference; private filesystem path omitted)",
+      "sources": [
+        {
+          "path": "assemble.py",
+          "sha256": "c064e27db7ca23e6db368f0bb093b794a2788897e1227a9314a6ab5add473657",
+          "adapted_symbols": [
+            "make_passage_box_xml",
+            "package_write_order"
+          ]
+        },
+        {
+          "path": "tables.py",
+          "sha256": "9f5d52c0ecb7363cabe36fc1318b1248c436863d74c927c885bb56e0eedbe354",
+          "adapted_symbols": [
+            "_make_general_data_table_xml"
+          ]
+        },
+        {
+          "path": "resources/hwpx_scripts/validate.py",
+          "sha256": "c0b4f702beb9e107d45c98481ab0fe67e9374744152993e7f19a99f96845b5e6",
+          "adapted_symbols": [
+            "_table_celladdr_errors",
+            "_estimate_text_units",
+            "_visible_text_from_paragraph",
+            "_line_start_offsets_for_text",
+            "_fix_long_single_lineseg"
+          ]
+        }
+      ],
+      "changes": "Reimplemented ordered question/explanation packages, editable neutral box/table XML, span-grid validation, and deterministic editable paragraph expansion at explicit/wrapped boundaries. Every generated paragraph retains one native textpos=0 lineSeg; equation objects remain atomic and table-cell height follows expanded paragraphs. Excluded the upstream output fixer and manual multi-line lineSeg synthesis, workbook fixtures, global IDs, solver/endnotes, and upstream runtime imports."
+    },
+    {
+      "component": "exam_region_cleaning_and_crop_geometry",
+      "status": "adapted_with_provenance_copies",
+      "upstream": "PNKmath/ngd-studio",
+      "commit": "cafa7e70eca2b0bea5ff85ec160987c6f2f471b8",
+      "vendor_roots": [
+        "vendor/pnkmath",
+        "web/vendor/pnkmath"
+      ],
+      "runtime_targets": [
+        "app/exam_cleaning.py",
+        "app/exam_region_cleaning.py",
+        "web/exam-region.mjs"
+      ],
+      "original_copies": [
+        {
+          "path": "vendor/pnkmath/upstream/image_cleaner.py",
+          "sha256": "6ee7efadf4f0312d0cd1ad4b023a1d65e3f0366314879757cb0b152fe10b6471"
+        },
+        {
+          "path": "vendor/pnkmath/upstream/image_provider_adapter.py",
+          "sha256": "411fbecca451fc27027ce1e90639db1d041cc80e36050061b51f28a83c555f05"
+        },
+        {
+          "path": "vendor/pnkmath/upstream/coords.ts",
+          "sha256": "15312a948cd93334c37929a810b22c35705c0b93edf3c82b37a668facd600108"
+        },
+        {
+          "path": "vendor/pnkmath/upstream/CropBoxLayer.tsx",
+          "sha256": "34189cb8dbfb47639a77a516a64e128f2d94da0b429beee49a2a7c5af6576d94"
+        }
+      ],
+      "changes": "Adapted image cleaning and current CodexCliImageProvider into Astra execution/integrity contracts. Ported crop geometry into the 0..1 browser coordinates and CAS persistence. Preserved original provenance copies; omitted upstream full application and solver."
+    }
+  ],
+  "original": [
+    {
+      "component": "optimistic_hwpx_export_policy_v0_3",
+      "status": "project_original",
+      "targets": [
+        "app/hwpx_export.py",
+        "app/hwpx_renderer.py",
+        "app/hwpx_validation.py",
+        "app/hwpx_artifacts.py"
+      ],
+      "contract_fingerprint_sha256": "4a99bf4a35a28d65188e66a2d40223f25ce1dfaf58b1439e0d9f0d833f23db96",
+      "changes": "Added readiness warnings without approval mutation, item-level ready source-crop fallback, ready-original figure selection for unapproved candidates, omission-without-inference for missing or unsupported answer/explanation content, hashed stored-review-issue receipts, deterministic cache/rollback preservation, Windows-safe short staging paths, and a Hancom compatibility quarantine for unverified transcription prompt versions that emit box/table/equation native structures. No upstream solver, answer inference, OCR-content rewrite, or AI auto-selection code was introduced."
+    }
+  ],
+  "planned": [],
+  "excluded": [
+    "solver and AI-generated explanation pipeline",
+    "questionPipeline/orchestrator/SSE cache stack",
+    "danger-full-access provider adapters",
+    "assemble.py main and make_endnote",
+    "resources/hwpx_base bundled bitmap/template design",
+    "destructive HWPX fix functions"
+  ],
+  "additional_upstreams": [
+    {
+      "name": "PNKmath/ngd-studio",
+      "url": "https://github.com/PNKmath/ngd-studio",
+      "commit": "cafa7e70eca2b0bea5ff85ec160987c6f2f471b8",
+      "provenance_document": "EXAM_REGION_UPSTREAM.md",
+      "license": "No general open-source license confirmed for the pinned tree; publisher-specific authorization recorded above."
+    }
+  ]
+}

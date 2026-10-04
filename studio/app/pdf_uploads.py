@@ -35,6 +35,10 @@ class PdfUploadError(ValueError):
     """Raised when an upload or its persisted record is invalid."""
 
 
+class PdfUploadTimeout(PdfUploadError):
+    """Raised when an upload stops delivering data."""
+
+
 class PdfUploadNotFound(PdfUploadError):
     """Raised when a syntactically valid upload ID does not exist."""
 
@@ -156,6 +160,9 @@ def store_pdf_upload(
     except PdfUploadError:
         _discard_staging(staging, staging_root)
         raise
+    except TimeoutError as exc:
+        _discard_staging(staging, staging_root)
+        raise PdfUploadTimeout("PDF 전송이 멈춰 업로드를 중단했습니다. 다시 시도해 주세요.") from exc
     except OSError as exc:
         _discard_staging(staging, staging_root)
         raise PdfUploadError("cannot store PDF upload") from exc

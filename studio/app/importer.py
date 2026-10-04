@@ -234,6 +234,9 @@ def _document_page_count(manifest: Mapping[str, Any], all_pages: list[int]) -> i
 def import_leaf_run(
     leaf_run: Path | str,
     workspace_root: Path | str,
+    *,
+    project_name: str | None = None,
+    source_name: str | None = None,
 ) -> ImportResult:
     leaf_run = Path(leaf_run).expanduser().resolve()
     workspace_root = Path(workspace_root).expanduser().resolve()
@@ -533,9 +536,11 @@ def import_leaf_run(
             source_import=source_import,
             timestamp=timestamp,
         )
-        source_name = Path(str(manifest.get("source_pdf") or leaf_run.name)).stem
-        project["metadata"]["filename_base"] = source_name
-        project["metadata"]["book_title"] = source_name
+        display_name = project_name or Path(
+            str(source_name or manifest.get("source_pdf") or leaf_run.name)
+        ).stem
+        project["metadata"]["filename_base"] = display_name
+        project["metadata"]["book_title"] = display_name
         atomic_write_json(staging / "project.json", project)
         if link_manifest is not None:
             enrich_project_from_leaf(staging, leaf_run)

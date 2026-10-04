@@ -192,6 +192,7 @@ class GeminiFigureAdapter:
         prompt: str,
         model: str,
         image_size: str,
+        aspect_ratio: str | None = None,
     ) -> GeneratedImage:
         if not isinstance(image, ValidatedImage):
             raise FigureGenerationError("figure generation requires a validated image")
@@ -215,6 +216,8 @@ class GeminiFigureAdapter:
             )
         if image_size != IMAGE_SIZE:
             raise FigureGenerationError("figure generation image_size must be 2K")
+        if aspect_ratio is not None and aspect_ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16"}:
+            raise FigureGenerationError("unsupported image aspect ratio")
         raw, request_media_type = _provider_inline_image(image)
         payload = {
             "contents": [
@@ -232,7 +235,7 @@ class GeminiFigureAdapter:
             ],
             "generationConfig": {
                 "responseModalities": ["IMAGE"],
-                "imageConfig": {"imageSize": image_size},
+                "imageConfig": {"imageSize": image_size, **({"aspectRatio": aspect_ratio} if aspect_ratio else {})},
             },
         }
         request_size = len(

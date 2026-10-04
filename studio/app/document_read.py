@@ -14,6 +14,8 @@ def document_list(workspace: Path) -> list[JsonMap]:
         return []
     result: list[JsonMap] = []
     for entry in root.iterdir():
+        if not (entry / 'document.json').is_file():
+            continue
         owned = document_root(workspace, entry.name)
         with lock_for(owned):
             document = load_document(owned)

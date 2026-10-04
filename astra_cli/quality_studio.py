@@ -105,3 +105,19 @@ def validate_receipt(document: dict, item_root: Path, *, require_verified: bool 
         return None if not require_verified or receipt.get('verdict') == 'verified' else 'quality_studio_not_verified'
     except (AstraError, KeyError, TypeError, ValueError, OSError):
         return 'quality_studio_receipt_invalid'
+
+
+def current_receipt_result(document: dict, item_root: Path) -> dict | None:
+    if validate_receipt(document, item_root, require_verified=False) is not None:
+        return None
+    try:
+        pointer = document['provenance']['solution_selection']['verification_receipt']
+        path = (item_root / Path(pointer['path'])).resolve()
+        raw = path.read_bytes()
+        if digest(raw) != pointer['sha256']:
+            return None
+        receipt = json_object(raw.decode('utf-8'))
+        result = receipt.get('result')
+        return result if isinstance(result, dict) else None
+    except (AstraError, KeyError, TypeError, ValueError, OSError, UnicodeError):
+        return None

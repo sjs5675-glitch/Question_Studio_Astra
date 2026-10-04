@@ -21,6 +21,54 @@
 .document-paragraph { min-height: 1.6em; cursor: text; border-radius: 3px; }.document-paragraph:hover { outline: 1px solid var(--line); }
 .tiptap { outline: 2px solid var(--focus); outline-offset: 4px; min-height: 1.6em; }.tiptap p { margin: 0 0 .6em; }
 .document-box { border: 1px solid var(--line-strong); padding: 12px; margin: 12px 0; }.document-choice { margin: 8px 0; }.document-choice > .document-label { float: left; margin-right: 8px; }
+/* Keep a 보기 statement marker beside its first paragraph without merging editable nodes.
+   Empty/hidden titles reserve no marker spacing; continuation lines use the body column. */
+#document-flow .document-box[data-box-role="statement"] {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  border: 0;
+  padding: 0;
+  margin: 4px 0;
+}
+#document-flow .document-box[data-box-role="statement"] > .document-label {
+  grid-column: 1;
+  grid-row: 1;
+  margin: 0;
+  font-weight: 400;
+}
+#document-flow .document-box[data-box-role="statement"] > .document-label:not(:empty) { padding-right: .5em; }
+#document-flow .document-box[data-box-role="statement"] > .document-node { grid-column: 2; min-width: 0; }
+#document-flow .document-box[data-box-role="statement"] > .document-paragraph { margin-top: 0; }
+
+/* Reuse the renderer's short-choice grid eligibility for the reading flow.
+   DOM/source order stays ①②③ / ④⑤; long or complex choices retain their stacked layout. */
+#document-flow .document-box[data-box-role="choices"][data-choice-grid="true"] {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 8px;
+  row-gap: 8px;
+}
+#document-flow .document-box[data-choice-grid="true"] > .document-label { grid-column: 1 / -1; margin: 0; }
+#document-flow .document-box[data-choice-grid="true"] > .document-label:empty { display: none; }
+#document-flow .document-box[data-choice-grid="true"] > .document-choice {
+  display: flex;
+  align-items: baseline;
+  gap: .4em;
+  margin: 0;
+  min-width: 0;
+}
+#document-flow .document-box[data-choice-grid="true"] > .document-choice > .document-label {
+  flex: 0 0 auto;
+  float: none;
+  margin: 0;
+  font-weight: 400;
+}
+#document-flow .document-box[data-choice-grid="true"] > .document-choice > .document-paragraph {
+  min-width: 0;
+  margin: 0 !important;
+}
+
 .document-answer, .document-explanation { background: var(--surface-muted); padding: 12px; margin-top: 12px; border-left: 3px solid var(--line-strong); }
 .document-table { border-collapse: collapse; width: 100%; margin: 12px 0; table-layout: fixed; }.document-cell { border: 1px solid var(--line-strong); padding: 8px; vertical-align: top; }
 .document-figure { max-width: 100%; margin: 12px 0; }.document-figure img { display: block; max-width: 100%; height: auto; }
@@ -49,6 +97,22 @@
 .document-page-title p { margin: 0; line-height: 1.5; }.document-page-title p:empty { display: none; }.document-cover-title { margin: auto 0; text-align: center; }.document-cover-title h1 { font-size: 24pt; }
 .document-print[data-template="workbook"] .document-page-title { border-bottom: 1px solid #444; padding-bottom: 4mm; }.document-unit-title { font-weight: 700; }
 .document-layout-columns { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); flex: 1; min-height: 0; }.document-layout-columns[hidden] { display: none; }.document-layout-column { min-width: 0; display: flex; flex-direction: column; align-items: stretch; }
-.document-layout-unit { flex: none; display: flow-root; box-sizing: border-box; margin: 0; }.document-layout-content { display: flow-root; }.document-solution-label { font-size: 9pt; font-weight: 700; margin: 0 0 2mm; }
+.document-layout-unit { flex: none; display: flow-root; box-sizing: border-box; margin: 0; }.document-layout-content { display: flow-root; }.document-solution-label { font-size: 9pt; font-weight: 700; margin: 0 0 2mm; border-top: 1px solid #555; padding-top: 1mm; }
 .document-print .document-question { border: 0; padding: 0; margin: 0; }.document-print .document-label { margin-bottom: 2mm; }.document-print .document-paragraph { min-height: 0; cursor: default; }.document-print .document-paragraph:hover,.document-print .document-equation:hover { outline: none; }
-.document-print .document-equation { cursor: default; max-width: none; }.document-print .document-figure img { max-width: none; }.document-print .document-answer,.document-print .document-explanation { background: transparent; padding: 0; border: 0; margin: 0; }
+.document-print .document-equation { cursor: default; max-width: none; }.document-print .document-figure img { max-width: 100%; }.document-print .document-answer,.document-print .document-explanation { background: transparent; padding: 0; border: 0; margin: 0; }
+.document-print .document-question > .document-label { font-weight: 400; margin-bottom: 1mm; }
+.document-print[data-template="mock_exam"] .document-page-title { display: none; }
+.document-print .document-figure { margin: 2mm 0; }
+.document-print .document-box { margin: 2mm 0; padding: 1.5mm 2mm; }
+.document-print .document-box[data-box-role="bogi"] { position: relative; border: 1px solid #555; padding-top: 2.5mm; }
+.document-print .document-box[data-box-role="bogi"] > .document-label { position: absolute; top: -.75em; left: 50%; transform: translateX(-50%); background: white; padding: 0 1mm; margin: 0; font-weight: 400; white-space: nowrap; }
+.document-print .document-box[data-box-role="statement"] { border: 0; margin: 0; padding: 0; display: flow-root; }
+.document-print .document-box[data-box-role="statement"] > .document-label { float: left; margin: 0 .4em 0 0; font-weight: 400; }
+.document-print .document-box[data-box-role="statement"] > .document-paragraph { margin-bottom: .3mm !important; }
+.document-print .document-box[data-box-role="choices"] { border: 0; padding: 0; margin: 1.5mm 0; }
+.document-print .document-box[data-box-role="choices"] > .document-label:empty { display: none; }
+.document-print .document-box[data-choice-grid="true"] { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 1mm; row-gap: .5mm; }
+.document-print .document-choice { display: flex; align-items: baseline; gap: .8mm; margin: 0; min-width: 0; }
+.document-print .document-choice > .document-label { float: none; margin: 0; font-weight: 400; }
+.document-print .document-choice > .document-paragraph { margin: 0 !important; min-width: 0; }
+

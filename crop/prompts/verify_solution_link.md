@@ -19,6 +19,8 @@ $SEQUENCE_CONTEXT
 # Success Criteria
 
 - Compare solution printed-page anchor/segment, hierarchy and numbering scope, parent number, explicit subquestion label, explicit range/group membership, monotonic local order, and visible stem/figure-label fingerprints.
+- Set `monotonic_order_match` from `computed_monotonic_order_match` and the supplied ordered neighbor records. `unknown` remains unknown when no comparable neighbor is supplied; crop-edge completeness is not order evidence.
+- A computed `mismatch` is an identity failure. Never change it to `match` because the target number, answer, or crop boundaries look correct.
 - Treat quick-answer and detailed-solution assets as separate roles. The same explicit answer appearing in both is normal corroboration.
 - Return `verified` only for one uniquely supported identity. A matching printed number alone is never enough.
 - Return `wrong_link` for a clear identity mismatch, `review` for missing/ambiguous evidence, and `conflict` when quick and detailed assets visibly state incompatible explicit answers.

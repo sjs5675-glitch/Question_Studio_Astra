@@ -1,0 +1,151 @@
+/* Device shells: paper / ink / muted green. Canonical controls remain intact. */
+.astra-ui { --device-bottom-height: 68px; }
+.astra-ui .device-bottom-nav, .astra-ui .device-more-panel { display: none; }
+.astra-ui .device-nav-group { display: grid; gap: 4px; }
+.astra-ui .device-nav-label { margin: 14px 12px 4px; color: var(--muted); font-size: .72rem; font-weight: 700; letter-spacing: .04em; }
+.astra-ui .device-home-heading { margin: 0 0 24px; }
+.astra-ui .device-home-heading h2 { font-size: clamp(1.5rem, 3vw, 2rem); margin: 0 0 8px; }
+.astra-ui .device-home-heading p { color: var(--muted); margin: 0; }
+.astra-ui .device-home-heading .device-eyebrow { font-size: .75rem; margin-bottom: 8px; letter-spacing: .08em; color: var(--brand); }
+.astra-ui .device-dashboard { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 24px; background: var(--brand-soft); border: 1px solid var(--line-strong); border-radius: var(--r-panel); }
+.astra-ui .device-dashboard h3 { margin: 0 0 8px; font-size: 1.12rem; }
+.astra-ui .device-dashboard p { max-width: 62ch; margin: 0; color: var(--muted); }
+.astra-ui .device-dashboard-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: 0 1 420px; }
+.astra-ui .device-dashboard-actions .button { white-space: nowrap; }
+.astra-ui .device-create-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+.astra-ui .device-create-heading h3 { margin: 0; font-size: 1.35rem; }
+.astra-ui .device-projects > summary, .astra-ui .device-filters > summary, .astra-ui .device-set-output > summary, .astra-ui .device-set-management > summary { cursor: pointer; min-height: 44px; padding: 12px; font-size: .8125rem; font-weight: 600; color: var(--muted); }
+.astra-ui .device-projects > summary { border-bottom: 1px solid var(--line); }
+.astra-ui .device-filters { margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; }
+.astra-ui .device-filters > :not(summary) { margin: 0 12px 12px; }
+.astra-ui .device-item-search input { width: 100%; }
+.astra-ui .project-removal-disclosure { position: relative; flex: 0 0 auto; align-self: start; }
+.astra-ui .project-removal-disclosure > summary { cursor: pointer; font-size: .75rem; min-height: 40px; padding: 10px 6px; color: var(--muted); }
+.astra-ui .project-removal-disclosure .trash-action { min-height: 40px; margin: 0; }
+.astra-ui .device-detail-back { margin-bottom: 16px; }
+.astra-ui .device-set-output { padding: 4px 12px 12px; border: 1px solid var(--line); border-radius: var(--r-panel); background: var(--surface); }
+.astra-ui .device-output-actions { display: flex; margin-top: 16px; }
+.astra-ui .device-set-management { margin-left: auto; }
+.astra-ui .device-set-management #deleteQuestionSet { margin: 0 8px 8px; }
+.astra-ui .batch-percent { white-space: nowrap; min-width: 72px; text-align: right; }
+.astra-ui .batch-card[data-status="failed"] progress, .astra-ui .batch-card[data-status="interrupted"] progress, .astra-ui .batch-card[data-status="cancelled"] progress { accent-color: var(--muted); }
+
+@media (min-width: 761px) {
+  .astra-ui { --rail-width: 188px; padding-left: var(--rail-width); padding-bottom: 0; }
+  .astra-ui .app-header { position: fixed; inset: 0 auto 0 0; height: 100dvh; width: var(--rail-width); display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 16px; padding: 20px 12px; border-right: 1px solid var(--line); border-bottom: 0; overflow-y: auto; z-index: 40; }
+  .astra-ui .workspace-nav { display: flex; flex-direction: column; width: auto; order: 0; overflow: visible; padding: 0; }
+  .astra-ui .workspace-nav a { min-width: 0; white-space: normal; padding: 10px; }
+  .astra-ui .connection { margin: auto 0 0; padding: 12px; }
+  .astra-ui .app-shell { display: grid; grid-template-columns: minmax(200px, 244px) minmax(0, 1fr); }
+  .astra-ui .sidebar { display: block; border-right: 1px solid var(--line); border-bottom: 0; }
+  .astra-ui .main-content { min-width: 0; padding: 24px; }
+  .astra-ui .dual-reading-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .astra-ui .review-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .astra-ui .review-grid .preview-panel { grid-column: 1 / -1; }
+  .astra-ui .dual-reading-actions, .astra-ui .item-actions { flex-wrap: wrap; }
+  .astra-ui .dual-reading-header { flex-wrap: wrap; gap: 8px; }
+  .astra-ui .bank-layout { grid-template-columns: 208px minmax(0, 1fr); }
+  .astra-ui .bank-classification { position: static; display: block; }
+  .astra-ui .sets-shell { display: grid; grid-template-columns: 224px minmax(0, 1fr); }
+  .astra-ui .sets-sidebar { border-right: 1px solid var(--line); border-bottom: 0; }
+  .astra-ui #setEditor:not([hidden]) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 280px); gap: 24px; }
+  .astra-ui .set-editor-heading { grid-column: 1 / -1; grid-row: 1; }
+  .astra-ui .set-order-section { grid-column: 1; grid-row: 2 / span 3; }
+  .astra-ui .device-set-output, .astra-ui .document-entry, .astra-ui .set-build-result { grid-column: 2; grid-row: auto; }
+  .astra-ui .device-set-output .output-mode-options { display: grid; grid-template-columns: 1fr; }
+  .astra-ui .exam-editor-grid { grid-template-columns: minmax(0, 1fr) minmax(230px, 304px); }
+  .astra-ui .exam-compare { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 761px) and (max-width: 1100px) {
+  .astra-ui { --rail-width: 172px; }
+  .astra-ui .app-shell { grid-template-columns: 208px minmax(0, 1fr); }
+  .astra-ui :is(.main-content,.set-workspace,.batch-area,.bank-page) { padding: 16px; }
+  .astra-ui .bank-layout { grid-template-columns: 176px minmax(0, 1fr); gap: 16px; }
+  .astra-ui .sets-shell { grid-template-columns: 180px minmax(0, 1fr); }
+  .astra-ui #setEditor:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui :is(.set-editor-heading,.set-order-section,.device-set-output,.document-entry,.set-build-result) { grid-column: 1; grid-row: auto; }
+  .astra-ui .device-dashboard { align-items: start; flex-direction: column; }
+  .astra-ui .device-dashboard-actions { flex-basis: auto; }
+  .astra-ui .exam-editor-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 760px) {
+  .astra-ui { padding-left: 0; padding-bottom: calc(var(--device-bottom-height) + env(safe-area-inset-bottom, 0px) + 16px); }
+  .astra-ui .app-header { position: sticky; top: 0; width: 100%; height: auto; min-height: 58px; display: flex; flex-direction: row; align-items: center; flex-wrap: nowrap; gap: 8px; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--line); z-index: 40; }
+  .astra-ui .app-brand { padding: 0; }
+  .astra-ui .brand-mark { width: 24px; height: 28px; }
+  .astra-ui .brand-copy strong { font-size: .92rem; }
+  .astra-ui .brand-copy span { font-size: .6875rem; }
+  .astra-ui .app-header .workspace-nav { display: none; }
+  .astra-ui .connection { margin: 0 0 0 auto; padding: 0; font-size: .6875rem; max-width: 45%; }
+  .astra-ui .device-bottom-nav { position: fixed; inset: auto 0 0; z-index: 70; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 4px 8px calc(4px + env(safe-area-inset-bottom, 0px)); min-height: var(--device-bottom-height); border-top: 1px solid var(--line-strong); background: var(--surface); box-shadow: 0 -4px 20px rgb(37 49 45 / 6%); }
+  .astra-ui .device-bottom-nav :is(a,button) { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 0; min-width: 0; min-height: 56px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); text-decoration: none; font: inherit; font-size: .75rem; font-weight: 600; }
+  .astra-ui .device-bottom-nav [aria-current="page"], .astra-ui .device-bottom-nav [aria-expanded="true"] { background: var(--brand-soft); color: var(--brand-dark); }
+  .astra-ui .device-bottom-icon { font-size: 1.4rem; line-height: 1.2; height: 28px; }
+  .astra-ui .device-more-panel { position: fixed; inset: auto 12px calc(var(--device-bottom-height) + env(safe-area-inset-bottom, 0px) + 8px); z-index: 65; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: calc(100dvh - 154px - env(safe-area-inset-bottom, 0px)); overflow-y: auto; overscroll-behavior: contain; gap: 8px; padding: 16px; border: 1px solid var(--line-strong); border-radius: 16px; background: var(--surface); box-shadow: 0 8px 40px rgb(37 49 45 / 18%); }
+  .astra-ui .device-more-heading { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .astra-ui .device-more-heading h2 { font-size: 1.1rem; margin: 0; }
+  .astra-ui .device-more-panel > a { display: flex; align-items: center; min-height: 48px; padding: 12px; border-radius: 8px; background: var(--surface-muted); text-decoration: none; font-size: .8125rem; }
+  .astra-ui :is(.batch-area,.learning-page,.bank-page,.main-content,.set-workspace) { width: 100%; min-width: 0; padding: 16px; }
+  .astra-ui .device-home-heading { margin-bottom: 16px; }
+  .astra-ui .device-dashboard { flex-direction: column; align-items: stretch; padding: 20px; gap: 16px; }
+  .astra-ui .device-dashboard h3 { font-size: 1rem; }
+  .astra-ui .device-dashboard-actions { flex-basis: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .astra-ui .device-dashboard-actions .primary { grid-column: 1 / -1; }
+  .astra-ui .device-dashboard-actions .button { white-space: normal; text-align: center; }
+  .astra-ui .recent-batches { margin-top: 20px; padding-top: 0; }
+  .astra-ui .batch-list { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui .batch-card { padding: 16px; }
+  .astra-ui .batch-progress-row { grid-template-columns: 1fr auto; }
+  .astra-ui .batch-progress-row .batch-phase { grid-column: 1 / -1; }
+  .astra-ui .batch-form { padding: 16px; }
+  .astra-ui .batch-fields { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui .batch-fields :is(label,.file-field,.path-field,.page-range-options,.provider-profile-options) { grid-column: 1; }
+  .astra-ui .provider-profile-options { grid-template-columns: 1fr; }
+  .astra-ui .exam-editor, .astra-ui .exam-intro { padding: 16px; }
+  .astra-ui .exam-editor-grid, .astra-ui .exam-compare { grid-template-columns: 1fr; }
+  .astra-ui .app-shell, .astra-ui .sets-shell { display: block; min-height: 0; }
+  .astra-ui .sidebar { display: block; width: 100%; border-right: 0; }
+  .astra-ui .sidebar .item-nav { padding-top: 8px; }
+  .astra-ui #savedView:not([data-device-detail="true"]) > .main-content { display: none; }
+  .astra-ui #savedView[data-device-detail="true"] > .sidebar { display: none; }
+  .astra-ui #savedView[data-device-detail="true"] > .main-content { display: block; }
+  .astra-ui .item-list { max-height: none; overflow: visible; }
+  .astra-ui .dual-reading-grid, .astra-ui .review-grid, .astra-ui .lower-grid { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui .review-grid .preview-panel { grid-column: 1; }
+  .astra-ui .dual-reading-header { flex-wrap: wrap; gap: 8px; }
+  .astra-ui .dual-reading-actions { flex-wrap: wrap; justify-content: flex-start; }
+  .astra-ui .item-header { flex-direction: column; }
+  .astra-ui .item-header .item-actions { display: flex; flex-wrap: wrap; justify-content: flex-start; width: 100%; }
+  .astra-ui .item-actions > .button { flex: 1 1 auto; }
+  .astra-ui .button, .astra-ui .icon-button { min-height: 44px; }
+  .astra-ui .bank-layout { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui .bank-classification { position: static; grid-template-columns: 1fr; }
+  .astra-ui .bank-grid { grid-template-columns: minmax(0, 1fr); }
+  .astra-ui .bank-search-row, .astra-ui .bank-toolbar, .astra-ui .bank-figure-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .astra-ui .bank-search-row input { flex: 1 1 160px; }
+  .astra-ui .bank-control-pair { max-width: 100%; }
+  .astra-ui .bank-figure-actions > .bank-control-pair { width: 100%; }
+  .astra-ui .bank-control-pair select { flex: 1; }
+  .astra-ui .bank-read-dialog { width: 100%; max-width: none; height: 100dvh; max-height: 100dvh; margin: 0; border: 0; border-radius: 0; padding: 16px; }
+  .astra-ui .bank-read-close { position: sticky; top: 0; z-index: 2; }
+  .astra-ui #setsView:not([data-device-detail="true"]) > .set-workspace { display: none; }
+  .astra-ui #setsView[data-device-detail="true"] > .sets-sidebar { display: none; }
+  .astra-ui #setsView[data-device-detail="true"] > .set-workspace { display: block; }
+  .astra-ui .sets-sidebar { padding: 16px; }
+  .astra-ui #setEditor:not([hidden]) { display: flex; flex-direction: column; gap: 16px; }
+  .astra-ui #setEditor > * { width: 100%; grid-column: auto; grid-row: auto; }
+  .astra-ui .set-editor-heading { order: 1; margin: 0; }
+  .astra-ui .set-order-section { order: 2; }
+  .astra-ui .device-set-output { order: 3; }
+  .astra-ui .document-entry { order: 4; }
+  .astra-ui .set-build-result { order: 5; }
+  .astra-ui .output-mode-options { grid-template-columns: 1fr; }
+  .astra-ui .set-editor-actions { display: flex; flex-wrap: wrap; }
+  .astra-ui .set-item-card { grid-template-columns: auto minmax(0, 1fr); }
+  .astra-ui .set-item-controls { grid-column: 1 / -1; flex-wrap: wrap; }
+  .astra-ui .app-message { bottom: calc(var(--device-bottom-height) + env(safe-area-inset-bottom, 0px) + 12px); max-width: calc(100% - 32px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .astra-ui *, .astra-ui *::before, .astra-ui *::after { scroll-behavior: auto !important; }
+}
