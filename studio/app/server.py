@@ -923,6 +923,7 @@ class StudioApplication:
                         "tags": package.get("tags"),
                         "figure_generation": figure_generation_summary(package),
                         "asset_count": len(package.get("resources", {}).get("assets", [])),
+                        "generation_review": self._generation_review_state(package),
                     }
                 )
             except (ModelError, OSError):
@@ -1926,6 +1927,7 @@ class StudioApplication:
                 solution["transcription_state"] = "running" if target["state"] == "running" else "pending"
         return {
             "package": package,
+            "generation_review": self._generation_review_state(package),
             "revision": package.get("workflow", {}).get("revision"),
             "registration": registration,
             "content_status": stored_content_status(package),
@@ -1938,6 +1940,11 @@ class StudioApplication:
                 project_id, item_id
             ),
         }
+
+
+    def _generation_review_state(self, package: Mapping[str, Any]) -> dict | None:
+        from .item_generation_reviews import canonical_review_state
+        return canonical_review_state(self.config.workspace_root, package)
 
 
 class StudioHTTPServer(ThreadingHTTPServer):

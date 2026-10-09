@@ -103,24 +103,32 @@ def handle_item_generation_api(handler: Any, method: str, parts: list[str], quer
         if len(rest) >= 2 and rest[0] == "jobs":
             job_id = rest[1]
             if len(rest) == 2 and method == "GET":
-                handler._send_json(HTTPStatus.OK, load_job(root, job_id))
+                from .item_generation_reviews import enrich_job
+                handler._send_json(HTTPStatus.OK, enrich_job(root, load_job(root, job_id)))
                 return
+            if len(rest) == 3 and rest[2] == 'reviews':
+                from .item_generation_reviews import enqueue, records
+                if method == 'GET':
+                    handler._send_json(HTTPStatus.OK, {'records': records(root, job_id)})
+                    return
+                if method == 'POST':
+                    body = handler._read_json()
+                    job = enqueue(root, job_id, body.get('numbers'), body.get('model'), body.get('expected_revision'))
+                    app.item_generation_worker.wake()
+                    handler._send_json(HTTPStatus.ACCEPTED, job)
+                    return
             if len(rest) == 3 and rest[2] == "confirm" and method == "POST":
                 body = handler._read_json()
                 numbers = body.get("numbers")
                 if not isinstance(numbers, list):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "numbers 목록이 필요합니다.")
                 result = confirm_drafts(root, job_id, [_int(n, "numbers") for n in numbers],
-                                        include_intent=body.get("include_intent", True) is not False)
+                                        include_intent=body.get("include_intent", True) is not False,
+                                        expected_revision=body.get('expected_revision'))
                 handler._send_json(HTTPStatus.OK, result)
                 return
             if len(rest) == 3 and rest[2] == "retry" and method == "POST":
-                def requeue(job: dict[str, Any]) -> None:
-                    if job.get("status") in {"queued", "running"}:
-                        raise ItemGenerationError("이미 진행 중인 작업입니다.")
-                    job["status"] = "queued"
-                from .item_generation import update_job
-                job = update_job(root, job_id, requeue)
+                job = pipeline.resume_job(root, job_id, expected_revision=handler._read_json().get('expected_revision'))
                 app.item_generation_worker.wake()
                 handler._send_json(HTTPStatus.ACCEPTED, job)
                 return
@@ -134,26 +142,30 @@ def handle_item_generation_api(handler: Any, method: str, parts: list[str], quer
                     if not figure.get("file"):
                         raise ApiError(HTTPStatus.NOT_FOUND, "그림이 없습니다.")
                     base = job_dir(root, job_id).resolve()
-                    path = (base / figure["file"]).resolve()
+                    from .item_generation_identity import safe_path
+                    path = safe_path(base, figure['file'])
                     if base not in path.parents or path.is_symlink() or not path.is_file():
                         raise ApiError(HTTPStatus.NOT_FOUND, "그림이 없습니다.")
                     handler._send_file(path, "image/png", cache="no-cache")
                     return
                 if method == "POST" and action == "revise":
-                    job = pipeline.request_revision(root, job_id, no, handler._read_json().get("instruction", ""))
+                    body = handler._read_json()
+                    job = pipeline.request_revision(root, job_id, no, body.get('instruction', ''), expected_revision=body.get('expected_revision'))
                     app.item_generation_worker.wake()
                     handler._send_json(HTTPStatus.ACCEPTED, job)
                     return
                 if method == "POST" and action == "edit":
-                    fields = handler._read_json().get("fields")
+                    body = handler._read_json()
+                    fields = body.get("fields")
                     if not isinstance(fields, dict):
                         raise ApiError(HTTPStatus.BAD_REQUEST, "fields 객체가 필요합니다.")
-                    job = pipeline.edit_draft(root, job_id, no, fields)
+                    job = pipeline.edit_draft(root, job_id, no, fields, expected_revision=body.get('expected_revision'))
                     app.item_generation_worker.wake()
                     handler._send_json(HTTPStatus.ACCEPTED, job)
                     return
                 if method == "POST" and action == "discard":
-                    job = pipeline.set_discarded(root, job_id, no, bool(handler._read_json().get("discarded", True)))
+                    body = handler._read_json()
+                    job = pipeline.set_discarded(root, job_id, no, bool(body.get('discarded', True)), expected_revision=body.get('expected_revision'))
                     handler._send_json(HTTPStatus.OK, job)
                     return
         if rest == ["chats"]:

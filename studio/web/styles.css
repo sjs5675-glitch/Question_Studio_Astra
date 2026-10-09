@@ -1850,3 +1850,10 @@ kbd {
 }
 .bank-card-tags .gen-origin-badge { font-weight: 800; border: 1px solid #5a78c8; background: #eef3ff; color: #2c4a99; }
 .bank-card-tags .gen-origin-badge.new { border-color: #7a52b3; background: #f4eefc; color: #5b3593; }
+.gen-review-bar { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.gen-review-bar > .gen-hint { width: 100%; margin: 0; }
+.gen-review-pick { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.gen-review-record { border-top: 1px solid var(--line); padding: 12px 0; overflow-wrap: anywhere; }
+.gen-review-record p { white-space: pre-wrap; }
+.gen-canonical-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.gen-item-code { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }

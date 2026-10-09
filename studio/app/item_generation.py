@@ -39,11 +39,12 @@ PIPELINE_VERSION = "item-generation-v1"
 INTERNAL_PROJECT_PREFIX = "project-itemgen-"
 JOBS_DIRNAME = ".item_generation"
 MAX_ITEMS_PER_JOB = 50
+CLAUDE_DEFAULT_EFFORT = "high"
 NEW_SIMILARITY_LIMIT = 0.45
 VARIANT_COPY_LIMIT = 0.8
 CHOICE_LABELS = ("①", "②", "③", "④", "⑤")
 BOGI_LABELS = ("ㄱ", "ㄴ", "ㄷ", "ㄹ", "ㅁ")
-SUBJECT_TAXONOMY = {"통합과학2": "integrated-2", "통합과학1": "integrated-1", "역학과 에너지": "mechanics-energy"}
+SUBJECT_TAXONOMY = {"통합과학2": "integrated-2", "통합과학1": "integrated-1", "역학과 에너지": "mechanics-energy", "물리학": "physics"}
 SIMPLE_UNIT_BY_ROMAN = {
     "통합과학2": {"Ⅰ": "변화와 다양성", "Ⅱ": "환경과 에너지", "Ⅲ": "과학과 미래 사회"},
 }
@@ -101,7 +102,18 @@ def load_scope(scope: str, root: Path | None = None) -> dict[str, Any]:
     return data
 
 
+def _max_effort_scope(scope: str) -> bool:
+    match = re.fullmatch(r"고([0-9]+)-(물리학|역학과 에너지)", scope or "")
+    return bool(match and int(match.group(1)) >= 2)
+
+
+def claude_effort_for_scope(scope: str) -> str:
+    return "max" if _max_effort_scope(scope) else CLAUDE_DEFAULT_EFFORT
+
+
 def codex_effort_for_scope(scope: str) -> str:
+    if _max_effort_scope(scope):
+        return "max"
     match = re.match(r"(중|고)(\d)", scope or "")
     if not match:
         return "xhigh"
@@ -165,6 +177,7 @@ def topic_tree(scope: str, root: Path | None = None) -> dict[str, Any]:
             "details": [{"name": name, "count": count} for name, count in sorted(details.items(), key=lambda kv: -kv[1])],
         })
     return {"scope": scope, "grade": grade, "subject": subject, "curriculum": data.get("curriculum"),
+            "claude_effort": claude_effort_for_scope(scope),
             "codex_effort": codex_effort_for_scope(scope), "majors": list(majors.values())}
 
 
@@ -528,12 +541,14 @@ def validate_request(body: Mapping[str, Any], root: Path | None = None) -> dict[
     }
 
 
-def estimate_calls(request: Mapping[str, Any]) -> dict[str, int]:
+def estimate_calls(request: Mapping[str, Any]) -> dict[str, Any]:
     total = int(request["variants"]) + int(request["new"])
     batches = math.ceil(int(request["variants"]) / 5) + math.ceil(int(request["new"]) / 5)
     figures = total if request.get("figure") == "use" else (0 if request.get("figure") == "none" else math.ceil(total / 2))
     return {"claude_generate": batches, "figure_codex_max": figures, "figure_check_claude_max": figures,
-            "codex_verify": math.ceil(total / 5)}
+            "codex_verify": math.ceil(total / 5),
+            "claude_effort": claude_effort_for_scope(request.get("scope", "")),
+            "codex_effort": codex_effort_for_scope(request.get("scope", ""))}
 
 
 def create_job(workspace: Path | str, request: Mapping[str, Any], *, route: str = "quick",
@@ -716,7 +731,8 @@ def build_package(workspace: Path | str, job: Mapping[str, Any], draft: Mapping[
     figure_record = None
     figure = draft.get("figure") if isinstance(draft.get("figure"), Mapping) else None
     if figure and figure.get("file"):
-        figure_file = (job_dir(workspace, str(job["job_id"])) / str(figure["file"])).resolve()
+        from .item_generation_identity import safe_path
+        figure_file = safe_path(job_dir(workspace, str(job['job_id'])), str(figure['file']))
         if not figure_file.is_file() or job_dir(workspace, str(job["job_id"])).resolve() not in figure_file.parents:
             raise ItemGenerationError("초안 그림 파일을 찾을 수 없습니다.")
         from PIL import Image
@@ -752,7 +768,7 @@ def build_package(workspace: Path | str, job: Mapping[str, Any], draft: Mapping[
         "distractor_intents": dict(draft.get("distractor_intents") or {}),
         "unique_answer_rationale": draft.get("unique_answer_rationale"),
         "generator": {"model": str(draft.get("generator_model") or job.get("generator_model") or "claude-opus-5-5"),
-                      "effort": draft.get("generator_effort") or job.get("generator_effort") or "high",
+                      "effort": draft['generator_effort'] if 'generator_effort' in draft else job.get('generator_effort', 'high'),
                       "created_at": job.get("created_at") or now,
                       "guide_sha256": job.get("guide_sha256"), "request": dict(request),
                       "bot_session_id": job.get("bot_session_id")},
@@ -766,6 +782,23 @@ def build_package(workspace: Path | str, job: Mapping[str, Any], draft: Mapping[
         "auto_checks": dict(draft.get("auto_checks") or {}),
         "confirmed_at": now,
     }
+    from . import item_registry
+    from .item_generation_identity import contributors
+
+    generation['generator'].update(requested_model=draft.get('requested_model'), actual_model=draft.get('actual_model'),
+        model_confirmed=draft.get('model_confirmed', False), contributors=contributors(draft),
+        versions=[{'at': h.get('at'), 'model': (h.get('previous') or {}).get('generator_model'),
+                   'effort': (h.get('previous') or {}).get('generator_effort'),
+                   'contributors': contributors(h.get('previous') or {})} for h in draft.get('history') or []])
+    receipt_fields = ('cli_selected_model', 'cli_selected_effort', 'model_evidence')
+    generation['generator'].update({k: draft[k] for k in receipt_fields if k in draft})
+    generation['verification'].update({k: verification[k] for k in ('identity', 'requested_model', 'actual_model',
+        'model_confirmed', 'review_kind', 'blind', *receipt_fields) if k in verification})
+
+    generation["item_code"] = str(draft.get("item_code") or item_registry.item_code(job["job_id"], draft["no"]))
+    generation["fingerprint"] = item_registry.draft_fingerprint(draft)
+    if isinstance(draft.get("duplicate_check"), Mapping):
+        generation["duplicate_check"] = dict(draft["duplicate_check"])
     source = generation["source_item"]
     label = ("변형" if draft["kind"] == "variant" else "신규")
     printed = f"AI{label}-{job['job_id'][-6:]}-{int(draft['no'])}"
@@ -826,7 +859,7 @@ def _ensure_internal_project(workspace: Path, subject: str, item_id: str, grade:
 
 
 def confirm_drafts(workspace: Path | str, job_id: str, numbers: Iterable[int], *,
-                   include_intent: bool = True) -> dict[str, Any]:
+                   include_intent: bool = True, expected_revision: int | None = None) -> dict[str, Any]:
     """Store selected drafts in the bank (internal project). Already stored drafts are skipped."""
 
     workspace = Path(workspace).resolve()
@@ -836,13 +869,18 @@ def confirm_drafts(workspace: Path | str, job_id: str, numbers: Iterable[int], *
     results = []
     with _LOCK:
         job = load_job(workspace, job_id)
-        if job.get("status") not in {"ready", "partial"}:
+        from .item_generation_pipeline import check_expected
+        check_expected(job, expected_revision)
+        if job.get('work_action') == 'review' and (job.get('review_request') or {}).get('status') in {'queued', 'running', 'paused'}:
+            raise ItemGenerationConflict('선택 버전 검토가 진행 중입니다.')
+        if job.get("status") not in {"ready", "partial", "paused"}:
             raise ItemGenerationError("생성·검증이 끝난 작업만 확정할 수 있습니다.")
         drafts = {int(d["no"]): d for d in job.get("drafts") or []}
         grade_match = re.search(r"([1-3])", str(job["scope"]).partition("-")[0])
         grade = int(grade_match.group(1)) if grade_match else None
         subject = str(job["scope"]).partition("-")[2]
         project_id = internal_project_id(subject)
+        index = None
         for no in wanted:
             draft = drafts.get(no)
             if draft is None:
@@ -856,6 +894,25 @@ def confirm_drafts(workspace: Path | str, job_id: str, numbers: Iterable[int], *
                 raise ItemGenerationError(f"{no}번 초안 형식 오류: {draft_format_errors(draft)[0]}")
             if (draft.get("verification") or {}).get("status") in (None, "pending", "error", "not_solved"):
                 raise ItemGenerationError(f"{no}번은 아직 Codex 검증을 받지 않았습니다. 검증 후 확정하세요.")
+            from .item_generation_identity import draft_identity, digest
+            receipt = (draft.get('verification') or {}).get('identity')
+            if receipt and receipt != draft_identity(draft, job_dir(workspace, job_id)):
+                raise ItemGenerationConflict(f'{no}번 검증은 이전 내용의 결과입니다. 다시 검증하세요.')
+            from . import item_registry
+
+            if index is None:
+                # Final gate: only items actually saved in the bank. Unsaved drafts of other jobs were
+                # compared at generation time and must not block each other here.
+                index = item_registry.bank_entries(workspace)
+            entry = item_registry.draft_entry(job, draft)
+            final = item_registry.check(entry, index)
+            if final["status"] == "duplicate":
+                draft["duplicate_check"] = {**final, "at": utc_now()}
+                save_job(workspace, job, expected_revision=job["revision"])
+                codes = ", ".join(m["code"] for m in final["matches"])
+                raise ItemGenerationError(f"{no}번은 이미 있는 문항({codes})과 겹쳐 저장하지 않습니다.")
+            draft["item_code"] = entry["code"]
+            draft["duplicate_check"] = {**final, "at": utc_now()}
             item_id = f"gen-{_hid(job_id, no, uuid.uuid4().hex)}"
             stage = jobs_root(workspace) / ".stage" / uuid.uuid4().hex[:12]
             item_stage = stage / "item"
@@ -879,7 +936,11 @@ def confirm_drafts(workspace: Path | str, job_id: str, numbers: Iterable[int], *
             draft["confirmed_item_id"] = item_id
             draft["confirmed_project_id"] = project_id
             draft["confirmed_at"] = utc_now()
-            results.append({"no": no, "item_id": item_id, "already": False})
+            draft['confirmed_revision'] = package['workflow']['revision']
+            draft['confirmed_content_sha256'] = digest(package['content']['question'])
+            draft['confirmed_answer_sha256'] = digest(package['content']['answer'])
+            index.append(item_registry.draft_entry(job, draft))
+            results.append({"no": no, "item_id": item_id, "item_code": draft["item_code"], "already": False})
         save_job(workspace, job, expected_revision=job["revision"])
     return {"job_id": job_id, "project_id": project_id, "results": results}
 
@@ -892,7 +953,12 @@ def generation_summary(package: Mapping[str, Any]) -> dict[str, Any] | None:
     if not isinstance(generation, Mapping):
         return None
     source = generation.get("source_item") if isinstance(generation.get("source_item"), Mapping) else None
-    return {"kind": generation.get("kind"), "job_id": generation.get("job_id"),
+    code = generation.get("item_code")
+    if not code and generation.get("job_id") and generation.get("draft_no"):
+        from .item_registry import item_code
+
+        code = item_code(generation["job_id"], generation["draft_no"])
+    return {"kind": generation.get("kind"), "job_id": generation.get("job_id"), "item_code": code,
             "source_printed_number": source.get("printed_number") if source else None,
             "source_item_id": source.get("item_id") if source else None,
             "verification": (generation.get("verification") or {}).get("status"),

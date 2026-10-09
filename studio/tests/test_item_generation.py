@@ -57,9 +57,57 @@ def draft(kind: str = "new", **overrides) -> dict:
     return base
 
 
+class EffortPolicyTests(unittest.TestCase):
+    def test_exact_high_school_subjects_use_max_verification(self) -> None:
+        for scope in ("고2-물리학", "고2-역학과 에너지", "고3-물리학"):
+            with self.subTest(scope=scope):
+                self.assertEqual(ig.codex_effort_for_scope(scope), "max")
+                self.assertEqual(ig.claude_effort_for_scope(scope), "max")
+
+    def test_non_target_scopes_keep_existing_efforts(self) -> None:
+        cases = {
+            "고2-전자기와 양자": "xhigh", "고2-통합과학2": "xhigh",
+            "고3-화학": "xhigh", "고2-물리학 심화": "xhigh",
+            "고2-응용 물리학": "xhigh", "고2-역학과 에너지 확장": "xhigh",
+            "고2-물리학-추가": "xhigh", "고2-물리학\n": "xhigh",
+            "고1-물리학": "high", "고1-역학과 에너지": "high",
+            "중3-물리학": "high", "중2-과학": "high", "고1-통합과학2": "high",
+            "물리학": "xhigh", "미상-물리학": "xhigh", "": "xhigh",
+            "고2물리학": "xhigh",
+        }
+        for scope, codex_effort in cases.items():
+            with self.subTest(scope=scope):
+                self.assertEqual(ig.claude_effort_for_scope(scope), "high")
+                self.assertEqual(ig.codex_effort_for_scope(scope), codex_effort)
+        self.assertEqual(pipeline.GENERATE_EFFORT, "high")
+
+    def test_ui_estimate_uses_returned_efforts(self) -> None:
+        text = (Path(__file__).parents[1] / "web" / "item-generation.mjs").read_text(encoding="utf-8")
+        estimate_line = next(line for line in text.splitlines() if "예상 호출: 생성" in line)
+        self.assertIn("Claude Opus ${e.claude_effort}", estimate_line)
+        self.assertIn("Codex 검증(${e.codex_effort})", estimate_line)
+        self.assertNotIn("Claude Opus high", estimate_line)
+
+
 class LabFixture(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        # Python 3.13's Windows mode 0o700 prevents sandbox access to disposable
+        # fixtures, including the HWPX export's nested TemporaryDirectory.
+        if os.name == "nt":
+            mkdtemp, mkdir = tempfile.mkdtemp, os.mkdir
+
+            def inherited_tempdir(*args, **kwargs):
+                with mock.patch("tempfile._os.mkdir", side_effect=lambda path, mode=0o777: mkdir(path)):
+                    path = mkdtemp(*args, **kwargs)
+                # Nested export paths exceed MAX_PATH in this isolated dev checkout.
+                return path if path.startswith("\\\\?\\") else "\\\\?\\" + path
+
+            patcher = mock.patch("tempfile.mkdtemp", side_effect=inherited_tempdir)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        synthetic_root = Path(__file__).resolve().parents[2] / ".test-tmp"
+        synthetic_root.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=synthetic_root)
         base = Path(self.temporary.name)
         self.lab = base / "lab"
         self.workspace = base / "workspace"
@@ -94,6 +142,13 @@ class LabFixture(unittest.TestCase):
         body = {"scope": "고1-통합과학2", "major": MAJOR, "middle": MIDDLE, "variants": 1, "new": 1, "difficulty": "중"}
         body.update(overrides)
         return ig.validate_request(body)
+
+    def scoped_request(self, scope: str, **overrides) -> dict:
+        source = self.lab / "scope" / "고1-통합과학2.json"
+        target = self.lab / "scope" / f"{scope}.json"
+        if not target.exists():
+            target.write_bytes(source.read_bytes())
+        return self.request(scope=scope, **overrides)
 
 
 class DraftCheckTests(LabFixture):
@@ -134,7 +189,9 @@ class DraftCheckTests(LabFixture):
         with self.assertRaises(ig.ItemGenerationError):
             self.request(middle="없는 단원")
         self.assertEqual(ig.codex_effort_for_scope("고1-통합과학2"), "high")
-        self.assertEqual(ig.codex_effort_for_scope("고2-역학과 에너지"), "xhigh")
+        self.assertEqual(ig.codex_effort_for_scope("고2-역학과 에너지"), "max")
+        self.assertEqual(ig.codex_effort_for_scope("고2-전자기와 양자"), "xhigh")
+        self.assertEqual(ig.codex_effort_for_scope("고2-통합과학2"), "xhigh")
         self.assertEqual(ig.codex_effort_for_scope("중3-과학"), "high")
 
     def test_topic_tree_and_search_use_scope_and_analyses(self) -> None:
@@ -148,13 +205,22 @@ class DraftCheckTests(LabFixture):
 
 
 class FakeModels:
-    def __init__(self, png: Path, *, verifier_answers: dict[int, str] | None = None) -> None:
+    STEMS = ["마그네슘 리본을 묽은 염산에 넣었더니 기체가 발생하였다.",
+             "철 못을 황산 구리 수용액에 담가 두었더니 표면이 붉게 변하였다.",
+             "아연 조각을 질산 납 수용액에 넣었더니 회색 고체가 생겼다.",
+             "알루미늄 포일을 염화 구리 수용액에 넣었더니 용액의 색이 옅어졌다."]
+
+    def __init__(self, png: Path, *, verifier_answers: dict[int, str] | None = None, repeat_new: bool = False) -> None:
         self.png = png
         self.answers = verifier_answers or {}
         self.calls: list[tuple] = []
+        self.prompts: list[str] = []
+        self.repeat_new = repeat_new
+        self.new_count = 0
 
     def claude(self, prompt, *, effort, add_dirs):
         self.calls.append(("claude", effort))
+        self.prompts.append(prompt)
         if "그림 파일을 Read 도구로 열어" in prompt:
             nos = [int(n) for n in re.findall(r"### 문항 (\d+)", prompt)]
             return json.dumps({"results": [{"no": n, "ok": True, "issues": []} for n in nos]}), {}
@@ -163,7 +229,15 @@ class FakeModels:
         if "변형 문항을 정확히" in prompt:
             figure = {"method": "code", "alt_text": "질량 그래프", "spec": {"type": "graph", "description": "시간-질량"}}
             return json.dumps({"items": [draft("variant", figure=figure)]}, ensure_ascii=False), {}
-        return json.dumps({"items": [draft("new")]}, ensure_ascii=False), {}
+        stem = self.STEMS[0] if self.repeat_new and "[대체 생성]" not in prompt else self.STEMS[self.new_count % len(self.STEMS)]
+        self.new_count += 1
+        k = self.STEMS.index(stem)
+        bogi = {"ㄱ": f"{k}번 금속은 산화된다.", "ㄴ": f"{k}번 용액의 양이온 수는 {k + 2}배가 된다.",
+                "ㄷ": ["기체가 발생한다.", "용액의 색이 변한다.", "고체가 석출된다.", "전자는 금속에서 이온으로 이동한다."][k]}
+        one = draft("new", stem=stem, bogi=bogi, table=None, calc_checks=[])
+        wanted = re.search(r"새 문항 (\d+)개", prompt)
+        n = int(wanted.group(1)) if wanted and self.repeat_new and "[대체 생성]" not in prompt else 1
+        return json.dumps({"items": [one] * n}, ensure_ascii=False), {}
 
     def codex(self, prompt, *, effort, images, write=False, workdir=None, timeout=0):
         self.calls.append(("codex", effort, write, len(images)))
@@ -235,6 +309,105 @@ class PipelineTests(LabFixture):
         job = pipeline.import_bot_drafts(self.workspace, self.request(), [draft("new")], bot_session_id="s")
         self.assertEqual((job["route"], job["status"], len(job["drafts"])), ("bot", "queued", 1))
         self.assertEqual(job["drafts"][0]["verification"]["status"], "pending")
+
+
+class ScopedEffortPipelineTests(LabFixture):
+    def test_generation_revision_metadata_and_figure_efforts(self) -> None:
+        cases = (("고2-물리학", "max", "max"), ("고2-역학과 에너지", "max", "max"),
+                 ("고3-물리학", "max", "max"), ("고2-전자기와 양자", "high", "xhigh"),
+                 ("고2-통합과학2", "high", "xhigh"), ("고1-물리학", "high", "high"))
+        for scope, author_effort, verify_effort in cases:
+            with self.subTest(scope=scope):
+                workspace = self.workspace / scope
+                workspace.mkdir()
+                models = FakeModels(self.figure_png)
+                runners = pipeline.Runners(models.claude, models.codex)
+                job = ig.create_job(workspace, self.scoped_request(scope))
+                job = pipeline.run_job(workspace, job["job_id"], runners)
+                self.assertEqual(job["status"], "ready")
+                self.assertEqual(job["generator_model"], "claude-opus-5-5")
+                self.assertEqual(job["generator_effort"], author_effort)
+                self.assertEqual(models.calls.count(("claude", author_effort)), 2)
+                self.assertIn(("codex", verify_effort, False, 1), models.calls)
+                self.assertIn(("codex", "medium", True, 0), models.calls)
+                self.assertIn(("claude", "medium"), models.calls)
+                self.assertEqual(job["drafts"][0]["figure"]["check"]["effort"], "medium")
+                for item in job["drafts"]:
+                    self.assertEqual(item["generator_model"], "claude-opus-5-5")
+                    self.assertEqual(item["generator_effort"], author_effort)
+                    self.assertEqual(item["verification"]["model"], "gpt-6-astra")
+                    self.assertEqual(item["verification"]["effort"], verify_effort)
+                for usage in (u for u in job["usage"] if u["step"] == "generate"):
+                    self.assertEqual((usage["model"], usage["effort"]), ("claude-opus-5-5", author_effort))
+                models.calls.clear()
+                pipeline.request_revision(workspace, job["job_id"], 2, "자료를 바꿔줘")
+                revised = pipeline.run_job(workspace, job["job_id"], runners)
+                self.assertEqual(revised["drafts"][1]["stem"], "수정된 자료 설명이다.")
+                self.assertEqual(revised["drafts"][1]["generator_effort"], author_effort)
+                self.assertEqual(revised["drafts"][1]["verification"]["effort"], verify_effort)
+                self.assertEqual(models.calls, [("claude", author_effort), ("codex", verify_effort, False, 0)])
+                usage = next(u for u in revised["usage"] if u["step"] == "revise")
+                self.assertEqual((usage["model"], usage["effort"]), ("claude-opus-5-5", author_effort))
+
+    def test_revision_preserves_old_and_unrevised_metadata_and_legacy_fallback(self) -> None:
+        job = ig.create_job(self.workspace, self.scoped_request("고2-역학과 에너지"), route="bot")
+        old = draft(no=1, generator_model="claude-opus-5-5", generator_effort="high",
+                    verification={"status": "verified", "model": "gpt-6-astra", "effort": "xhigh"})
+        legacy = draft(no=2, stem=FakeModels.STEMS[1], verification={"status": "verified"})
+        job = ig.update_job(self.workspace, job["job_id"], lambda j: j.update(
+            status="ready", drafts=[old, legacy], generator_model="claude-opus-5-5", generator_effort="high"))
+        pipeline.request_revision(self.workspace, job["job_id"], 1, "자료를 바꿔줘")
+        models = FakeModels(self.figure_png)
+        revised = pipeline.run_job(self.workspace, job["job_id"], pipeline.Runners(models.claude, models.codex))
+        self.assertEqual(revised["drafts"][0]["generator_effort"], "max")
+        self.assertEqual(revised["drafts"][0]["verification"]["effort"], "max")
+        self.assertEqual(revised["drafts"][0]["history"][0]["previous"], old)
+        self.assertEqual(revised["drafts"][1], legacy)
+        self.assertEqual(revised["generator_effort"], "high")  # original job authoring metadata
+        package, _ = ig.build_package(self.workspace, revised, legacy, item_id=SOURCE_ID)
+        self.assertEqual(package["provenance"]["generation"]["generator"]["effort"], "high")
+        # Older jobs without either metadata field retain the original fallback too.
+        revised.pop("generator_effort")
+        revised.pop("generator_model")
+        package, _ = ig.build_package(self.workspace, revised, legacy, item_id=SOURCE_ID)
+        self.assertEqual(package["provenance"]["generation"]["generator"]["effort"], "high")
+
+    def test_failed_generation_and_revision_preserve_author_metadata(self) -> None:
+        calls = []
+
+        def broken(prompt, *, effort, **kwargs):
+            calls.append(effort)
+            raise RuntimeError("synthetic quota")
+
+        job = ig.create_job(self.workspace, self.scoped_request("고2-물리학", variants=0, new=1))
+        ig.update_job(self.workspace, job["job_id"], lambda j: j.update(
+            generator_model="claude-opus-5-5", generator_effort="high"))
+        failed = pipeline.run_job(self.workspace, job["job_id"], pipeline.Runners(broken, broken))
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["drafts"], [])
+        self.assertEqual(failed["generator_effort"], "high")
+        self.assertIn("synthetic quota", failed["error"])
+        old = draft(no=1, generator_model="item-analyst (hermes bot)", generator_effort=None,
+                    verification={"status": "verified"}, history=[{"request": "old history"}])
+        job = ig.update_job(self.workspace, job["job_id"], lambda j: j.update(status="ready", drafts=[old]))
+        pipeline.request_revision(self.workspace, job["job_id"], 1, "자료를 바꿔줘")
+        failed = pipeline.run_job(self.workspace, job["job_id"], pipeline.Runners(broken, broken))
+        self.assertEqual(failed["drafts"][0], {**old, "revise_request": "자료를 바꿔줘", "revise_error": "synthetic quota"})
+        self.assertEqual(failed["generator_effort"], "high")
+        self.assertEqual(calls, ["max", "max"])  # genuine failures are not automatically retried
+
+    def test_bot_verification_keeps_bot_author_metadata(self) -> None:
+        job = pipeline.import_bot_drafts(self.workspace, self.scoped_request("고2-물리학"),
+                                         [draft()], bot_session_id="synthetic-bot")
+        models = FakeModels(self.figure_png)
+        job = pipeline.run_job(self.workspace, job["job_id"], pipeline.Runners(models.claude, models.codex))
+        self.assertEqual(models.calls, [("codex", "max", False, 0)])
+        self.assertEqual(job["generator_model"], "item-analyst (hermes bot)")
+        self.assertNotIn("generator_effort", job)
+        self.assertEqual(job["drafts"][0]["generator_model"], "item-analyst (hermes bot)")
+        self.assertIsNone(job["drafts"][0]["generator_effort"])
+        package, _ = ig.build_package(self.workspace, job, job["drafts"][0], item_id=SOURCE_ID)
+        self.assertEqual(package["provenance"]["generation"]["generator"]["model"], "item-analyst (hermes bot)")
 
 
 class BankStorageTests(LabFixture):
@@ -312,7 +485,142 @@ class BankStorageTests(LabFixture):
         self.assertIn("구리판을 질산 은 수용액에 넣었더니", sections)
 
 
+class RegistryTests(LabFixture):
+    """Item codes, fingerprints and duplicate checks across drafts, jobs and the bank."""
+
+    def run_new(self, models: FakeModels, n: int = 1) -> dict:
+        job = ig.create_job(self.workspace, self.request(variants=0, new=n))
+        pipeline.run_job(self.workspace, job["job_id"], pipeline.Runners(models.claude, models.codex))
+        return ig.load_job(self.workspace, job["job_id"])
+
+    def test_item_code_is_stable_and_readable(self) -> None:
+        from app import item_registry as reg
+
+        self.assertEqual(reg.item_code("gen-20261007-110619-597c6a", 3), "AIQ-261007-597c6a-03")
+        self.assertEqual(reg.item_code("gen-20261007-110619-597c6a", 3), reg.item_code("gen-20261007-110619-597c6a", 3))
+        self.assertRegex(reg.item_code("odd-id", 1), r"^AIQ-000000-[0-9a-f]{6}-01$")
+
+    def test_number_only_change_is_duplicate_and_new_situation_is_unique(self) -> None:
+        from app import item_registry as reg
+
+        base = {"job_id": "gen-20261007-110619-aaaaaa", "scope": "고1-통합과학2", "unit": {"major": MAJOR, "middle": MIDDLE}}
+        first = reg.draft_entry(base, {**draft(stem="질량이 10 g인 구리판을 넣었다."), "no": 1})
+        numbers = reg.draft_entry(base, {**draft(stem="질량이 25 g인 구리판을 넣었다."), "no": 2})
+        self.assertEqual(reg.check(numbers, [first])["status"], "duplicate")
+        self.assertIn("숫자만 다르고 본문이 같음", reg.check(numbers, [first])["matches"][0]["reasons"])
+        other = reg.draft_entry(base, {**draft(stem="전지의 두 전극에서 일어나는 반응을 비교하였다.",
+                                               bogi={"ㄱ": "가", "ㄴ": "나", "ㄷ": "다"},
+                                               choices={"①": "ㄱ", "②": "ㄴ"}, instruction="옳은 것은?",
+                                               table=None, design_intent={"purpose": "전지 반응 비교"}), "no": 3})
+        self.assertEqual(reg.check(other, [first])["status"], "unique")
+
+    def test_drafts_get_codes_and_a_repeat_in_the_same_job_is_excluded_then_replaced(self) -> None:
+        models = FakeModels(self.figure_png, repeat_new=True)
+        job = self.run_new(models, n=2)
+        # One prompt asks for 2; the fake repeats the same item → 2nd is a duplicate, then one replacement round.
+        codes = [d["item_code"] for d in job["drafts"]]
+        self.assertEqual(len(set(codes)), len(codes))
+        self.assertTrue(all(c.startswith("AIQ-") for c in codes))
+        statuses = [d["duplicate_check"]["status"] for d in job["drafts"]]
+        self.assertEqual(statuses.count("duplicate"), 1)
+        dup = next(d for d in job["drafts"] if d["duplicate_check"]["status"] == "duplicate")
+        self.assertEqual(dup["duplicate_check"]["matches"][0]["code"], job["drafts"][0]["item_code"])
+        self.assertEqual(dup["verification"]["status"], "pending")  # not sent to Codex
+        kept = [d for d in job["drafts"] if d["duplicate_check"]["status"] != "duplicate"]
+        self.assertEqual(len(kept), 2)
+        self.assertTrue(all(d["verification"]["status"] == "verified" for d in kept))
+        self.assertTrue(any("[대체 생성]" in p for p in models.prompts))
+        self.assertIn("중복 제외 1", job["progress"]["message"])
+        with self.assertRaises(ig.ItemGenerationError):
+            ig.confirm_drafts(self.workspace, job["job_id"], [dup["no"]])
+
+    def test_later_job_sees_earlier_items_in_prompt_and_registry(self) -> None:
+        first = self.run_new(FakeModels(self.figure_png))
+        code = first["drafts"][0]["item_code"]
+        models = FakeModels(self.figure_png, repeat_new=True)
+        second = self.run_new(models)
+        generate_prompt = next(p for p in models.prompts if "새 문항" in p and "[대체 생성]" not in p)
+        self.assertIn("[이미 만든 문항", generate_prompt)
+        self.assertIn(code, generate_prompt)
+        self.assertEqual(second["drafts"][0]["duplicate_check"]["status"], "duplicate")
+        self.assertEqual(second["drafts"][0]["duplicate_check"]["matches"][0]["code"], code)
+
+    def test_confirm_stores_code_and_fingerprint_and_blocks_bank_duplicates(self) -> None:
+        first = self.run_new(FakeModels(self.figure_png))
+        stored = ig.confirm_drafts(self.workspace, first["job_id"], [1])
+        code = stored["results"][0]["item_code"]
+        item_dir = self.workspace / stored["project_id"] / "items" / stored["results"][0]["item_id"]
+        package = json.loads((item_dir / "question.json").read_text(encoding="utf-8"))
+        generation = package["provenance"]["generation"]
+        self.assertEqual(generation["item_code"], code)
+        self.assertEqual(len(generation["fingerprint"]["text_sha256"]), 64)
+        self.assertEqual(ig.validate_package(package, item_dir / "question.json"), [])
+        bank = list_bank_items(self.workspace)
+        self.assertEqual(bank[0]["generation"]["item_code"], code)
+        # A second job whose draft slipped past generation (e.g. created before the bank save) is blocked at confirm.
+        second = self.run_new(FakeModels(self.figure_png))
+        ig.update_job(self.workspace, second["job_id"], lambda j: j["drafts"][0].update(
+            stem=first["drafts"][0]["stem"], duplicate_check={"status": "unique", "matches": []},
+            verification={"status": "verified"}))
+        with self.assertRaises(ig.ItemGenerationError) as caught:
+            ig.confirm_drafts(self.workspace, second["job_id"], [1])
+        self.assertIn(code, str(caught.exception))
+        self.assertEqual(ig.load_job(self.workspace, second["job_id"])["drafts"][0]["duplicate_check"]["status"], "duplicate")
+
+    def test_items_saved_before_registry_get_a_code_from_job_and_draft_number(self) -> None:
+        from app import item_registry as reg
+
+        first = self.run_new(FakeModels(self.figure_png))
+        stored = ig.confirm_drafts(self.workspace, first["job_id"], [1])
+        path = self.workspace / stored["project_id"] / "items" / stored["results"][0]["item_id"] / "question.json"
+        package = json.loads(path.read_text(encoding="utf-8"))
+        for key in ("item_code", "fingerprint", "duplicate_check"):
+            package["provenance"]["generation"].pop(key)
+        path.write_text(json.dumps(package, ensure_ascii=False), encoding="utf-8")
+        entries = reg.bank_entries(self.workspace)
+        self.assertEqual(entries[0]["code"], reg.item_code(first["job_id"], 1))
+        self.assertEqual(ig.generation_summary(package)["item_code"], reg.item_code(first["job_id"], 1))
+
+    def test_bank_comparison_uses_current_content_and_excludes_shared_boilerplate(self):
+        from app import item_registry as reg
+        first = self.run_new(FakeModels(self.figure_png))
+        saved = ig.confirm_drafts(self.workspace, first['job_id'], [1])
+        path = self.workspace / saved['project_id'] / 'items' / saved['results'][0]['item_id'] / 'question.json'
+        package = json.loads(path.read_text('utf-8'))
+        original = reg.draft_entry(first, first['drafts'][0])
+        entries = reg.bank_entries(self.workspace)
+        self.assertEqual(entries[0]['fingerprint']['text_sha256'], original['fingerprint']['text_sha256'])
+        self.assertNotIn(first['drafts'][0]['instruction'], entries[0]['text'])
+        changed = draft(stem='아주 다른 새로운 별의 생성 과정', bogi=None, table=None, choices=None, format='단답형', answer='3')
+        package['content'] = ig.draft_to_content(changed, package['item_id'])
+        ig.atomic_write_json(path, package)
+        now = reg.bank_entries(self.workspace)[0]
+        self.assertEqual(now['fingerprint']['text_sha256'], reg.draft_fingerprint(changed)['text_sha256'])
+        self.assertNotEqual(now['fingerprint']['text_sha256'], original['fingerprint']['text_sha256'])
+
+
 class GuideAndApiTests(LabFixture):
+    def test_topics_and_estimate_routes_return_effective_efforts_without_server(self) -> None:
+        from app.item_generation_routes import handle_item_generation_api
+
+        for scope, author, verify in (("고2-物理学", "high", "xhigh"), ("고2-물리학", "max", "max"),
+                                      ("고2-역학과 에너지", "max", "max"),
+                                      ("고2-전자기와 양자", "high", "xhigh"), ("고1-통합과학2", "high", "high")):
+            with self.subTest(scope=scope):
+                request = self.scoped_request(scope)
+                handler = mock.Mock()
+                handler.app.config.workspace_root = self.workspace
+                handler._read_json.return_value = request
+                handle_item_generation_api(handler, "GET", ["api", "item-generation", "topics"], {"scope": scope})
+                tree = handler._send_json.call_args.args[1]
+                self.assertEqual((tree["claude_effort"], tree["codex_effort"]), (author, verify))
+                handle_item_generation_api(handler, "POST", ["api", "item-generation", "estimate"], {})
+                estimate = handler._send_json.call_args.args[1]["estimate"]
+                self.assertEqual((estimate["claude_effort"], estimate["codex_effort"]), (author, verify))
+                self.assertEqual((estimate["claude_generate"], estimate["codex_verify"]), (2, 1))
+                job = ig.create_job(self.workspace, request)
+                self.assertEqual(job["estimate"], estimate)
+
     def test_guide_rule_is_appended_and_changes_hash(self) -> None:
         (self.lab / "guides").mkdir()
         (self.lab / "guides" / "출제지침.md").write_text("# 지침" + chr(10), encoding="utf-8")
@@ -325,6 +633,7 @@ class GuideAndApiTests(LabFixture):
         with self.assertRaises(ig.ItemGenerationError):
             ig.append_guide_rule("   ")
 
+    @unittest.skipIf(os.environ.get("ASTRA_ITEMGEN_NO_SERVICE_TESTS") == "1", "service starts excluded by scoped test run")
     def test_http_routes_require_session_and_run_job_flow(self) -> None:
         import http.client
         import threading
@@ -333,8 +642,11 @@ class GuideAndApiTests(LabFixture):
 
         allowed = Path(self.temporary.name) / "allowed"
         allowed.mkdir()
-        server = create_server(workspace_root=self.workspace, import_roots=[allowed], port=0, token="itemgen-token")
-        server.app.item_generation_worker.runners = pipeline.Runners(*(lambda m: (m.claude, m.codex))(FakeModels(self.figure_png)))
+        models = FakeModels(self.figure_png)
+        worker_class = pipeline.GenerationWorker
+        with mock.patch('app.item_generation_pipeline.GenerationWorker', side_effect=lambda workspace, **kw: worker_class(
+                workspace, runners=pipeline.Runners(models.claude, models.codex), autostart=False)):
+            server = create_server(workspace_root=self.workspace, import_roots=[allowed], port=0, token="itemgen-token")
         port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -364,6 +676,7 @@ class GuideAndApiTests(LabFixture):
             status, created = request("POST", "/api/item-generation/jobs",
                                       {"scope": "고1-통합과학2", "major": MAJOR, "middle": MIDDLE, "variants": 1, "new": 1})
             self.assertEqual(status, 201, created)
+            server.app.item_generation_worker.run_once()
             for _ in range(100):
                 status, job = request("GET", f"/api/item-generation/jobs/{created['job_id']}")
                 if job["status"] in {"ready", "failed", "partial"}:

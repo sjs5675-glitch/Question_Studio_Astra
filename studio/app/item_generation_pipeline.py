@@ -15,16 +15,19 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .item_generation import (
+    CLAUDE_DEFAULT_EFFORT,
     CHOICE_LABELS,
     ItemGenerationError,
     analyses_for_unit,
     auto_checks,
     blocks_text_for_prompt,
+    claude_effort_for_scope,
     codex_effort_for_scope,
     draft_format_errors,
     grams,
@@ -41,12 +44,14 @@ from .item_generation import (
     _blocks_text,
     _pattern_path,
 )
+from . import item_registry as registry
 from .model import utc_now
+from .item_generation_identity import digest, draft_identity, contributors, independence, safe_path, image_bytes, image_sandbox, receipt_model
 
 CLAUDE_BIN = os.environ.get("ASTRA_ITEMGEN_CLAUDE_BIN", "C:/Users/ExampleUser/.local/bin/claude.exe")
-CODEX_BIN = os.environ.get("ASTRA_ITEMGEN_CODEX_BIN", "C:/Users/ExampleUser/AppData/Local/Programs/nodejs/codex.cmd")
+CODEX_BIN = os.environ.get("ASTRA_ITEMGEN_CODEX_BIN", "C:/Users/ExampleUser/AppData/Local/Programs/nodejs/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe")
 CLAUDE_MODEL = "claude-opus-5-5"
-GENERATE_EFFORT = "high"  # user decision: generation = Opus 5.5 high
+GENERATE_EFFORT = CLAUDE_DEFAULT_EFFORT  # default; authoring selects effort by scope
 CHECK_EFFORT = "medium"  # figure/body comparison is a reading check, not authoring
 CODEX_MODEL = "gpt-6-astra"
 LAB_PYTHON = os.environ.get("ASTRA_ITEMGEN_LAB_PYTHON", "C:/Question_Item_Lab/.venv/Scripts/python.exe")
@@ -54,6 +59,57 @@ BATCH = 5
 
 
 # --------------------------------------------------------------------------- runners
+
+class ProviderFailure(ItemGenerationError):
+    """Safe provider category, never the raw CLI dump or credentials."""
+
+    def __init__(self, provider: str, category: str, usage: dict | None = None):
+        self.provider, self.category, self.usage = provider, category, usage or {}
+        super().__init__(f"{provider}: {category}")
+
+
+class ProviderQuotaExhausted(ProviderFailure):
+    def __init__(self, provider: str, usage: dict | None = None):
+        super().__init__(provider, "subscription_usage_exhausted", usage)
+
+
+def is_quota_exhaustion(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        # Only explicit subscription usage categories, not rate_limit_error/HTTP 429.
+        if value.get("type") in {"usage_limit_reached", "usage_limit_exceeded", "subscription_usage_limit"} \
+                or value.get("code") in {"usage_limit_reached", "usage_limit_exceeded", "subscription_usage_limit"}:
+            return True
+        return any(is_quota_exhaustion(value.get(k)) for k in ("error", "errors", "result", "message"))
+    if isinstance(value, list):
+        return any(is_quota_exhaustion(v) for v in value)
+    text = str(value or "")
+    return bool(re.search(r"you(?:'|’|\u0027)ve hit your (?:(?:weekly|daily|session) )?(?:usage )?limit\b[\s\S]{0,300}\bresets?\b", text, re.I)
+                or re.search(r"\byou have reached your usage limit\b", text, re.I))
+
+
+def _provider_error(provider: str, value: Any, usage: dict | None = None) -> ProviderFailure:
+    if is_quota_exhaustion(value):
+        return ProviderQuotaExhausted(provider, usage)
+    text = json.dumps(value, ensure_ascii=False).lower()
+    category = "cli_failure"
+    for pattern, name in (("unsupported model|model.*not.*supported", "unsupported_model"),
+                          ("auth|unauthorized|credential", "authentication"),
+                          ("429|rate.?limit", "rate_limited"), ("overload|capacity_unavailable", "overloaded"),
+                          ("timeout|timed out", "timeout"), ("network|connection", "network"),
+                          ("policy|denied", "policy_denied")):
+        if re.search(pattern, text):
+            category = name
+            break
+    return ProviderFailure(provider, category, usage)
+
+
+def _subprocess(provider: str, cmd: list[str], **kwargs):
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise ProviderFailure(provider, "timeout") from exc
+    except OSError as exc:
+        raise ProviderFailure(provider, "cli_unavailable") from exc
 
 def _json_object(text: str) -> Any:
     text = (text or "").strip()
@@ -65,30 +121,67 @@ def _json_object(text: str) -> Any:
     return json.loads(text[start:end + 1])
 
 
-def _scratch_dir(prefix: str) -> Path:
+def _scratch_dir(prefix: str, parent: Path | None = None) -> Path:
     # Python 3.13 mkdtemp applies an owner-only ACL on Windows that the Codex
     # sandbox account cannot read; a plain mkdir inherits normal permissions.
-    path = Path(tempfile.gettempdir()) / f"{prefix}-{os.getpid()}-{threading.get_ident()}-{os.urandom(5).hex()}"
+    base = parent or Path(tempfile.gettempdir())
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"{prefix}-{os.getpid()}-{threading.get_ident()}-{os.urandom(5).hex()}"
     os.mkdir(path)
     return path
 
 
 def real_claude(prompt: str, *, effort: str, add_dirs: list[Path]) -> tuple[str, dict[str, Any]]:
     cmd = [CLAUDE_BIN, "-p", "--model", CLAUDE_MODEL, "--effort", effort, "--output-format", "json",
-           "--tools", "Read", "--allowedTools", "Read", "--no-session-persistence"]
+           "--restricted", "--safe-mode", "--permission-mode", "dontAsk", "--tools", "Read",
+           "--allowedTools", "Read(./image-*.png)" if len(add_dirs) == 1 and add_dirs[0].name.startswith('blind-') else "Read",
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disallowedTools", "mcp__*",
+           "--no-session-persistence"]
     for directory in add_dirs:
         cmd += ["--add-dir", str(directory)]
     started = time.time()
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          cwd=str(lab_root()), timeout=1800)
-    if proc.returncode != 0:
-        raise ItemGenerationError(f"Claude 실행 실패(rc={proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}")
-    envelope = json.loads(proc.stdout)
-    if envelope.get("is_error"):
-        raise ItemGenerationError(f"Claude 오류: {str(envelope.get('result'))[:400]}")
-    usage = {"model": CLAUDE_MODEL, "effort": effort, "usage": envelope.get("usage"),
+    proc = _subprocess("claude", cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          cwd=str(add_dirs[0] if add_dirs else lab_root()), timeout=1800)
+    try:
+        envelope = json.loads(proc.stdout)
+        if not isinstance(envelope, dict):
+            envelope = {}
+    except (ValueError, TypeError):
+        envelope = {}
+    model_usage = envelope.get("modelUsage") or {}
+    actual = envelope.get("model") or (next(iter(model_usage)) if len(model_usage) == 1 else None)
+    usage = {"model": actual or CLAUDE_MODEL, "requested_model": CLAUDE_MODEL, "actual_model": actual,
+             "model_confirmed": bool(actual), "effort": effort, "usage": envelope.get("usage"),
+             "model_usage": model_usage,
              "duration_s": round(time.time() - started, 1)}
+    if proc.returncode != 0 or envelope.get("is_error") or is_quota_exhaustion(envelope):
+        raise _provider_error("claude", [envelope, proc.stdout, proc.stderr], usage)
+    if not envelope or not isinstance(envelope.get("result"), str):
+        raise ProviderFailure("claude", "invalid_envelope", usage)
     return str(envelope.get("result") or ""), usage
+
+
+def _codex_startup_receipt(stderr: str) -> dict:
+    # The installed CLI's stderr starts with its version and delimited config.
+    # Never search for model/effort in the user prompt or assistant's text.
+    stderr = (stderr or '').replace('\r\n', '\n')
+    match = re.match(r'\AOpenAI Codex v[0-9]+\.[0-9]+\.[0-9]+[^\r\n]*\r?\n--------\r?\n'
+                     r'(?P<header>(?:(?!--------|user$|assistant$)[^\r\n]*\r?\n)*)--------\r?\n', stderr or '')
+    if not match:
+        return {}
+    config = match['header']
+    if any(line.strip() in {'user', 'assistant'} for line in config.splitlines()):
+        return {}
+    models = re.findall(r'^model: ([^\r\n]+)$', config, re.M)
+    efforts = re.findall(r'^reasoning effort: ([^\r\n]+)$', config, re.M)
+    if len(models) != 1 or len(efforts) != 1:
+        return {}
+    receipt = {'cli_selected_model': models[0].strip(), 'cli_selected_effort': efforts[0].strip(),
+               'model_evidence': 'cli_startup_receipt'}
+    footer = re.search(r'(?:^|\n)tokens used\r?\n([0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)\s*\Z', stderr)
+    if footer:
+        receipt['usage'] = {'total_tokens': int(footer[1].replace(',', ''))}
+    return receipt
 
 
 def real_codex(prompt: str, *, effort: str, images: list[Path], write: bool = False,
@@ -96,21 +189,63 @@ def real_codex(prompt: str, *, effort: str, images: list[Path], write: bool = Fa
     own = workdir is None
     workdir = workdir or _scratch_dir("astra-itemgen-codex")
     try:
-        last = workdir / "_last.txt"
+        last = workdir / f"_itemgen-{uuid.uuid4().hex}.txt"
         cmd = [CODEX_BIN, "exec", "-m", CODEX_MODEL, "-c", f'model_reasoning_effort="{effort}"',
                "-s", "workspace-write" if write else "read-only", "--skip-git-repo-check", "--ephemeral",
                "-C", str(workdir), "-o", str(last)]
+        if not write:
+            # Read-only shell sandbox is not a confidentiality boundary. Text /
+            # blind reviewers need no tools: attach pixels directly and disable
+            # ambient instructions, memory, plugins and file/command capabilities.
+            cmd += ['--ignore-user-config', '-c', 'project_doc_max_bytes=0', '-c', 'web_search="disabled"',
+                    '-c', 'approval_policy="never"', '-c', 'mcp_servers={}', '-c', 'plugins={}',
+                    '-c', 'features.skip_host_skill_discovery=true']
+            for feature in ('shell_tool', 'unified_exec', 'view_image', 'apps', 'multi_agent', 'multi_agent_v2',
+                'hooks', 'memories', 'goals', 'shell_snapshot', 'plugins', 'remote_plugin', 'skill_search',
+                'browser_use', 'computer_use', 'code_mode', 'code_mode_host', 'image_generation'):
+                cmd += ['--disable', feature]
         for image in images:
             cmd += ["-i", str(image)]
         cmd.append("-")
         started = time.time()
-        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        proc = _subprocess("codex", cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               cwd=str(workdir), timeout=timeout)
-        if proc.returncode != 0 and not last.exists():
-            raise ItemGenerationError(f"Codex 실행 실패(rc={proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}")
+        events = []
+        for line in (proc.stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+                if isinstance(event, dict):
+                    events.append(event)
+            except ValueError:
+                pass
+        receipt = _codex_startup_receipt(proc.stderr)
+        selected = receipt.get('cli_selected_model')
+        usage = {"model": selected or CODEX_MODEL, "requested_model": CODEX_MODEL, "actual_model": None,
+                 "model_confirmed": False, "effort": effort, "usage": None, **receipt,
+                 "duration_s": round(time.time() - started, 1)}
+        # Structured failures remain errors even in the text protocol; JSONL
+        # model fields are not a receipt on this entry point. No paid retry.
+        cli_prefix = re.split(r'(?m)^(?:user|assistant)\r?$', proc.stderr or '', maxsplit=1)[0]
+        text_error = re.search(r'(?im)^\s*(?:error|fatal)\s*:', cli_prefix + '\n' + (proc.stdout or ''))
+        if proc.returncode != 0 or text_error or any(e.get("type") in {"error", "turn.failed"} or e.get('is_error') for e in events) \
+                or is_quota_exhaustion([events, proc.stdout, proc.stderr]):
+            raise _provider_error("codex", [events, proc.stdout, proc.stderr], usage)
         text = last.read_text(encoding="utf-8") if last.exists() else ""
-        return text, {"model": CODEX_MODEL, "effort": effort, "duration_s": round(time.time() - started, 1)}
+        if not text.strip():
+            raise ProviderFailure("codex", "missing_output", usage)
+        if is_quota_exhaustion(text):
+            raise ProviderQuotaExhausted('codex', usage)
+        if not selected or not receipt.get('cli_selected_effort'):
+            raise ProviderFailure('codex', 'cli_receipt_unknown', usage)
+        if selected != CODEX_MODEL:
+            raise ProviderFailure('codex', 'cli_model_mismatch', usage)
+        if receipt['cli_selected_effort'] != effort:
+            raise ProviderFailure('codex', 'cli_effort_mismatch', usage)
+        usage['model_confirmed'] = True
+        return text, usage
     finally:
+        if 'last' in locals() and last.is_file():
+            last.unlink()
         if own:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -203,6 +338,11 @@ NEW_TASK = """
 
 [문항 분석 요약]
 {digests}
+"""
+
+REPLACE_TASK = """
+[대체 생성] 앞서 만든 문항 일부가 이미 있는 문항과 겹쳐 제외되었다. 위 지시의 문항 수는 무시하고,
+아래 [이미 만든 문항] 목록과 상황·자료·풀이 구조가 모두 다른 새 문항을 정확히 {n}개만 만든다.
 """
 
 REVISE_TASK = """
@@ -350,7 +490,7 @@ def build_prompts(job: Mapping[str, Any], root: Path | None = None) -> list[tupl
 
 
 def problem_text(draft: Mapping[str, Any]) -> str:
-    lines = [f"### 문항 {draft['no']} ({draft.get('format')})", str(draft.get("stem") or "")]
+    lines = [f"### 문항 {draft['no']}", str(draft.get("stem") or "")]
     table = draft.get("table")
     if isinstance(table, Mapping):
         lines.append("[표]")
@@ -358,7 +498,7 @@ def problem_text(draft: Mapping[str, Any]) -> str:
         lines += ["| " + " | ".join(map(str, row)) + " |" for row in table.get("rows") or []]
     figure = draft.get("figure")
     if isinstance(figure, Mapping) and figure.get("file"):
-        lines.append(f"[그림: 첨부 이미지 {Path(str(figure['file'])).name}]")
+        lines.append("[그림: 첨부 이미지]")
     lines.append(str(draft.get("instruction") or ""))
     if draft.get("bogi"):
         lines.append("[보기]")
@@ -379,7 +519,7 @@ def normalize_answer(value: Any) -> str:
 
 
 def verification_status(draft: Mapping[str, Any], result: Mapping[str, Any] | None) -> str:
-    if not result:
+    if not result or not isinstance(result.get('answer'), str) or not result['answer'].strip():
         return "not_solved"
     if result.get("issue"):
         return "item_issue"
@@ -401,6 +541,29 @@ def _recheck(draft: dict[str, Any], unit_concepts: list[str], corpus, printed) -
     draft["auto_checks"] = auto_checks(draft, allowed_concepts=unit_concepts, corpus=corpus, printed=printed)
 
 
+def is_duplicate(draft: Mapping[str, Any]) -> bool:
+    return (draft.get("duplicate_check") or {}).get("status") == "duplicate"
+
+
+def _job_index(workspace: Path, job: Mapping[str, Any], *, skip_no: int | None = None) -> list[dict[str, Any]]:
+    """Registry index: bank + other jobs + this job's kept drafts (except ``skip_no``)."""
+
+    index = registry.build_index(workspace, exclude_job=str(job["job_id"]))
+    index += [registry.draft_entry(job, d) for d in job.get("drafts") or []
+              if d.get("no") != skip_no and not d.get("confirmed_item_id") and not d.get("discarded") and not is_duplicate(d)]
+    return index
+
+
+def _registry_check(job: Mapping[str, Any], draft: dict[str, Any], index: list[dict[str, Any]]) -> dict[str, Any]:
+    """Give the draft its stable code and fingerprint and compare it with the index."""
+
+    draft["item_code"] = draft.get("item_code") or registry.item_code(job["job_id"], draft["no"])
+    entry = registry.draft_entry(job, draft)
+    draft["fingerprint"] = entry["fingerprint"]
+    draft["duplicate_check"] = {**registry.check(entry, index), "at": utc_now()}
+    return entry
+
+
 def _progress(workspace: Path, job_id: str, step: str, message: str, **extra: Any) -> dict[str, Any]:
     def change(job: dict[str, Any]) -> None:
         job["progress"] = {"step": step, "message": message, "at": utc_now()}
@@ -409,7 +572,10 @@ def _progress(workspace: Path, job_id: str, step: str, message: str, **extra: An
 
 
 def _clean_draft(raw: Mapping[str, Any], kind: str) -> dict[str, Any]:
-    draft = {k: v for k, v in dict(raw).items() if k not in {"no", "auto_checks", "verification", "confirmed_item_id"}}
+    fields = {'kind', 'source_item_id', 'source_printed_number', 'reference_item_ids', 'variant_type', 'difficulty',
+              'format', 'scope_concepts', 'concepts', 'stem', 'table', 'figure', 'instruction', 'bogi', 'choices',
+              'answer', 'solution', 'design_intent', 'distractor_intents', 'unique_answer_rationale', 'calc_checks'}
+    draft = {k: v for k, v in dict(raw).items() if k in fields}
     draft.setdefault("kind", kind)
     if isinstance(draft.get("figure"), Mapping):
         draft["figure"] = {k: v for k, v in draft["figure"].items() if k in {"method", "alt_text", "spec"}}
@@ -418,51 +584,184 @@ def _clean_draft(raw: Mapping[str, Any], kind: str) -> dict[str, Any]:
     return draft
 
 
-def step_generate(workspace: Path, job: Mapping[str, Any], runners: Runners, root: Path) -> None:
+def _author_call(workspace: Path, job: Mapping[str, Any], runners: Runners, prompt: str,
+                 *, step: str, effort: str, images: list[Path] | None = None,
+                 add_dirs: list[Path] | None = None) -> tuple[str, dict]:
+    current = load_job(workspace, job["job_id"])
+    if not current.get("claude_exhausted"):
+        try:
+            text, usage = runners.claude(prompt, effort=effort, add_dirs=add_dirs or [workspace])
+            usage = {**usage, "model": usage.get("actual_model") or usage.get("model") or CLAUDE_MODEL,
+                          "requested_model": CLAUDE_MODEL, "effort": effort}
+            if receipt_model(usage) and receipt_model(usage) != CLAUDE_MODEL:
+                raise ProviderFailure('claude', 'actual_model_mismatch', usage)
+            update_job(workspace, job['job_id'], lambda j: j.setdefault('usage', []).append({'step': step, **usage}))
+            return text, usage
+        except ProviderQuotaExhausted as exc:
+            if exc.provider != "claude":
+                raise
+            replacement = CHECK_EFFORT if step == "figure_check" else codex_effort_for_scope(job["request"]["scope"])
+            def fallback(j):
+                j["claude_exhausted"] = True
+                j.setdefault("fallback_transitions", []).append({
+                    "at": utc_now(), "category": exc.category, "reason": "Claude subscription usage exhausted",
+                    "step": step, "original_model": CLAUDE_MODEL, "original_effort": effort,
+                    "replacement_model": CODEX_MODEL, "replacement_effort": replacement})
+                j.setdefault("usage", []).append({"step": step, "error_category": exc.category, **exc.usage})
+            update_job(workspace, job["job_id"], fallback)
+    effort = CHECK_EFFORT if step == "figure_check" else codex_effort_for_scope(job["request"]["scope"])
+    text, usage = runners.codex(prompt, effort=effort, images=images or [])
+    usage = {**usage, "model": usage.get("actual_model") or usage.get("model") or CODEX_MODEL,
+                  "requested_model": CODEX_MODEL, "effort": effort}
+    if receipt_model(usage) and receipt_model(usage) != CODEX_MODEL:
+        raise ProviderFailure('codex', 'actual_model_mismatch', usage)
+    update_job(workspace, job['job_id'], lambda j: j.setdefault('usage', []).append({'step': step, **usage}))
+    return text, usage
+
+
+def _authorship(usage: Mapping[str, Any]) -> dict:
+    model = receipt_model(usage) or usage.get("model") or "unknown"
+    return {"generator_model": model, "generator_effort": usage.get("effort"),
+            "requested_model": usage.get("requested_model"), "actual_model": usage.get("actual_model"),
+            **{k: usage[k] for k in ('cli_selected_model', 'cli_selected_effort', 'model_evidence') if k in usage},
+            "model_confirmed": usage.get("model_confirmed", bool(usage.get("actual_model"))),
+            "contributors": [model if usage.get("model_confirmed", bool(usage.get("actual_model"))) else "unknown"]}
+
+
+def _validate_items(text: str, kind: str, maximum: int) -> list[dict]:
+    payload = _json_object(text)
+    items = payload.get("items") if isinstance(payload, Mapping) else None
+    if not isinstance(items, list) or not items or len(items) > maximum:
+        raise ItemGenerationError("invalid_items_count")
+    cleaned = []
+    for raw in items:
+        if not isinstance(raw, Mapping) or raw.get("kind") != kind:
+            raise ItemGenerationError("invalid_item_kind")
+        item = _clean_draft(raw, kind)
+        errors = draft_format_errors(item)
+        if errors:
+            raise ItemGenerationError("invalid_item_payload: " + errors[0])
+        cleaned.append(item)
+    return cleaned
+
+
+def _ensure_plan(workspace: Path, job: Mapping[str, Any], root: Path) -> dict:
+    if job.get("generation_plan"):
+        return dict(job)
     prompts = build_prompts(job, root)
+    if sum(n for _, _, n in prompts) != int(job["request"]["variants"]) + int(job["request"]["new"]):
+        raise ItemGenerationError("source_count_short: not enough variant sources")
+    slots = []
+    consumed: set[int] = set()
+    for number, (kind, prompt, expected) in enumerate(prompts):
+        sources = re.findall(r"### 원문항 item_id=(\S+)", prompt) if kind == "variant" else []
+        completed = []
+        for draft in job["drafts"]:
+            if draft["no"] in consumed or draft.get("kind") != kind or draft.get("replacement_of"):
+                continue
+            if sources and draft.get("source_item_id") not in sources:
+                continue
+            if len(completed) < expected:
+                consumed.add(draft["no"])
+                completed.append(draft["no"])
+        slots.append({"slot": number, "kind": kind, "prompt": prompt, "expected": expected,
+                      "source_ids": sources, "completed_nos": completed, "replacement": False})
+    # Unmapped historical drafts are never removed or regenerated.
+    if any(not d.get("replacement_of") and d["no"] not in consumed for d in job["drafts"]):
+        raise ItemGenerationError("legacy_plan_conflict: saved drafts exceed or differ from request")
+    return update_job(workspace, job["job_id"], lambda j: j.update(generation_plan=slots))
+
+
+def step_generate(workspace: Path, job: Mapping[str, Any], runners: Runners, root: Path) -> None:
+    job = _ensure_plan(workspace, job, root)
     unit = resolve_unit(job["request"]["scope"], job["request"]["major"], job["request"]["middle"], root)
     corpus, printed = _corpus(root)
     _, guide_sha = guides_text(job["request"]["scope"].partition("-")[2], root)
-    for index, (kind, prompt, expected) in enumerate(prompts, 1):
-        _progress(workspace, job["job_id"], "generate", f"문항 생성 중 ({index}/{len(prompts)}, {kind})")
-        last_error = None
-        for attempt in (1, 2):
-            try:
-                text, usage = runners.claude(prompt, effort=GENERATE_EFFORT, add_dirs=[workspace])
-                items = _json_object(text).get("items")
-                if not isinstance(items, list) or not items:
-                    raise ItemGenerationError("생성 결과에 items가 없습니다.")
-                break
-            except Exception as exc:  # noqa: BLE001 - recorded on the job
-                last_error, items, usage = exc, None, None
-        if items is None:
-            raise ItemGenerationError(f"문항 생성 실패: {last_error}")
-
-        def change(current: dict[str, Any]) -> None:
-            for raw in items[:expected]:
-                draft = _clean_draft(raw, kind)
-                draft["no"] = len(current["drafts"]) + 1
-                draft["generator_model"] = CLAUDE_MODEL
-                draft["generator_effort"] = GENERATE_EFFORT
+    effort = claude_effort_for_scope(job["request"]["scope"])
+    slot_number = 0
+    while True:
+        current = load_job(workspace, job["job_id"])
+        if slot_number >= len(current["generation_plan"]):
+            break
+        slot = current["generation_plan"][slot_number]
+        missing = slot["expected"] - len(slot["completed_nos"])
+        if missing <= 0:
+            slot_number += 1
+            continue
+        prompt = slot["prompt"]
+        pending_sources = list(slot.get("source_ids") or [])
+        if pending_sources:
+            by_no = {d["no"]: d for d in current["drafts"]}
+            done_sources = {by_no[n].get("source_item_id") for n in slot["completed_nos"]}
+            pending_sources = [s for s in pending_sources if s not in done_sources]
+            # Whitelist only missing source sections; old completed variant content is not re-requested.
+            sections = re.split(r"(?=### 원문항 item_id=)", prompt)
+            prompt = sections[0] + "".join(s for s in sections[1:]
+                if re.match(r"### 원문항 item_id=(\S+)", s).group(1) in pending_sources)
+        prompt += f"\n[REQUEST_COUNT={missing}]\n앞 문항 수 지시 대신 남은 {missing}개만 출력한다. kind={slot['kind']}."
+        if pending_sources:
+            prompt += "\nsource_item_id는 다음 목록에서 각각 한 번만: " + json.dumps(pending_sources)
+        prompt += registry.avoid_section(_job_index(workspace, current),
+            scope=job["request"]["scope"], middle=job["request"]["middle"])
+        _progress(workspace, job["job_id"], "generate", f"문항 생성 중 (slot {slot_number + 1}, 남은 {missing}개)")
+        images = []
+        for source in pending_sources:
+            for asset in (lab_inputs(root).get(source) or {}).get("assets") or []:
+                if isinstance(asset, Mapping) and asset.get("abs_path"):
+                    images.append(Path(asset["abs_path"]))
+        text, usage = _author_call(workspace, job, runners, prompt, step="generate", effort=effort, images=images)
+        items = _validate_items(text, slot["kind"], missing)
+        if pending_sources:
+            lineage = [d.get("source_item_id") for d in items]
+            if len(set(lineage)) != len(lineage) or not set(lineage) <= set(pending_sources):
+                raise ItemGenerationError("invalid_variant_lineage")
+        def save(j):
+            plan = j["generation_plan"][slot_number]
+            index = _job_index(workspace, j)
+            duplicates = []
+            for raw in items:
+                draft = {**raw, **_authorship(usage)}
+                draft["no"] = max((d["no"] for d in j["drafts"]), default=0) + 1
+                draft["content_revision"] = 1
                 draft["verification"] = {"status": "pending"}
+                if slot.get("replacement"):
+                    original_no = slot["replacement_of"][len(plan["completed_nos"])]
+                    draft["replacement_of"] = original_no
+                    next(d for d in j["drafts"] if d["no"] == original_no)["replaced_by"] = draft["no"]
                 _recheck(draft, unit["concepts"], corpus, printed)
-                current["drafts"].append(draft)
-            current["usage"].append({"step": "generate", "kind": kind, **(usage or {})})
-            current["guide_sha256"] = guide_sha
-            current["generator_model"] = CLAUDE_MODEL
-            current["generator_effort"] = GENERATE_EFFORT
-        update_job(workspace, job["job_id"], change)
+                entry = _registry_check(j, draft, index)
+                if is_duplicate(draft):
+                    duplicates.append(draft["no"])
+                else:
+                    index.append(entry)
+                j["drafts"].append(draft)
+                plan["completed_nos"].append(draft["no"])
+            if duplicates and slot["kind"] == "new" and not slot.get("replacement"):
+                j["generation_plan"].append({"slot": len(j["generation_plan"]), "kind": "new",
+                    "prompt": slot["prompt"] + REPLACE_TASK.format(n=len(duplicates)), "expected": len(duplicates),
+                    "source_ids": [], "completed_nos": [], "replacement": True, "replacement_of": duplicates})
+            plan['last_receipt'] = {'model': usage['model'], 'effort': usage['effort'], 'at': utc_now(),
+                'retry': slot.get('replacement', False), 'duplicates': len(duplicates)}
+            j["guide_sha256"] = guide_sha
+            # This is original job metadata only; draft/version authorship is authoritative.
+            j.setdefault("generator_model", usage["model"])
+            j.setdefault("generator_effort", usage["effort"])
+        update_job(workspace, job["job_id"], save)
+        if len(items) < missing:
+            raise ItemGenerationError(f"generation_output_short: expected {missing}, received {len(items)}")
+        slot_number += 1
 
 
 def _figure_attempt(workspace: Path, job_id: str, draft: Mapping[str, Any], method: str, runners: Runners) -> Path:
     spec = json.dumps((draft.get("figure") or {}).get("spec") or {}, ensure_ascii=False, indent=1)
     stem = problem_text({**draft, "figure": None})
-    workdir = _scratch_dir("astra-itemgen-figure")
+    workdir = _scratch_dir("astra-itemgen-figure", job_dir(workspace, job_id) / '.scratch')
     try:
         prompt = (FIGURE_CODE_PROMPT.format(spec=spec, stem=stem, python=LAB_PYTHON) if method == "code"
                   else FIGURE_IMAGE_PROMPT.format(spec=spec, stem=stem))
-        runners.codex(prompt, effort="medium", images=[], write=True, workdir=workdir, timeout=900)
-        output = workdir / "output.png"
+        _, usage = runners.codex(prompt, effort="medium", images=[], write=True, workdir=workdir, timeout=900)
+        update_job(workspace, job_id, lambda j: j.setdefault('usage', []).append({'step': 'figure', 'no': draft['no'], **usage}))
+        output = safe_path(workdir, 'output.png')
         if output.is_symlink() or not output.is_file() or output.stat().st_size < 200:
             raise ItemGenerationError("그림 파일이 만들어지지 않았습니다.")
         from PIL import Image
@@ -482,17 +781,19 @@ def _figure_attempt(workspace: Path, job_id: str, draft: Mapping[str, Any], meth
 
 
 def step_figures(workspace: Path, job: Mapping[str, Any], runners: Runners) -> None:
-    todo = [d for d in job["drafts"] if not d.get("discarded") and isinstance(d.get("figure"), Mapping)
-            and not d["figure"].get("file") and not d.get("confirmed_item_id")]
+    todo = [d for d in job["drafts"] if not d.get("discarded") and not is_duplicate(d)
+            and isinstance(d.get("figure"), Mapping) and not d["figure"].get("file") and not d.get("confirmed_item_id")]
     for index, draft in enumerate(todo, 1):
         _progress(workspace, job["job_id"], "figure", f"그림 만드는 중 ({index}/{len(todo)}, {draft['no']}번)")
         preferred = draft["figure"].get("method") if draft["figure"].get("method") in {"code", "codex_image"} else "code"
-        order = [preferred] + [m for m in ("code", "codex_image") if m != preferred]
+        order = [preferred]
         result, errors = None, []
         for method in order:
             try:
                 result = (_figure_attempt(workspace, job["job_id"], draft, method, runners), method)
                 break
+            except ProviderQuotaExhausted:
+                raise
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{method}: {exc}")
 
@@ -501,90 +802,137 @@ def step_figures(workspace: Path, job: Mapping[str, Any], runners: Runners) -> N
             if result:
                 target["figure"]["file"] = str(result[0].relative_to(job_dir(workspace, current["job_id"]))).replace("\\", "/")
                 target["figure"]["method"] = result[1]
+                from .model import sha256_file
+                target['figure']['sha256'] = sha256_file(result[0])
                 target["figure"]["check"] = {"status": "pending"}
             target["figure"]["errors"] = errors
             current["usage"].append({"step": "figure", "no": no, "ok": bool(result), "errors": errors})
         update_job(workspace, job["job_id"], change)
+        if result is None:
+            raise ItemGenerationError('figure_failed: ' + ' / '.join(errors))
+
+
+def _stage_current(draft: Mapping[str, Any], base: Path, record: Mapping[str, Any]) -> bool:
+    identity = record.get("identity")
+    if not identity:
+        # Legacy receipts remain historical. Preserve untouched drafts during
+        # another draft's revision; explicit retry marks these stages pending.
+        return not draft.get('content_revision') and not draft.get('edited_by_user') \
+            and not (draft.get('figure') or {}).get('hash_observation')
+    try:
+        return identity == draft_identity(draft, base)
+    except ItemGenerationError:
+        return False
+
+
+def _result_map(text: str, numbers: set[int], *, figure: bool = False) -> dict:
+    payload = _json_object(text)
+    rows = payload.get("results") if isinstance(payload, Mapping) else None
+    if not isinstance(rows, list):
+        raise ItemGenerationError("invalid_results")
+    result = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or type(row.get("no")) is not int or row["no"] not in numbers or row["no"] in result:
+            raise ItemGenerationError("invalid_result_number")
+        if figure:
+            if type(row.get("ok")) is not bool or not isinstance(row.get("issues"), list):
+                raise ItemGenerationError("invalid_figure_result")
+        elif not isinstance(row.get("answer"), str) or not row["answer"].strip() or not isinstance(row.get("reasoning"), str):
+            raise ItemGenerationError("invalid_blind_result")
+        result[row["no"]] = dict(row)
+    if set(result) != numbers:
+        raise ItemGenerationError("missing_results")
+    return result
+
+
+def _draft_images(drafts: list[dict], base: Path) -> list[bytes]:
+    images = []
+    for d in drafts:
+        f = d.get("figure")
+        if isinstance(f, Mapping) and f.get("file"):
+            data, _ = image_bytes(base, f["file"], f.get("sha256"))
+            images.append(data)
+    return images
 
 
 def step_figure_check(workspace: Path, job: Mapping[str, Any], runners: Runners) -> None:
-    todo = [d for d in job["drafts"] if not d.get("discarded") and isinstance(d.get("figure"), Mapping)
-            and d["figure"].get("file") and (d["figure"].get("check") or {}).get("status") in (None, "pending")]
-    if not todo:
-        return
-    _progress(workspace, job["job_id"], "figure_check", f"그림·본문 대조 중 ({len(todo)}개)")
     base = job_dir(workspace, job["job_id"])
-    entries = "\n\n".join(
-        f"### 문항 {d['no']}\n[그림 파일] {base / d['figure']['file']}\n[그림 명세] "
-        + json.dumps(d["figure"].get("spec"), ensure_ascii=False) + "\n" + problem_text({**d, "figure": None})
-        for d in todo)
-    try:
-        text, usage = runners.claude(FIGURE_CHECK_PROMPT.format(entries=entries), effort=CHECK_EFFORT, add_dirs=[base])
-        results = {int(r["no"]): r for r in _json_object(text).get("results") or [] if str(r.get("no", "")).isdigit()}
-        error = None
-    except Exception as exc:  # noqa: BLE001
-        results, usage, error = {}, None, str(exc)
-
-    def change(current: dict[str, Any]) -> None:
-        for draft in current["drafts"]:
-            if draft["no"] not in {d["no"] for d in todo}:
-                continue
-            result = results.get(draft["no"])
-            if error or not result:
-                draft["figure"]["check"] = {"status": "error", "error": error or "판정 결과 없음", "at": utc_now()}
-            else:
-                draft["figure"]["check"] = {"status": "ok" if result.get("ok") else "mismatch",
-                                            "issues": [str(x) for x in result.get("issues") or []],
-                                            "model": CLAUDE_MODEL, "effort": CHECK_EFFORT, "at": utc_now()}
-            draft.setdefault("auto_checks", {})["figure_ok"] = draft["figure"]["check"]["status"] == "ok"
-        current["usage"].append({"step": "figure_check", **(usage or {}), "error": error})
-    update_job(workspace, job["job_id"], change)
+    todo = [d for d in job["drafts"] if not d.get("discarded") and not is_duplicate(d)
+            and not d.get("confirmed_item_id") and isinstance(d.get("figure"), Mapping) and d["figure"].get("file")
+            and ((d["figure"].get("check") or {}).get("status") in (None, "pending", "error")
+                 or not _stage_current(d, base, d["figure"].get("check") or {}))]
+    # One receipt per image comparison lets quota resume only unfinished work.
+    for draft in todo:
+        _progress(workspace, job["job_id"], "figure_check", f"그림·본문 대조 중 ({draft['no']}번)")
+        identity = draft_identity(draft, base)
+        with image_sandbox(base / ".scratch", _draft_images([draft], base)) as (sandbox, images):
+            entries = (f"[그림 파일] {images[0]}\n[그림 명세] "
+                + json.dumps(draft["figure"].get("spec"), ensure_ascii=False)
+                + "\n" + problem_text({**draft, "figure": None}))
+            text, usage = _author_call(workspace, job, runners, FIGURE_CHECK_PROMPT.format(entries=entries),
+                step="figure_check", effort=CHECK_EFFORT, images=images, add_dirs=[sandbox])
+            result = _result_map(text, {draft["no"]}, figure=True)[draft["no"]]
+        def save(j):
+            target = next(d for d in j["drafts"] if d["no"] == draft["no"])
+            if draft_identity(target, base) != identity:
+                raise ItemGenerationError("figure_check_stale")
+            target["figure"]["check"] = {"status": "ok" if result["ok"] else "mismatch",
+                "issues": [str(x) for x in result["issues"]], "model": usage["model"],
+                "requested_model": usage.get("requested_model"), "actual_model": usage.get("actual_model"),
+                **{k: usage[k] for k in ('cli_selected_model', 'cli_selected_effort', 'model_evidence', 'model_confirmed') if k in usage},
+                "effort": CHECK_EFFORT, "at": utc_now(), "identity": identity}
+            target.setdefault("auto_checks", {})["figure_ok"] = result["ok"]
+        update_job(workspace, job["job_id"], save)
 
 
 def step_verify(workspace: Path, job: Mapping[str, Any], runners: Runners) -> None:
-    todo = [d for d in job["drafts"] if not d.get("discarded") and not d.get("confirmed_item_id")
-            and (d.get("verification") or {}).get("status") in (None, "pending", "error")
+    base = job_dir(workspace, job["job_id"])
+    todo = [d for d in job["drafts"] if not d.get("discarded") and not d.get("confirmed_item_id") and not is_duplicate(d)
+            and ((d.get("verification") or {}).get("status") in (None, "pending", "error", "not_solved")
+                 or not _stage_current(d, base, d.get("verification") or {}))
             and not (d.get("auto_checks") or {}).get("format_errors")]
     scope = job["request"]["scope"]
     grade, _, subject = scope.partition("-")
     effort = codex_effort_for_scope(scope)
-    base = job_dir(workspace, job["job_id"])
+    exclusions = load_scope(scope).get("excluded_notes") or []
     for start in range(0, len(todo), BATCH):
         chunk = todo[start:start + BATCH]
-        _progress(workspace, job["job_id"], "verify", f"Codex 독립 검증 중 ({start + len(chunk)}/{len(todo)}, {effort})")
-        images = [base / d["figure"]["file"] for d in chunk if isinstance(d.get("figure"), Mapping) and d["figure"].get("file")]
+        _progress(workspace, job["job_id"], "verify", f"Codex 블라인드 검산 중 ({start + len(chunk)}/{len(todo)}, {effort})")
+        identities = {d["no"]: draft_identity(d, base) for d in chunk}
         prompt = VERIFY_PROMPT.format(grade=grade, subject=subject, problems="\n\n".join(problem_text(d) for d in chunk))
-        try:
-            text, usage = runners.codex(prompt, effort=effort, images=images)
-            results = {int(r["no"]): r for r in _json_object(text).get("results") or [] if str(r.get("no", "")).isdigit()}
-            error = None
-        except Exception as exc:  # noqa: BLE001
-            results, usage, error = {}, None, str(exc)
-
-        def change(current: dict[str, Any], chunk=chunk, results=results, error=error, usage=usage) -> None:
-            numbers = {d["no"] for d in chunk}
-            for draft in current["drafts"]:
-                if draft["no"] not in numbers:
+        prompt += "\n범위 제외: " + json.dumps(exclusions, ensure_ascii=False)
+        with image_sandbox(base / ".scratch", _draft_images(chunk, base)) as (sandbox, images):
+            text, usage = runners.codex(prompt, effort=effort, images=images, workdir=sandbox)
+            update_job(workspace, job['job_id'], lambda j: j.setdefault('usage', []).append({'step': 'verify', 'nos': [d['no'] for d in chunk], **usage}))
+            results = _result_map(text, {d["no"] for d in chunk})
+        def save(j):
+            for target in j["drafts"]:
+                if target["no"] not in results:
                     continue
-                result = results.get(draft["no"])
-                record = {"model": CODEX_MODEL, "effort": effort, "at": utc_now(), "blind": True}
-                if error:
-                    record.update(status="error", error=error[:600])
-                else:
-                    record.update(status=verification_status(draft, result),
-                                  verifier_answer=(result or {}).get("answer"),
-                                  verifier_reasoning=(result or {}).get("reasoning"),
-                                  verifier_issue=(result or {}).get("issue"),
-                                  verifier_bogi=(result or {}).get("bogi_judgement"))
-                draft["verification"] = record
-            current["usage"].append({"step": "verify", "nos": sorted(numbers), **(usage or {}), "error": error})
-        update_job(workspace, job["job_id"], change)
+                if draft_identity(target, base) != identities[target["no"]]:
+                    raise ItemGenerationError("verification_stale")
+                result = results[target["no"]]
+                actual = receipt_model(usage)
+                model = actual or usage.get("model") or CODEX_MODEL
+                target["verification"] = {"status": verification_status(target, result),
+                    "model": model, "requested_model": CODEX_MODEL, "actual_model": usage.get('actual_model'),
+                    **{k: usage[k] for k in ('cli_selected_model', 'cli_selected_effort', 'model_evidence') if k in usage},
+                    "model_confirmed": usage.get("model_confirmed", bool(actual)), "effort": effort,
+                    "at": utc_now(), "blind": True, "identity": identities[target["no"]],
+                    "review_kind": independence(contributors(target), actual,
+                        confirmed=usage.get("model_confirmed", bool(actual))),
+                    "verifier_answer": result.get("answer"), "verifier_reasoning": result.get("reasoning"),
+                    "verifier_issue": result.get("issue"), "verifier_bogi": result.get("bogi_judgement")}
+                if actual and actual != CODEX_MODEL:
+                    target['verification'].update(status='error', review_kind='unknown', error='actual_model_mismatch')
+        update_job(workspace, job["job_id"], save)
 
 
 def step_revise(workspace: Path, job: Mapping[str, Any], runners: Runners, root: Path) -> None:
     todo = [d for d in job["drafts"] if d.get("revise_request") and not d.get("confirmed_item_id")]
     if not todo:
         return
+    effort = claude_effort_for_scope(job["request"]["scope"])
     unit = resolve_unit(job["request"]["scope"], job["request"]["major"], job["request"]["middle"], root)
     corpus, printed = _corpus(root)
     head = build_prompts({**job, "request": {**job["request"], "variants": 0, "new": 0}}, root)  # validates inputs
@@ -603,23 +951,29 @@ def step_revise(workspace: Path, job: Mapping[str, Any], runners: Runners, root:
         prompt = common + REVISE_TASK.format(instruction=draft["revise_request"],
                                              draft=json.dumps(visible, ensure_ascii=False, indent=1))
         try:
-            text, usage = runners.claude(prompt, effort=GENERATE_EFFORT, add_dirs=[workspace])
-            items = _json_object(text).get("items") or []
-            revised = _clean_draft(items[0], draft["kind"]) if items else None
-            error = None if revised else "수정 결과가 비어 있습니다."
-        except Exception as exc:  # noqa: BLE001
-            revised, usage, error = None, None, str(exc)
+            text, usage = _author_call(workspace, job, runners, prompt, step='revise', effort=effort,
+                images=[job_dir(workspace, job['job_id']) / draft['figure']['file']]
+                if isinstance(draft.get('figure'), Mapping) and draft['figure'].get('file') else [])
+            revised = _validate_items(text, draft['kind'], 1)[0]
+            if revised.get('source_item_id') != draft.get('source_item_id'):
+                raise ItemGenerationError('revision_lineage_changed')
+        except ProviderQuotaExhausted:
+            raise
+        except Exception as exc:
+            update_job(workspace, job['job_id'], lambda j: next(d for d in j['drafts'] if d['no'] == draft['no']).update(revise_error=str(exc)[:200]))
+            raise
 
-        def change(current: dict[str, Any], no=draft["no"], revised=revised, error=error, usage=usage) -> None:
+        def change(current: dict[str, Any], no=draft["no"], revised=revised, usage=usage) -> None:
             target = next(d for d in current["drafts"] if d["no"] == no)
-            request = target.pop("revise_request", None)
-            if revised is None:
-                target["revise_error"] = error
-                return
+            request = target.get("revise_request")
             history = target.get("history") or []
             history.append({"at": utc_now(), "request": request,
-                            "previous": {k: v for k, v in target.items() if k != "history"}})
-            keep = {"no": no, "history": history[-5:], "generator_model": CLAUDE_MODEL, "generator_effort": GENERATE_EFFORT}
+                            "previous": {k: v for k, v in target.items() if k not in {'history', 'revise_request'}}})
+            authors = sorted(set(contributors(target) + _authorship(usage)['contributors']))
+            keep = {"no": no, "history": history, **_authorship(usage), "contributors": authors,
+                    "content_revision": int(target.get('content_revision', 0)) + 1,
+                    "item_code": target.get("item_code"), 'replacement_of': target.get('replacement_of')}
+            previous_verification = target.get('verification')
             old_figure = target.get("figure") if isinstance(target.get("figure"), Mapping) else None
             target.clear()
             target.update(revised)
@@ -627,9 +981,10 @@ def step_revise(workspace: Path, job: Mapping[str, Any], runners: Runners, root:
             if isinstance(target.get("figure"), Mapping) and old_figure and old_figure.get("file") and \
                     target["figure"].get("spec") == old_figure.get("spec"):
                 target["figure"] = dict(old_figure)
-            target["verification"] = {"status": "pending"}
+                target['figure']['check'] = {'status': 'pending', 'previous': old_figure.get('check')}
+            target["verification"] = {"status": "pending", 'stale': bool(previous_verification), 'previous': previous_verification}
             _recheck(target, unit["concepts"], corpus, printed)
-            current["usage"].append({"step": "revise", "no": no, **(usage or {})})
+            _registry_check(current, target, _job_index(workspace, current, skip_no=no))
         update_job(workspace, job["job_id"], change)
 
 
@@ -637,32 +992,71 @@ def run_job(workspace: Path | str, job_id: str, runners: Runners | None = None, 
     workspace = Path(workspace).resolve()
     runners = runners or Runners()
     root = root or lab_root()
+    if load_job(workspace, job_id).get('status') == 'paused':
+        return load_job(workspace, job_id)
 
     def start(job: dict[str, Any]) -> None:
+        from .item_generation import ItemGenerationConflict
+        if job.get('status') == 'running':
+            raise ItemGenerationConflict('작업이 진행 중입니다.')
         job["status"] = "running"
         job["error"] = None
     job = update_job(workspace, job_id, start)
     try:
-        if job.get("route") == "quick" and not job["drafts"]:
+        if job.get('work_action') == 'review':
+            from .item_generation_reviews import run_reviews
+            return run_reviews(workspace, job, runners)
+        if job.get("route") == "quick" and job.get('work_action', 'generate') == 'generate':
             step_generate(workspace, load_job(workspace, job_id), runners, root)
         step_revise(workspace, load_job(workspace, job_id), runners, root)
         step_figures(workspace, load_job(workspace, job_id), runners)
         step_figure_check(workspace, load_job(workspace, job_id), runners)
         step_verify(workspace, load_job(workspace, job_id), runners)
+    except ProviderQuotaExhausted as exc:
+        def pause(current):
+            current['status'] = 'paused'
+            current['pause'] = {'provider': exc.provider, 'category': exc.category, 'at': utc_now(),
+                                'stage': current.get('progress', {}).get('step')}
+            current['codex_exhausted'] = exc.provider == 'codex'
+            current.setdefault('usage', []).append({'step': current['pause']['stage'],
+                'error_category': exc.category, **exc.usage})
+            current['error'] = str(exc)
+            current['progress'] = {'step': 'paused', 'message': '구독 사용량 한도에 도달했습니다. 사용자 재개가 필요합니다.', 'at': utc_now()}
+        return update_job(workspace, job_id, pause)
     except Exception as exc:  # noqa: BLE001 - recorded on the job
         def fail(current: dict[str, Any]) -> None:
+            if isinstance(exc, ProviderFailure) and exc.usage:
+                current.setdefault('usage', []).append({'step': current.get('progress', {}).get('step'),
+                    **exc.usage, 'error_category': exc.category})
             current["status"] = "partial" if current["drafts"] else "failed"
             current["error"] = str(exc)[:800]
             current["progress"] = {"step": "failed", "message": str(exc)[:200], "at": utc_now()}
         return update_job(workspace, job_id, fail)
 
     def finish(current: dict[str, Any]) -> None:
+        if current.get('route') == 'quick':
+            plan = current.get('generation_plan')
+            complete = (all(len(s['completed_nos']) == s['expected'] for s in plan) if plan else
+                all(sum(d.get('kind') == kind and not d.get('replacement_of') for d in current['drafts']) == current['request'][key]
+                    for kind, key in (('variant', 'variants'), ('new', 'new'))))
+            if not complete:
+                current['status'] = 'partial'
+                current['error'] = 'generation_count_incomplete'
+                return
+        active = [d for d in current['drafts'] if not d.get('discarded') and not is_duplicate(d)
+                  and not d.get('confirmed_item_id')]
+        if any(d.get('revise_request') or (d.get('verification') or {}).get('status') in {None, 'pending', 'error', 'not_solved'}
+               or (isinstance(d.get('figure'), Mapping) and (not d['figure'].get('file')
+                   or (d['figure'].get('check') or {}).get('status') in {None, 'pending', 'error'})) for d in active):
+            current['status'] = 'partial'
+            current['error'] = 'stage_incomplete'
+            return
         current["status"] = "ready"
         counts: dict[str, int] = {}
         for draft in current["drafts"]:
-            status = (draft.get("verification") or {}).get("status", "pending")
+            status = "duplicate" if is_duplicate(draft) else (draft.get("verification") or {}).get("status", "pending")
             counts[status] = counts.get(status, 0) + 1
-        labels = {"verified": "검증 통과", "answer_conflict": "정답 불일치", "needs_review": "검토 필요", "item_issue": "문항 문제 지적",
+        labels = {"duplicate": "중복 제외", "verified": "검증 통과", "answer_conflict": "정답 불일치", "needs_review": "검토 필요", "item_issue": "문항 문제 지적",
                   "not_solved": "검증 응답 없음", "error": "검증 실패", "pending": "검증 전"}
         current["progress"] = {"step": "done", "message": "완료: " + ", ".join(f"{labels.get(k, k)} {v}" for k, v in counts.items()),
                                "at": utc_now()}
@@ -671,18 +1065,65 @@ def run_job(workspace: Path | str, job_id: str, runners: Runners | None = None, 
 
 # --------------------------------------------------------------------------- draft operations
 
-def request_revision(workspace: Path | str, job_id: str, no: int, instruction: str) -> dict[str, Any]:
+def check_expected(job: Mapping[str, Any], expected_revision: int | None) -> None:
+    from .item_generation import ItemGenerationConflict
+    if expected_revision is not None and (type(expected_revision) is not int or expected_revision != job.get('revision')):
+        raise ItemGenerationConflict('생성 작업 버전이 바뀌었습니다. 새로 고치세요.')
+
+
+def resume_job(workspace: Path | str, job_id: str, *, expected_revision: int | None = None) -> dict:
+    from .item_generation import ItemGenerationConflict
+    def change(job):
+        check_expected(job, expected_revision)
+        if job.get('status') in {'queued', 'running'}:
+            raise ItemGenerationConflict('이미 진행 중인 작업입니다.')
+        if job.get('work_action') != 'review':
+            _observe_legacy_figures(job, job_dir(workspace, job_id))
+            for d in job.get('drafts') or []:
+                if d.get('confirmed_item_id') or d.get('discarded'):
+                    continue
+                v = d.get('verification') or {}
+                if not v.get('identity'):
+                    d['verification'] = {'status': 'pending', 'previous': v}
+                f = d.get('figure')
+                if isinstance(f, dict) and not (f.get('check') or {}).get('identity'):
+                    f['check'] = {'status': 'pending', 'previous': f.get('check')}
+        job['status'] = 'queued'
+        job.pop('pause', None)
+        job.pop('codex_exhausted', None)
+        job['error'] = None
+        if job.get('work_action') != 'review' and not any(d.get('revise_request') for d in job.get('drafts') or []):
+            job['work_action'] = 'generate' if job.get('route') == 'quick' else 'verify'
+        job['progress'] = {'step': 'queued', 'message': '사용자가 남은 작업 재개', 'at': utc_now()}
+    return update_job(workspace, job_id, change)
+
+
+def _observe_legacy_figures(job: dict, base: Path) -> None:
+    """Explicit user update only; old checks are never promoted to new receipts."""
+    for draft in job.get('drafts') or []:
+        figure = draft.get('figure')
+        if draft.get('confirmed_item_id') or draft.get('discarded') or not isinstance(figure, dict) or not figure.get('file'):
+            continue
+        _, sha = image_bytes(base, figure['file'], figure.get('sha256'), allow_legacy=True)
+        if not figure.get('sha256'):
+            figure.update(sha256=sha, hash_observation={'kind': 'legacy-first-observation', 'sha256': sha, 'at': utc_now()})
+
+def request_revision(workspace: Path | str, job_id: str, no: int, instruction: str, *, expected_revision: int | None = None) -> dict[str, Any]:
     instruction = str(instruction or "").strip()
     if not instruction:
         raise ItemGenerationError("수정 요청을 입력하세요.")
 
     def change(job: dict[str, Any]) -> None:
-        if job.get("status") in {"queued", "running"}:
-            raise ItemGenerationError("작업이 진행 중입니다. 끝난 뒤 수정하세요.")
+        check_expected(job, expected_revision)
+        if job.get("status") in {"queued", "running", "paused"}:
+            from .item_generation import ItemGenerationConflict
+            raise ItemGenerationConflict("작업이 진행 중이거나 일시정지되었습니다. 남은 단계를 재개하세요.")
         draft = next((d for d in job["drafts"] if d["no"] == int(no)), None)
         if draft is None or draft.get("confirmed_item_id"):
             raise ItemGenerationError("수정할 수 없는 초안입니다.")
         draft["revise_request"] = instruction[:2000]
+        _observe_legacy_figures({'drafts': [draft]}, job_dir(workspace, job_id))
+        job['work_action'] = 'revise'
         draft.pop("revise_error", None)
         job["status"] = "queued"
         job["progress"] = {"step": "queued", "message": f"{no}번 수정 대기", "at": utc_now()}
@@ -693,7 +1134,7 @@ EDITABLE = {"stem", "instruction", "table", "bogi", "choices", "answer", "soluti
             "distractor_intents", "unique_answer_rationale", "difficulty", "format", "scope_concepts", "concepts"}
 
 
-def edit_draft(workspace: Path | str, job_id: str, no: int, fields: Mapping[str, Any], root: Path | None = None) -> dict[str, Any]:
+def edit_draft(workspace: Path | str, job_id: str, no: int, fields: Mapping[str, Any], root: Path | None = None, *, expected_revision: int | None = None) -> dict[str, Any]:
     unexpected = set(fields) - EDITABLE
     if unexpected:
         raise ItemGenerationError(f"고칠 수 없는 항목: {', '.join(sorted(unexpected))}")
@@ -701,8 +1142,10 @@ def edit_draft(workspace: Path | str, job_id: str, no: int, fields: Mapping[str,
     corpus, printed = _corpus(root)
 
     def change(job: dict[str, Any]) -> None:
-        if job.get("status") in {"queued", "running"}:
-            raise ItemGenerationError("작업이 진행 중입니다. 끝난 뒤 고치세요.")
+        check_expected(job, expected_revision)
+        if job.get("status") in {"queued", "running", "paused"}:
+            from .item_generation import ItemGenerationConflict
+            raise ItemGenerationConflict("작업이 진행 중이거나 일시정지되었습니다. 남은 단계를 재개하세요.")
         unit = resolve_unit(job["request"]["scope"], job["request"]["major"], job["request"]["middle"], root)
         draft = next((d for d in job["drafts"] if d["no"] == int(no)), None)
         if draft is None or draft.get("confirmed_item_id"):
@@ -711,20 +1154,32 @@ def edit_draft(workspace: Path | str, job_id: str, no: int, fields: Mapping[str,
         errors = draft_format_errors(candidate)
         if errors:
             raise ItemGenerationError(errors[0])
+        _observe_legacy_figures({'drafts': [draft]}, job_dir(workspace, job_id))
+        previous_verification = draft.get('verification')
         history = draft.get("history") or []
         history.append({"at": utc_now(), "request": "직접 편집", "previous": {k: v for k, v in draft.items() if k != "history"}})
         draft.update(dict(fields))
-        draft["history"] = history[-5:]
+        draft["history"] = history
+        draft['contributors'] = sorted(set(contributors(draft) + ['human']))
+        draft['content_revision'] = int(draft.get('content_revision', 0)) + 1
         draft["edited_by_user"] = True
-        draft["verification"] = {"status": "pending"}
+        job['work_action'] = 'verify'
+        draft["verification"] = {"status": "pending", 'stale': bool(previous_verification), 'previous': previous_verification}
+        if isinstance(draft.get('figure'), Mapping):
+            draft['figure']['check'] = {'status': 'pending', 'previous': draft['figure'].get('check')}
         _recheck(draft, unit["concepts"], corpus, printed)
+        _registry_check(job, draft, _job_index(Path(workspace).resolve(), job, skip_no=draft["no"]))
         job["status"] = "queued"
         job["progress"] = {"step": "queued", "message": f"{no}번 편집 후 재검증 대기", "at": utc_now()}
     return update_job(workspace, job_id, change)
 
 
-def set_discarded(workspace: Path | str, job_id: str, no: int, discarded: bool) -> dict[str, Any]:
+def set_discarded(workspace: Path | str, job_id: str, no: int, discarded: bool, *, expected_revision: int | None = None) -> dict[str, Any]:
     def change(job: dict[str, Any]) -> None:
+        check_expected(job, expected_revision)
+        if job.get('status') in {'queued', 'running'}:
+            from .item_generation import ItemGenerationConflict
+            raise ItemGenerationConflict('작업이 진행 중입니다.')
         draft = next((d for d in job["drafts"] if d["no"] == int(no)), None)
         if draft is None or draft.get("confirmed_item_id"):
             raise ItemGenerationError("바꿀 수 없는 초안입니다.")
@@ -755,13 +1210,19 @@ def import_bot_drafts(workspace: Path | str, request: Mapping[str, Any], drafts:
     job = create_job(workspace, request, route="bot", bot_session_id=bot_session_id)
     _, guide_sha = guides_text(request["scope"].partition("-")[2], root)
 
+    workspace = Path(workspace).resolve()
+
     def change(current: dict[str, Any]) -> None:
+        index = _job_index(workspace, current)
         for draft in cleaned:
             draft["no"] = len(current["drafts"]) + 1
             draft["generator_model"] = "item-analyst (hermes bot)"
             draft["generator_effort"] = None
             draft["verification"] = {"status": "pending"}
             _recheck(draft, unit["concepts"], corpus, printed)
+            entry = _registry_check(current, draft, index)
+            if not is_duplicate(draft):
+                index.append(entry)
             current["drafts"].append(draft)
         current["guide_sha256"] = guide_sha
         current["generator_model"] = "item-analyst (hermes bot)"
@@ -786,8 +1247,8 @@ class GenerationWorker:
         for summary in list_jobs(self.workspace, limit=500):
             if summary.get("status") == "running":
                 def change(job: dict[str, Any]) -> None:
-                    job["status"] = "queued"
-                    job["progress"] = {"step": "queued", "message": "서버 재시작으로 다시 대기", "at": utc_now()}
+                    job["status"] = "paused"
+                    job["progress"] = {"step": "paused", "message": "중단된 작업입니다. 사용자 재개가 필요합니다.", "at": utc_now()}
                 try:
                     update_job(self.workspace, str(summary["job_id"]), change)
                 except Exception:  # noqa: BLE001

@@ -4,13 +4,21 @@
 
 const API = "/api/item-generation";
 const STATUS_LABEL = {
-  queued: "대기 중", running: "진행 중", ready: "검토 대기", partial: "일부 완료", failed: "실패", cancelled: "취소됨",
+  queued: "대기 중", running: "진행 중", ready: "검토 대기", partial: "일부 완료", paused: "사용자 재개 대기", failed: "실패", cancelled: "취소됨",
 };
 const VERIFY_LABEL = {
   verified: ["Codex 정답 일치", "ok"], answer_conflict: ["Codex 정답 불일치", "bad"], item_issue: ["Codex 문항 문제 지적", "bad"],
   needs_review: ["답 표현 확인 필요", "warn"], not_solved: ["Codex 미풀이", "warn"], error: ["검증 오류", "bad"], pending: ["검증 대기", "wait"],
 };
 const KIND_LABEL = { variant: "변형", new: "신규" };
+const REVIEW_LABEL = {
+  not_run: ["교차 검토 미실시", "wait"], self_check: ["같은 모델 자체 검산 · 교차 검토 미실시", "warn"],
+  cross_check: ["교차 검토 · 답 일치", "ok"], mixed: ["혼합 작성 · 독립 교차 검토 아님", "warn"],
+  unknown: ["작성·검토 모델 확인 불가", "warn"], stale: ["이전 내용의 검토 · 다시 검토 필요", "warn"],
+  conflict: ["검토 답 불일치", "bad"], item_issue: ["검토에서 문항 문제 지적", "bad"],
+  blocked: ["검토 차단 · 모델/입력 확인 필요", "warn"], error: ["검토 오류", "bad"],
+  queued: ["검토 대기", "wait"], running: ["검토 진행 중", "wait"], paused: ["검토 일시정지 · 사용자 재개 필요", "warn"],
+};
 
 function node(tag, className = "", text = "") {
   const element = document.createElement(tag);
@@ -72,6 +80,8 @@ export function mountItemGeneration(root) {
   const state = {
     scopes: [], tree: null, scope: "", major: "", middle: "", details: new Set(), sources: [], sourceIds: new Set(),
     jobs: [], job: null, selected: new Set(), pollTimer: null, chat: null, chatTimer: null, showAllDetails: false, openMore: new Set(),
+    reviewSelected: new Set(), reviewFilter: "all", reviewModel: null, openHistory: new Set(), reviseText: new Map(),
+    selectionInitialized: false,
   };
 
   const layout = node("div", "gen-layout");
@@ -223,7 +233,7 @@ export function mountItemGeneration(root) {
       try {
         const data = await call("/estimate", { method: "POST", body: requestBody() });
         const e = data.estimate;
-        estimate.textContent = `예상 호출: 생성(Claude Opus high) ${e.claude_generate}회 · 그림 최대 ${e.figure_codex_max}회 · 그림 대조 최대 ${e.figure_check_claude_max}회 · Codex 검증 ${e.codex_verify}회`;
+        estimate.textContent = `예상 호출: 생성(Claude Opus ${e.claude_effort}) ${e.claude_generate}회 · 그림 최대 ${e.figure_codex_max}회 · 그림 대조 최대 ${e.figure_check_claude_max}회 · Codex 검증(${e.codex_effort}) ${e.codex_verify}회`;
         estimate.dataset.tone = "";
         startButton.disabled = false;
       } catch (error) {
@@ -306,14 +316,21 @@ export function mountItemGeneration(root) {
     try { state.job = await call(`/jobs/${encodeURIComponent(jobId)}`); }
     catch (error) { say(error.message, "bad"); return; }
     jobSelect.value = jobId;
+    if (previous?.job_id !== jobId) {
+      state.selected.clear(); state.reviewSelected.clear(); state.reviewModel = null; state.reviewFilter = "all";
+      state.selectionInitialized = false;
+    }
     const busy = ["queued", "running"].includes(state.job.status);
-    if (!busy && !state.selected.size) {
+    if (!busy && !state.selectionInitialized) {
       state.job.drafts.forEach((d) => {
-        if (!d.discarded && !d.confirmed_item_id && d.verification?.status === "verified" && d.auto_checks?.passed) state.selected.add(d.no);
+        if (!d.discarded && !d.confirmed_item_id && d.duplicate_check?.status !== "duplicate"
+          && d.verification?.status === "verified" && d.auto_checks?.passed) state.selected.add(d.no);
       });
+      state.selectionInitialized = true;
     }
     // Skip the rebuild when a poll returns the same saved job: keeps scroll, open sections and typed text.
     const unchanged = previous && previous.job_id === state.job.job_id && previous.revision === state.job.revision
+      && previous.projection_sha256 === state.job.projection_sha256
       && previous.updated_at === state.job.updated_at && jobBody.childElementCount;
     if (!unchanged) renderJob();
     if (busy) state.pollTimer = window.setTimeout(() => openJob(jobId), 4000);
@@ -328,12 +345,41 @@ export function mountItemGeneration(root) {
     if (draft.discarded) card.classList.add("discarded");
     const head = node("header", "gen-draft-head");
     const pick = Object.assign(node("input"), { type: "checkbox", checked: state.selected.has(draft.no) });
-    pick.disabled = Boolean(draft.discarded || draft.confirmed_item_id || ["queued", "running"].includes(job.status));
+    const duplicate = draft.duplicate_check?.status === "duplicate";
+    pick.disabled = Boolean(draft.discarded || draft.confirmed_item_id || duplicate || ["queued", "running"].includes(job.status));
     pick.setAttribute("aria-label", `${draft.no}번 확정 선택`);
     pick.addEventListener("change", () => { pick.checked ? state.selected.add(draft.no) : state.selected.delete(draft.no); renderConfirmBar(); });
     const [vText, vTone] = VERIFY_LABEL[draft.verification?.status || "pending"] || [draft.verification?.status, "warn"];
-    head.append(pick, node("strong", "", `${draft.no}번`), badge(KIND_LABEL[draft.kind] || draft.kind, "kind"),
-      badge(draft.difficulty || "-"), badge(draft.format || "-"), badge(vText, vTone));
+    const code = draft.item_code ? node("code", "gen-item-code", draft.item_code) : null;
+    head.append(pick, node("strong", "", `${draft.no}번`), ...(code ? [code] : []), badge(KIND_LABEL[draft.kind] || draft.kind, "kind"),
+      badge(draft.difficulty || "-"), badge(draft.format || "-"), ...(duplicate ? [] : [badge(vText, vTone)]));
+    const reviewPick = Object.assign(node("input"), { type: "checkbox", checked: state.reviewSelected.has(draft.no) });
+    reviewPick.disabled = Boolean(draft.discarded || ["queued", "running"].includes(job.status));
+    reviewPick.setAttribute("aria-label", `${draft.no}번 검토 선택`);
+    reviewPick.addEventListener("change", () => {
+      reviewPick.checked ? state.reviewSelected.add(draft.no) : state.reviewSelected.delete(draft.no);
+      state.reviewModel = null; renderReviewBar();
+    });
+    const reviewLabel = node("label", "gen-review-pick");
+    reviewLabel.append(reviewPick, " 검토 선택");
+    head.append(reviewLabel);
+    const cross = draft.cross_review || { status: "not_run" };
+    const labelKey = cross.status === "not_run" && cross.initial_kind === "self_check" ? "self_check" : cross.status;
+    const [reviewText, reviewTone] = REVIEW_LABEL[labelKey] || REVIEW_LABEL.unknown;
+    head.append(badge(reviewText, reviewTone));
+    if (draft.model_confirmed === false || draft.verification?.model_confirmed === false) {
+      head.append(node("span", "gen-hint", "모델 확인 기록 없음 · 교차 검토 판정 불가"));
+    }
+    head.append(node("span", "gen-hint", `작성: ${(draft.canonical_current?.authors || draft.contributors || [draft.generator_model || "미상"])
+      .map((m) => m === "unknown" ? "미상" : m === "human" ? "직접 편집" : m).join(" / ")}`));
+    const dup = draft.duplicate_check;
+    if (dup?.status === "duplicate" || dup?.status === "similar") {
+      const near = (dup.matches || []).map((m) => `${m.code}(${(m.reasons || []).join(", ")})`).join(" / ");
+      const label = dup.status === "duplicate" ? "중복 — 제외됨" : "비슷한 문항 있음";
+      const tag = badge(label, dup.status === "duplicate" ? "bad" : "warn");
+      tag.title = near;
+      head.append(tag);
+    }
     const checks = draft.auto_checks || {};
     if (checks.scope_ok === false) head.append(badge(`범위 밖 개념: ${(checks.scope_unlisted || []).join(", ")}`, "bad"));
     if (checks.calc_ok === false) head.append(badge("계산 재확인 불일치", "bad"));
@@ -347,6 +393,19 @@ export function mountItemGeneration(root) {
     card.append(head);
 
     const body = node("div", "gen-draft-body");
+    if (draft.canonical_current) {
+      const current = draft.canonical_current;
+      body.append(node("p", "gen-hint", `현재 문제은행 문항 · 버전 ${current.revision ?? "확인 불가"}`));
+      if (current.error) body.append(node("p", "gen-issue", current.error));
+      else {
+        body.append(mathText("p", "gen-canonical-text", current.question_text));
+        (current.figures || []).forEach((url) => {
+          const image = node("img", "gen-figure"); image.alt = "현재 저장 문항의 그림"; image.src = url; body.append(image);
+        });
+        body.append(mathText("p", "gen-answer", `현재 정답 ${current.answer}`));
+        body.append(mathText("p", "gen-canonical-text", current.solution));
+      }
+    } else {
     if (draft.kind === "variant" && draft.source_printed_number) body.append(node("p", "gen-hint", `원문항: ${draft.source_printed_number}번 · 변형: ${(draft.variant_type || []).join(", ")}`));
     body.append(mathText("p", "gen-stem", draft.stem));
     if (draft.table?.columns) {
@@ -397,19 +456,43 @@ export function mountItemGeneration(root) {
     [["평가 목적", intent.purpose], ["측정 능력", intent.assessed_ability], ["구성 이유", intent.structure_rationale],
       ["겨냥한 오개념", (intent.misconceptions_targeted || []).join(" / ")], ["난이도 설계", intent.difficulty_design], ["설계 근거", intent.basis]]
       .forEach(([k, v]) => v && more.append(mathText("p", "", `${k}: ${v}`)));
-    if (draft.verification?.verifier_reasoning) more.append(node("h4", "", "Codex 독립 풀이"), mathText("p", "", draft.verification.verifier_reasoning));
+    if (draft.verification?.verifier_reasoning) more.append(node("h4", "", draft.verification.review_kind === "cross_check" ? "Codex 블라인드 교차 풀이" : "Codex 블라인드 검산 풀이"), mathText("p", "", draft.verification.verifier_reasoning));
     if (checks.calc_results?.length) more.append(node("h4", "", "계산 재확인"), ...checks.calc_results.map((c) => node("p", c.ok ? "" : "gen-issue", `${c.expression} = ${c.computed ?? c.error} (기대 ${c.expected}) ${c.ok ? "✓" : "✗"}`)));
     body.append(more);
+    }
+    const history = node("details", "gen-more gen-review-history");
+    const historyKey = `${job.job_id}:${draft.no}:history`;
+    history.open = state.openHistory.has(historyKey);
+    history.addEventListener("toggle", () => { history.open ? state.openHistory.add(historyKey) : state.openHistory.delete(historyKey); });
+    history.append(node("summary", "", `검토 전체 이력 (${draft.review_history?.length || 0})`));
+    if (!draft.review_history?.length) history.append(node("p", "gen-hint", "사용자가 요청한 추가 검토 이력이 없습니다."));
+    (draft.review_history || []).forEach((entry) => {
+      const section = node("section", "gen-review-record");
+      const kind = REVIEW_LABEL[entry.review_kind]?.[0] || "모델 확인 불가";
+      section.append(node("strong", "", `${entry.sequence}회 · ${entry.at || ""} · ${entry.actual_model || entry.cli_selected_model || "미확인"} ${entry.actual_effort || entry.requested_effort || ""}`),
+        node("p", "gen-hint", `${entry.status} · ${kind}${entry.current === false || entry.stale ? " · 이전 내용(stale)" : ""} · 원본 버전 ${entry.identity?.source_revision ?? "미상"}`),
+        mathText("p", "", `원래 정답: ${entry.original_answer || "미상"} · 검토 답: ${entry.verifier_answer || "응답 없음"}`),
+        mathText("p", "", `원래 해설: ${entry.original_solution || "없음"}`),
+        mathText("p", "", `검토 풀이: ${entry.verifier_reasoning || "없음"}`));
+      if (entry.model_evidence === "cli_startup_receipt") section.append(node("p", "gen-hint", "모델 확인 근거: CLI 시작 기록"));
+      if (entry.status === "blocked") section.append(node("p", "gen-hint", "모델 확인 기록이 없거나 요청한 모델·추론 강도와 달라 검토 판정을 차단했습니다."));
+      if (entry.verifier_issue || entry.error_category) section.append(node("p", "gen-issue", entry.verifier_issue || entry.error_category));
+      history.append(section);
+    });
+    body.append(history);
     card.append(body);
 
-    if (!draft.confirmed_item_id && !["queued", "running"].includes(job.status)) {
+    if (!draft.confirmed_item_id && !["queued", "running", "paused"].includes(job.status)) {
       const actions = node("div", "gen-draft-actions");
       const revise = node("input");
+      const reviseKey = `${job.job_id}:${draft.no}`;
+      revise.value = state.reviseText.get(reviseKey) || "";
+      revise.addEventListener("input", () => state.reviseText.set(reviseKey, revise.value));
       revise.placeholder = "수정 요청 (예: ㄷ 보기를 더 헷갈리게)";
       actions.append(revise,
         button("AI에게 수정 요청", "button small", async () => {
           if (!revise.value.trim()) return;
-          try { await call(`/jobs/${encodeURIComponent(job.job_id)}/drafts/${draft.no}/revise`, { method: "POST", body: { instruction: revise.value } }); say(`${draft.no}번 수정을 요청했습니다. 수정 후 다시 검증합니다.`, "ok"); openJob(job.job_id); }
+          try { await call(`/jobs/${encodeURIComponent(job.job_id)}/drafts/${draft.no}/revise`, { method: "POST", body: { instruction: revise.value, expected_revision: job.revision } }); state.reviseText.delete(reviseKey); say(`${draft.no}번 수정을 요청했습니다. 수정 후 다시 검증합니다.`, "ok"); openJob(job.job_id); }
           catch (error) { say(error.message, "bad"); }
         }),
         button("직접 편집", "button small", () => openEditor(draft)),
@@ -420,7 +503,7 @@ export function mountItemGeneration(root) {
           catch (error) { say(error.message, "bad"); }
         }),
         button(draft.discarded ? "되살리기" : "버리기", "button small", async () => {
-          try { await call(`/jobs/${encodeURIComponent(job.job_id)}/drafts/${draft.no}/discard`, { method: "POST", body: { discarded: !draft.discarded } }); state.selected.delete(draft.no); openJob(job.job_id); }
+          try { await call(`/jobs/${encodeURIComponent(job.job_id)}/drafts/${draft.no}/discard`, { method: "POST", body: { discarded: !draft.discarded, expected_revision: job.revision } }); state.selected.delete(draft.no); openJob(job.job_id); }
           catch (error) { say(error.message, "bad"); }
         }));
       if (draft.revise_error) actions.append(node("p", "gen-issue", `수정 실패: ${draft.revise_error}`));
@@ -464,7 +547,7 @@ export function mountItemGeneration(root) {
       }
       if (!Object.keys(body).length) { dialog.close(); return; }
       try {
-        await call(`/jobs/${encodeURIComponent(state.job.job_id)}/drafts/${draft.no}/edit`, { method: "POST", body: { fields: body } });
+        await call(`/jobs/${encodeURIComponent(state.job.job_id)}/drafts/${draft.no}/edit`, { method: "POST", body: { fields: body, expected_revision: state.job.revision } });
         dialog.close(); say(`${draft.no}번을 고쳤습니다. Codex가 다시 검증합니다.`, "ok"); openJob(state.job.job_id);
       } catch (error) { message.textContent = error.message; }
     });
@@ -479,7 +562,7 @@ export function mountItemGeneration(root) {
     const job = state.job;
     confirmBar.replaceChildren();
     if (!job || ["queued", "running"].includes(job.status)) return;
-    const chosen = [...state.selected].filter((no) => job.drafts.some((d) => d.no === no && !d.confirmed_item_id && !d.discarded));
+    const chosen = [...state.selected].filter((no) => job.drafts.some((d) => d.no === no && !d.confirmed_item_id && !d.discarded && d.duplicate_check?.status !== "duplicate"));
     const risky = chosen.filter((no) => { const d = job.drafts.find((x) => x.no === no); return d.verification?.status !== "verified" || !d.auto_checks?.passed; });
     const intent = Object.assign(node("input"), { type: "checkbox", checked: true });
     const intentLabel = node("label", "gen-hint");
@@ -488,7 +571,7 @@ export function mountItemGeneration(root) {
       if (risky.length && !window.confirm(`${risky.join(", ")}번은 검증이 일치하지 않거나 자동 검사에 걸렸습니다. 그래도 저장할까요?`)) return;
       go.disabled = true;
       try {
-        const result = await call(`/jobs/${encodeURIComponent(job.job_id)}/confirm`, { method: "POST", body: { numbers: chosen, include_intent: intent.checked } });
+        const result = await call(`/jobs/${encodeURIComponent(job.job_id)}/confirm`, { method: "POST", body: { numbers: chosen, include_intent: intent.checked, expected_revision: job.revision } });
         say(`${result.results.length}문항을 문제은행에 저장했습니다. 문제은행에서 '변형'·'신규' 배지로 볼 수 있습니다.`, "ok");
         state.selected.clear();
         await loadJobs();
@@ -501,6 +584,44 @@ export function mountItemGeneration(root) {
     if (risky.length) confirmBar.append(node("p", "gen-issue", `주의: ${risky.join(", ")}번은 검증 불일치 또는 자동 검사 문제가 있습니다.`));
   }
 
+  const reviewBar = node("div", "gen-review-bar");
+  function renderReviewBar() {
+    const job = state.job;
+    reviewBar.replaceChildren();
+    if (!job) return;
+    const selected = job.drafts.filter((d) => state.reviewSelected.has(d.no) && !d.discarded);
+    const families = new Set(selected.flatMap((d) => d.canonical_current?.authors || d.contributors || [d.actual_model || d.generator_model || "unknown"])
+      .map((m) => m.startsWith("claude-") ? "claude" : m.startsWith("gpt-") ? "codex" : "unknown").filter((m) => m !== "unknown"));
+    const recommended = families.size === 1 && families.has("claude") ? "codex" : "claude";
+    const reviewer = node("select"); reviewer.setAttribute("aria-label", "검토 모델");
+    for (const [value, label] of [["claude", "Claude Opus 5.5"], ["codex", "Codex gpt-6-astra"]]) {
+      reviewer.append(Object.assign(node("option", "", `${label}${value === recommended ? " (권장)" : ""}`), { value }));
+    }
+    reviewer.value = state.reviewModel || recommended;
+    reviewer.addEventListener("change", () => { state.reviewModel = reviewer.value; });
+    const busy = ["queued", "running"].includes(job.status) || (job.work_action === "review" && job.review_request?.status === "paused");
+    const submit = button(`선택 ${selected.length}문항 교차 검토 / 재검토`, "button", async () => {
+      submit.disabled = true;
+      try {
+        await call(`/jobs/${encodeURIComponent(job.job_id)}/reviews`, { method: "POST", body: {
+          numbers: selected.map((d) => d.no), model: reviewer.value, expected_revision: job.revision,
+        } });
+        say("선택한 현재 버전의 블라인드 검토를 요청했습니다. 정답은 검토 후 비교합니다.", "ok");
+        await openJob(job.job_id);
+      } catch (error) { say(error.message, "bad"); submit.disabled = false; }
+    });
+    submit.disabled = busy || !selected.length; reviewer.disabled = busy;
+    const filter = node("select"); filter.setAttribute("aria-label", "검토 상태 필터");
+    for (const [value, label] of [["all", "검토 상태 전체"], ["not_run", "교차 검토 미실시"], ["self_check", "자체 검산"],
+      ["cross_check", "교차 검토 일치"], ["stale", "이전 내용의 검토"], ["conflict", "답 불일치"], ["error", "오류·차단"]]) {
+      filter.append(Object.assign(node("option", "", label), { value }));
+    }
+    filter.value = state.reviewFilter;
+    filter.addEventListener("change", () => { state.reviewFilter = filter.value; renderJob(); });
+    reviewBar.append(field("검토 모델", reviewer), submit, field("표시", filter), node("p", "gen-hint",
+      `권장: ${recommended === "claude" ? "Claude" : "Codex"}. 같은 모델 계열의 검토는 자체 검산으로 표시합니다. 작성 모델 미상·혼합 작성은 독립 검토로 표시하지 않습니다. 추가 교차 검토는 저장의 필수 조건이 아닙니다.`));
+  }
+
   function renderJob() {
     const job = state.job;
     if (!job) { jobBody.replaceChildren(node("p", "gen-hint", "왼쪽에서 주제를 고르고 생성하거나, 위에서 이전 작업을 여세요.")); return; }
@@ -509,13 +630,23 @@ export function mountItemGeneration(root) {
       badge(STATUS_LABEL[job.status] || job.status, job.status === "failed" ? "bad" : job.status === "ready" ? "ok" : "wait"),
       node("span", "gen-hint", ` ${job.progress?.message || ""}`));
     if (job.error) info.append(node("p", "gen-issue", job.error));
-    if (["failed", "partial"].includes(job.status)) info.append(button("남은 단계 다시 실행", "button small", async () => {
-      try { await call(`/jobs/${encodeURIComponent(job.job_id)}/retry`, { method: "POST", body: {} }); openJob(job.job_id); } catch (error) { say(error.message, "bad"); }
+    if (job.fallback_transitions?.length) info.append(node("p", "gen-hint", "Claude 사용량 한도에 도달해 이 작업의 남은 작성·수정·그림 대조를 Codex로 전환했습니다."));
+    if (["failed", "partial", "paused"].includes(job.status)) info.append(button(job.work_action === "review" ? "남은 검토 사용자 재개" : "남은 단계 사용자 재개", "button small", async () => {
+      try { await call(`/jobs/${encodeURIComponent(job.job_id)}/retry`, { method: "POST", body: { expected_revision: job.revision } }); openJob(job.job_id); } catch (error) { say(error.message, "bad"); }
     }));
     const list = node("div", "gen-drafts");
-    job.drafts.forEach((draft) => list.append(renderDraft(draft)));
+    const displayed = job.drafts.filter((d) => {
+      const cross = d.cross_review || { status: "not_run" };
+      const key = cross.status === "not_run" && cross.initial_kind === "self_check" ? "self_check" : cross.status;
+      return state.reviewFilter === "all" || key === state.reviewFilter
+        || (state.reviewFilter === "not_run" && key === "self_check")
+        || (state.reviewFilter === "error" && ["error", "blocked"].includes(key));
+    });
+    displayed.forEach((draft) => list.append(renderDraft(draft)));
+    if (job.drafts.length && !displayed.length) list.append(node("p", "gen-hint", "이 검토 상태에 해당하는 문항이 없습니다."));
     if (!job.drafts.length) list.append(node("p", "gen-hint", ["queued", "running"].includes(job.status) ? "문항을 만드는 중입니다. 화면은 자동으로 새로 고쳐집니다." : "초안이 없습니다."));
-    jobBody.replaceChildren(info, list, confirmBar);
+    jobBody.replaceChildren(info, reviewBar, list, confirmBar);
+    renderReviewBar();
     renderConfirmBar();
     renderMath(jobBody);
   }
