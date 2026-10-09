@@ -64,7 +64,7 @@ export function batchAttemptPresentation(status, progress) {
 
 const NAV_GROUPS = [
   ['작업', ['workNav']], ['문항 탐색·검수', ['savedNav', 'bankNav']],
-  ['문제지·문서', ['setsNav', 'documentNav']], ['관리·기록', ['learningNav']]
+  ['AI 생성', ['generateNav']], ['문제지·문서', ['setsNav', 'documentNav']], ['관리·기록', ['learningNav']]
 ];
 
 /** Mount once on either page, retaining canonical anchor nodes and their IDs. */
@@ -82,7 +82,7 @@ export function initializeDeviceShell(doc = document, win = window) {
   };
   const workLabel = get('workNav')?.querySelector('span');
   if (workLabel) workLabel.textContent = '작업 현황';
-  doc.querySelector('.app-brand')?.setAttribute('aria-label', 'Astra 작업 현황');
+  doc.querySelector('.app-brand')?.setAttribute('aria-label', 'Forest of Q 작업 현황');
   const destinations = deviceDestinations(nav.querySelectorAll('a'));
   for (const [label, ids] of NAV_GROUPS) {
     const group = make('div', '', 'device-nav-group');

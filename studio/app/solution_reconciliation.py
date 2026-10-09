@@ -445,6 +445,7 @@ def _existing_candidates(
     *,
     origin: str,
     attempts: tuple[str, ...],
+    kind: str = "detailed_solution",
 ) -> tuple[SolutionCandidate, ...]:
     assets = link_manifest.get("assets")
     if not isinstance(assets, Mapping):
@@ -456,8 +457,30 @@ def _existing_candidates(
         raw_asset = assets.get(external_id)
         if raw_asset is None:
             raise SolutionIntegrityError(f"referenced solution asset is missing: {external_id}")
-        if not isinstance(raw_asset, Mapping) or raw_asset.get("kind") != "detailed_solution":
+        if not isinstance(raw_asset, Mapping) or raw_asset.get("kind") != kind:
             continue
+        if kind == "quick_answer" and (
+            link_item.get("status") in {"rejected", "excluded"}
+            or raw_asset.get("selection_status") in {"rejected", "excluded"}
+        ):
+            continue
+        if kind == "quick_answer" and any(
+            "rejected" in str(reason) or "excluded" in str(reason)
+            or ("ambiguous" in str(reason) and "scope" in str(reason))
+            for reason in (*list(link_item.get("review_reasons") or []),
+                           *list(raw_asset.get("review_reasons") or []),
+                           raw_asset.get("review_reason") or "")
+        ):
+            continue
+        if kind == "quick_answer":
+            signature = raw_asset.get("quality_signature")
+            parsed = parse_printed_number(str(manifest_item.get("printed_number") or ""))
+            if (isinstance(signature, Mapping) and signature.get("parent_number") is not None
+                    and (parsed is None or _number_key(signature["parent_number"]) != parsed.number_key)):
+                continue
+            if (isinstance(signature, Mapping) and signature.get("subquestion_label") is not None
+                    and (parsed is None or _subquestion_key(signature["subquestion_label"]) != parsed.subquestion_key)):
+                continue
         path, relative, source_hash = _asset_file(leaf, raw_asset)
         parts = raw_asset.get("parts")
         part = parts[0] if isinstance(parts, list) and parts and isinstance(parts[0], Mapping) else {}
@@ -857,7 +880,7 @@ def _quick_answer_provider_agreement(
     )
 
 
-def reconcile_solutions(leaf_run: Path | str) -> ReconciliationResult:
+def reconcile_solutions(leaf_run: Path | str, *, quick_answers_only: bool = False) -> ReconciliationResult:
     """Return a deterministic best-effort decision for every manifest item.
 
     Existing verified links keep their upstream status. Non-verified items exhaust
@@ -869,6 +892,12 @@ def reconcile_solutions(leaf_run: Path | str) -> ReconciliationResult:
     _reject_symlink_chain(leaf, leaf)
     manifest = _load_safe_json(leaf, "manifest.json")
     link_manifest = _load_safe_json(leaf, "solutions/link_manifest.json")
+    if link_manifest.get('fragment_review_admission') is not None:
+        from crop.solution_fragment_review import validate_published
+        try:
+            validate_published(leaf, link_manifest)
+        except (ValueError, OSError, KeyError) as exc:
+            raise SolutionIntegrityError('original fragment admission proof is invalid') from exc
     manifest_items = manifest.get("items")
     link_items = link_manifest.get("items")
     if not isinstance(manifest_items, list):
@@ -910,6 +939,34 @@ def reconcile_solutions(leaf_run: Path | str) -> ReconciliationResult:
         ]
         if link_item.get("status") == "verified" and missing_verified_ids:
             raise SolutionIntegrityError("verified solution asset is missing")
+
+        if quick_answers_only:
+            quick_ids = _unique_strings(
+                external_id
+                for name in ("answer_ids", "candidate_ids")
+                for external_id in (link_item.get(name) or [])
+                if isinstance(external_id, str)
+            )
+            quick = _existing_candidates(
+                leaf, link_manifest, manifest_item, link_item, quick_ids,
+                origin="link_review_candidate", attempts=("current_quick_answer_ids_checked",),
+                kind="quick_answer",
+            ) if link_item.get("status") in {"verified", "review"} else ()
+            scopes = {
+                signature.get("scope_id") for candidate in quick
+                if isinstance(signature := candidate.raw_asset.get("quality_signature"), Mapping)
+                and isinstance(signature.get("scope_id"), str)
+            }
+            if len(scopes) > 1:
+                quick = ()
+                reasons = _unique_strings((*reasons, "ambiguous_quick_answer_scope"))
+            decisions[unit_id] = SolutionDecision(
+                unit_id, printed_number, "review" if quick else "missing",
+                _confidence(*(candidate.confidence for candidate in quick)), quick, evidence,
+                _unique_strings((*reasons, "quality_crop_decision_required")),
+                ("current_quick_answer_ids_checked",),
+            )
+            continue
 
         attempts = ("verified_explanation_ids_checked",)
         authority_reason = decision_reason(leaf, link_manifest, unit_id)
@@ -1123,6 +1180,37 @@ def reconcile_solutions(leaf_run: Path | str) -> ReconciliationResult:
                 ),
                 attempts,
                 quick_answer_agreement,
+            )
+            continue
+
+        # Printed answers are review-only fallbacks, never detailed solutions.
+        # Use only the current upstream candidates, not historical snapshot IDs.
+        raw_picked_answer_ids = link_item.get("answer_ids")
+        picked_answer_ids = raw_picked_answer_ids if isinstance(raw_picked_answer_ids, list) else []
+        quick_ids = _unique_strings((*eligible_review_ids, *picked_answer_ids))
+        quick_candidates = (
+            _existing_candidates(
+                leaf, link_manifest, manifest_item, link_item, quick_ids,
+                origin="link_review_candidate", attempts=attempts, kind="quick_answer",
+            )
+            if not matches else ()
+        )
+        quick_scopes = {
+            signature.get("scope_id")
+            for candidate in quick_candidates
+            if isinstance(signature := candidate.raw_asset.get("quality_signature"), Mapping)
+            and isinstance(signature.get("scope_id"), str)
+        }
+        if len(quick_scopes) > 1:
+            quick_candidates = ()
+            reasons = _unique_strings((*reasons, "ambiguous_quick_answer_scope"))
+        if quick_candidates:
+            decisions[unit_id] = SolutionDecision(
+                unit_id, printed_number, "review",
+                _confidence(*(candidate.confidence for candidate in quick_candidates)),
+                quick_candidates, _unique_strings((*evidence, *quick_answer_evidence)),
+                _unique_strings((*reasons, "quality_crop_decision_required")),
+                attempts, quick_answer_agreement,
             )
             continue
 
@@ -1516,6 +1604,7 @@ def enrich_project_from_leaf(
     leaf_run: Path | str,
     *,
     preserve_approved: bool = False,
+    append_quick_answers_only: bool = False,
     expected_link_manifest_sha256: str | None = None,
     expected_project_revision: int | None = None,
     item_ids: Sequence[str] | None = None,
@@ -1563,7 +1652,7 @@ def enrich_project_from_leaf(
         )
     ):
         raise SolutionIntegrityError("project changed after relink preflight")
-    reconciliation = reconcile_solutions(leaf)
+    reconciliation = reconcile_solutions(leaf, quick_answers_only=append_quick_answers_only)
     if (
         expected_link_manifest_sha256 is not None
         and sha256_file(link_manifest_path) != expected_link_manifest_sha256
@@ -1588,7 +1677,7 @@ def enrich_project_from_leaf(
         item = load_json_object(item_path)
         workflow = item.get("workflow")
         review = item.get("review")
-        if preserve_approved and (
+        if preserve_approved and not append_quick_answers_only and (
             (
                 isinstance(workflow, Mapping)
                 and workflow.get("status") in {"content_ready", "export_ready"}
@@ -1621,10 +1710,16 @@ def enrich_project_from_leaf(
         decision = reconciliation.items.get(unit_id) if isinstance(unit_id, str) else None
         if decision is None:
             continue
+        candidates = tuple(
+            candidate for candidate in decision.candidates
+            if not append_quick_answers_only or candidate.raw_asset.get("kind") == "quick_answer"
+        )
+        if append_quick_answers_only and (not candidates or decision.status not in {"verified", "review"}):
+            continue
         links = provenance.get("solution_links")
         if not isinstance(links, list):
             continue
-        if any(
+        if not append_quick_answers_only and any(
             isinstance(link, Mapping)
             and (
                 "manual_user_confirmation" in (link.get("evidence") or [])
@@ -1644,7 +1739,7 @@ def enrich_project_from_leaf(
         candidate_links = candidate_provenance["solution_links"]
         candidate_snapshot = candidate_provenance.get("raw_snapshot")
         changed = False
-        if decision.status != "verified":
+        if not append_quick_answers_only and decision.status != "verified":
             for existing_link in candidate_links:
                 if isinstance(existing_link, dict) and existing_link.get("status") == "verified":
                     if (existing_link.get('kind') == 'quick_answer'
@@ -1652,7 +1747,7 @@ def enrich_project_from_leaf(
                         continue
                     existing_link.update(status="review", review_reasons=list(decision.review_reasons))
                     changed = True
-        if isinstance(candidate_snapshot, dict):
+        if not append_quick_answers_only and isinstance(candidate_snapshot, dict):
             snapshot_link = candidate_snapshot.get("link_item")
             snapshot_link = copy.deepcopy(snapshot_link) if isinstance(snapshot_link, Mapping) else {}
             reconciliation_snapshot = decision.to_dict()
@@ -1696,9 +1791,9 @@ def enrich_project_from_leaf(
                 changed = True
 
         missing_candidate_issue = "solution_link:review_candidate_asset_missing"
-        if "review_candidate_asset_missing" in decision.review_reasons:
+        if not append_quick_answers_only and "review_candidate_asset_missing" in decision.review_reasons:
             changed |= _append_issue(candidate_document, missing_candidate_issue)
-        else:
+        elif not append_quick_answers_only:
             changed |= _remove_issue(candidate_document, missing_candidate_issue)
 
         if decision.status == "missing":
@@ -1734,10 +1829,10 @@ def enrich_project_from_leaf(
             }
             repaired_candidate_ids = {
                 candidate.candidate_id
-                for candidate in decision.candidates
+                for candidate in candidates
                 if _candidate_is_boundary_seam_repaired(candidate)
             }
-            for candidate in decision.candidates:
+            for candidate in candidates:
                 local_asset_id = _asset_id(candidate.candidate_id)
                 repaired = _candidate_is_boundary_seam_repaired(candidate)
                 candidate_evidence = [
@@ -1754,7 +1849,7 @@ def enrich_project_from_leaf(
                     candidate_evidence.append(BOUNDARY_SEAM_REPAIRED)
                     candidate_review_reasons.append(BOUNDARY_SEAM_REPAIRED)
                 desired_link = {
-                    "kind": "detailed_solution",
+                    "kind": candidate.raw_asset.get("kind", "detailed_solution"),
                     "external_asset_id": candidate.candidate_id,
                     "source_asset_id": local_asset_id,
                     "source_document": candidate.source_document,
@@ -1769,6 +1864,14 @@ def enrich_project_from_leaf(
                     "parts": candidate.to_solution_parts(),
                 }
                 existing_link = existing_by_external.get(candidate.candidate_id)
+                if append_quick_answers_only and existing_link is not None:
+                    continue
+                if (existing_link is not None and desired_link["kind"] == "quick_answer"
+                        and (existing_link.get("status") in {"rejected", "excluded"}
+                             or any("rejected" in str(reason) or "excluded" in str(reason)
+                                    for reason in (existing_link.get("review_reasons") or [])))):
+                    # A newly retained answer must not undo a saved pair rejection.
+                    continue
                 replaced_link = None
                 if existing_link is not None:
                     existing_resource = next((entry for entry in assets
@@ -1833,37 +1936,42 @@ def enrich_project_from_leaf(
                 existing_by_external[candidate.candidate_id] = desired_link
                 added_count += 1
                 changed = True
-            if decision.candidates and decision.status == "review":
+            if not append_quick_answers_only and decision.candidates and decision.status == "review":
                 changed |= _remove_issue(
                     candidate_document, "solution_link:best_effort_exhausted"
                 )
                 changed |= _append_issue(
                     candidate_document, "solution_link:cross_document_verification_pending"
                 )
-            elif decision.candidates and decision.status == "verified":
+            elif not append_quick_answers_only and decision.candidates and decision.status == "verified":
                 changed |= _remove_issue(
                     candidate_document, "solution_link:best_effort_exhausted"
                 )
                 changed |= _remove_issue(
                     candidate_document, "solution_link:cross_document_verification_pending"
                 )
-            if decision.candidates:
+            if not append_quick_answers_only and decision.candidates:
                 review = candidate_document.get("review")
                 if isinstance(review, dict):
                     review["assets"] = "unreviewed"
-                    review["explanation"] = "unreviewed"
-                    coverage = review.get("coverage")
-                    if isinstance(coverage, dict):
-                        coverage["explanation"] = "unreviewed"
-        changed |= refresh_replaced_auto_selection(candidate_document)
+                    if any(candidate.raw_asset.get("kind") == "detailed_solution"
+                           for candidate in decision.candidates):
+                        review["explanation"] = "unreviewed"
+                        coverage = review.get("coverage")
+                        if isinstance(coverage, dict):
+                            coverage["explanation"] = "unreviewed"
+        if not append_quick_answers_only:
+            changed |= refresh_replaced_auto_selection(candidate_document)
         if changed:
-            current_manifest = _load_safe_json(leaf, "solutions/link_manifest.json")
-            bind_import_origin(candidate_document, leaf, unit_id,
-                               current_manifest["items"].get(unit_id, {}), item_path.parent)
+            if not append_quick_answers_only:
+                current_manifest = _load_safe_json(leaf, "solutions/link_manifest.json")
+                bind_import_origin(candidate_document, leaf, unit_id,
+                                   current_manifest["items"].get(unit_id, {}), item_path.parent)
             revision = item.get("workflow", {}).get("revision")
             if not isinstance(revision, int):
                 raise SolutionIntegrityError(f"invalid item revision: {item_id}")
-            save_json_cas(item_path, candidate_document, revision)
+            save_json_cas(item_path, candidate_document, revision,
+                          preserve_content=append_quick_answers_only)
             updated.append(item_id)
     if (
         expected_link_manifest_sha256 is not None

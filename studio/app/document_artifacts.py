@@ -42,13 +42,17 @@ def start_artifact(workspace: Path, identifier: str, request: JsonMap) -> JsonMa
             stage = export_root(workspace, identifier, build)
             stage.mkdir(parents=True)
             immutable(stage / 'document.json', encoded(current))
+            frozen: set[str] = set()
             for item in [*current['imports'], *current['assets']]:
                 relative = item['relative_path']
                 data = confined(root, relative).read_bytes()
                 expected = item.get('sha256', item.get('package_sha256'))
                 if hashlib.sha256(data).hexdigest() != expected:
                     raise DocumentError('document_input_changed', 'Input changed during export snapshot')
-                immutable(confined(stage, relative), data)
+                # Assets are content-addressed: items sharing one source crop share one frozen file.
+                if relative not in frozen:
+                    immutable(confined(stage, relative), data)
+                    frozen.add(relative)
             if request['format'] == 'zip':
                 freeze_receipts(root, stage, current)
             state: JsonMap = {'build_id': build, 'document_id': identifier, 'revision': current['revision'], 'format': request['format'],

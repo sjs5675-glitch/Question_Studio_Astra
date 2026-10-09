@@ -1137,6 +1137,13 @@ def _check_assets(
         if original is None:
             errors.append(f"{block_path}.original_asset_id does not identify a local asset")
             continue
+        if selected.get("role") == "figure_generated" or original.get("role") == "figure_generated":
+            # AI-generated item figure: no source crop lineage; it must be self-referential.
+            if asset_id != original_id or selected.get("section") not in {section, "shared"}:
+                errors.append(f"{block_path} generated figure must reference itself in its section")
+                continue
+            _check_asset_file(item_path, selected, errors)
+            continue
         if selected.get("role") not in {"figure_original", "figure_regenerated"}:
             errors.append(
                 f"{block_path} selected figure role is unsupported: {selected.get('role')!r}"

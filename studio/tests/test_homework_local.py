@@ -43,6 +43,24 @@ class HomeworkLocalTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_handoff_has_completion_not_review_gate(self):
+        from app.model import atomic_write_json
+        path = self.workspace / 'project-one/items/item-1/question.json'
+        package = load_json_object(path)
+        package['content']['answer'] = {'kind': 'content', 'blocks': [{'type': 'paragraph', 'inlines': [{'type': 'text', 'text': 'actual answer'}]}]}
+        package['workflow']['status'] = 'needs_review'
+        atomic_write_json(path, package)
+        _, _, raw = self.request(PREFIX + '/items')
+        row = json.loads(raw)['items'][0]
+        self.assertEqual('complete', row['status']['workflow'])
+        self.assertNotIn('review_issue_count', row['status'])
+        _, _, raw = self.request(PREFIX + '/projects/project-one/items/item-1?revision=2')
+        detail = json.loads(raw)
+        self.assertEqual('complete', detail['completion_status'])
+        self.assertTrue(detail['usable_for_homework'])
+        self.assertNotIn('approval_valid', detail)
+        self.assertEqual(package, detail['package'])
+
     def test_changed_poll_rereads_only_changed_packages(self):
         from unittest.mock import patch
         make_project(self.workspace, 'project-many', [(f'item-{n}', 1, f'question {n}') for n in range(30)])
@@ -204,7 +222,7 @@ class HomeworkLocalTest(unittest.TestCase):
         detail = json.loads(raw)
         self.assertEqual(2, detail['revision'])
         self.assertEqual({'kind': 'text', 'text': '정답'}, detail['package']['content']['answer'])
-        self.assertFalse(detail['approval_valid'])
+        self.assertNotIn('approval_valid', detail)
         self.assertNotIn('candidates', detail)
         self.assertNotIn('jobs', detail)
         for query in ('', '?revision=02', '?revision=2&revision=2', '?revision=2&other=1'):

@@ -66,7 +66,7 @@
 
 - 문제/해설은 같은 neutral template을 공유하고 design profile만 두 개로 분리한다.
 - 위 A4/1단/여백/글자 계층을 사용한다.
-- source mechanics 기준 root는 `C:\Users\USER\OneDrive\학원 자료 모음\exam-studio-multi`로 고정한다.
+- source mechanics 기준 root는 `C:\Users\ExampleUser\OneDrive\학원 자료 모음\exam-studio-multi`로 고정한다.
 
 ## Native ordered v0.2 직렬화 결정
 

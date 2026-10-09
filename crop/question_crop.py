@@ -3344,8 +3344,20 @@ def build_units(
                 }
             )
         if subquestions and unit_mode in {"atomic", "both"}:
+            base_ids = [
+                question["question_id"] + f"-sub-{safe_slug(sub['label'] or str(index), 20)}"
+                for index, sub in enumerate(subquestions, 1)
+            ]
+            reserved_ids = set(base_ids)
+            used_ids: set[str] = set()
             for index, subquestion in enumerate(subquestions, 1):
                 label = subquestion["label"] or str(index)
+                unit_id = base_ids[index - 1]
+                if unit_id in used_ids:
+                    unit_id += f"-ord-{index}"
+                    while unit_id in reserved_ids or unit_id in used_ids:
+                        unit_id += f"-ord-{index}"
+                used_ids.add(unit_id)
                 next_subquestion_y: dict[int, int] = {}
                 if index < len(subquestions):
                     for next_part in subquestions[index]["parts"]:
@@ -3355,7 +3367,7 @@ def build_units(
                         )
                 units.append(
                     {
-                        "unit_id": question["question_id"] + f"-sub-{safe_slug(label, 20)}",
+                        "unit_id": unit_id,
                         "owner_question_id": question["question_id"],
                         "column": question.get("column"),
                         "number_bbox": question.get("number_part"),

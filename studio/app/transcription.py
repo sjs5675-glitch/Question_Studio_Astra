@@ -792,6 +792,20 @@ def _load_prompt_and_schema(
                 "number or source editorial badges in question blocks. Record those "
                 "regions in ignored_regions as target_identifier or editorial_badge."
             )
+        if section == "explanation":
+            target_instruction += (
+                " If a detailed explanation starts with the canonical target number and a "
+                "visibly printed answer symbol (①–⑤), ㄱ/ㄴ/ㄷ combination, or short answer, "
+                "copy that exact printed value into answer. If no explicit printed answer "
+                "is visible, leave answer unknown; never derive it from the explanation."
+                " If this image is a quick-answer table, transcribe only the printed answer "
+                "explicitly associated with the canonical target identifier, including its "
+                "scope and subquestion label. Ignore neighbor rows, columns, and other "
+                "question numbers; record those regions in ignored_regions. Keep blocks empty "
+                "when no actual explanation is printed. If the target row or scope cannot be "
+                "identified unambiguously, return answer kind unknown with a warning; never "
+                "borrow a neighboring answer or infer a solution."
+            )
         if section == "explanation" and "(" in target and target.endswith(")"):
             target_instruction += (
                 " The crop may contain shared analysis and multiple sibling subquestion "
@@ -801,6 +815,13 @@ def _load_prompt_and_schema(
                 "ignored_regions with reason sibling_subquestion. Never merge a sibling's "
                 "answer into the target explanation."
             )
+    if section == "explanation" and shared_parent_mode:
+        target_instruction += (
+            " If an answer is visibly printed alongside its question number at the "
+            "start of the explanation (①–⑤, ㄱ/ㄴ/ㄷ combination, or a short answer), "
+            "preserve that value and its printed number in blocks. In shared-parent "
+            "mode the top-level answer must remain null; never infer a missing answer."
+        )
     if shared_parent_mode:
         prompt_source = "\n".join(
             line
@@ -1145,6 +1166,16 @@ def load_candidate_job(
     return CandidateJob(job_path, metadata, candidate, cached=cached)
 
 
+def _eligible_quick_answer_source(document, source_asset_id: str) -> bool:
+    return any(
+        isinstance(link, Mapping) and link.get("source_asset_id") == source_asset_id
+        and link.get("kind") == "quick_answer" and link.get("status") in {"verified", "review"}
+        and not any("rejected" in str(reason) or "excluded" in str(reason)
+                    for reason in (link.get("review_reasons") or []))
+        for link in document.get("provenance", {}).get("solution_links", [])
+    )
+
+
 def create_transcription_job(
     question_path: Path | str,
     source_asset_id: str,
@@ -1182,7 +1213,9 @@ def create_transcription_job(
     base_revision = _workflow_revision(document)
     _, image = _source_asset(question_path, document, source_asset_id, section)
     selection = document.get("provenance", {}).get("solution_selection") if section == "explanation" else None
-    if isinstance(selection, Mapping) and (selection.get("source_asset_id") != source_asset_id or selection.get("source_sha256") != image.sha256):
+    quick_answer_source = (section == "explanation" and not shared_parent_mode
+                           and _eligible_quick_answer_source(document, source_asset_id))
+    if not quick_answer_source and isinstance(selection, Mapping) and (selection.get("source_asset_id") != source_asset_id or selection.get("source_sha256") != image.sha256):
         raise CandidateIntegrityError("source image differs from solution selection")
     identity = document.get("identity")
     printed_number = (
@@ -1358,6 +1391,8 @@ def create_transcription_job(
             ),
             "source_asset_id": source_asset_id,
             "input_sha256": image.sha256,
+            **({"answer_only_source": True, "solution_selection_snapshot": copy.deepcopy(selection)}
+               if quick_answer_source else {}),
             **({"selection_revision": selection["revision"]} if isinstance(selection, Mapping) else {}),
             "input_media_type": image.media_type,
             "input_width_px": image.width_px,
@@ -1682,6 +1717,9 @@ def normalize_canonical_question_headers(
     return normalized, removed, before, after
 
 
+_PRINTED_LIST_BULLETS = frozenset({"•", "·", "○", "▪", "◦", "*", "-"})
+
+
 class _Normalizer:
     def __init__(
         self,
@@ -1691,12 +1729,14 @@ class _Normalizer:
         seed: str,
         existing_choice_ids: Mapping[str, str] | None = None,
         existing_statement_ids: Mapping[str, str] | None = None,
+        typing_only: bool = False,
     ) -> None:
         self.ids = _IdFactory(item_id, section, seed)
         self.section = section
         self.source_asset_id = source_asset_id
         self.choice_ids = dict(existing_choice_ids or {})
         self.statement_ids = dict(existing_statement_ids or {})
+        self.typing_only = typing_only
         self.figure_assets: list[dict[str, Any]] = []
         self.issues: list[str] = []
 
@@ -1844,6 +1884,33 @@ class _Normalizer:
         )
         return blocks
 
+    def visible_item_blocks(
+        self,
+        items: list[Mapping[str, Any]],
+        bbox: Mapping[str, Any],
+        path: str,
+    ) -> list[dict[str, Any]]:
+        """Keep printed labels as text, without inventing bogi identifiers."""
+        blocks = []
+        for index, item in enumerate(items):
+            label = item["label"]
+            if (
+                label in _PRINTED_LIST_BULLETS and item["figure_bbox"] is None
+                and not _text_run_stream(item["runs"]).strip()
+            ):
+                raise CandidateValidationError(
+                    f"{path}.items[{index}] has a bullet but no readable content"
+                )
+            runs = ([{"type": "text", "text": label + (" " if item["runs"] else "")}]
+                    if label else []) + item["runs"]
+            blocks.extend(self.labeled_blocks(
+                dict(item, runs=runs), bbox, "main", f"{path}.items[{index}]", "shared_box"
+            ))
+        self.issues.append(
+            f"{path}: 보기 식별자로 연결하지 않고 원문 라벨을 일반 자료 상자에 보존했습니다."
+        )
+        return blocks
+
     def block(self, block: Mapping[str, Any], path: str) -> dict[str, Any]:
         block_type = block["type"]
         bbox = block["bbox"]
@@ -1871,16 +1938,23 @@ class _Normalizer:
                 regeneration_note=block["regeneration_note"],
             )
         if block_type in {"bogi", "choices"}:
-            if (
-                block_type == "bogi"
-                and self.bogi_label_mode(block["items"], path) == "all_empty"
-            ):
+            label_mode = None
+            if block_type == "bogi":
+                label_mode = (
+                    "bullets" if block["items"] and all(
+                        item["label"] in _PRINTED_LIST_BULLETS for item in block["items"]
+                    ) else self.bogi_label_mode(block["items"], path)
+                )
+            if label_mode in {"all_empty", "bullets"}:
                 result = {
                     **common,
                     "type": "box",
                     "role": "note",
-                    "blocks": self.unlabeled_item_blocks(
-                        block["items"], bbox, path, "bogi"
+                    "blocks": (
+                        self.visible_item_blocks(block["items"], bbox, path)
+                        if label_mode == "bullets" else self.unlabeled_item_blocks(
+                            block["items"], bbox, path, "bogi"
+                        )
                     ),
                 }
                 if block["title_visible"] or block["title"]:
@@ -1946,20 +2020,25 @@ class _Normalizer:
             if block["runs"]:
                 children.append(self.paragraph(block["runs"], "body", bbox, f"{path}.text"))
             if block["items"]:
-                # Printed bullets are visible text, not unique bogi identifiers.
-                # Preserve them in ordinary box paragraphs; do not relax bogi validation.
+                # A box is source layout, not an assertion of unique bogi IDs.
+                # Fall back only for label/layout conflicts, never parse failures.
+                labels = [item["label"] for item in block["items"]]
+                empty = [not label.strip() for label in labels]
+                plain_items = (
+                    all(label in _PRINTED_LIST_BULLETS for label in labels)
+                    or (any(empty) and not all(empty))
+                    or (not all(empty) and len(set(labels)) != len(labels))
+                    or any(
+                        item["label"].strip() and not item["runs"]
+                        and item["figure_bbox"] is None for item in block["items"]
+                    )
+                )
                 label_mode = (
-                    "bullets" if all(item.get("label") == "•" for item in block["items"])
+                    "plain" if plain_items
                     else self.bogi_label_mode(block["items"], f"{path}.items")
                 )
-                if label_mode == "bullets":
-                    for index, item in enumerate(block["items"]):
-                        visible_item = dict(item, runs=[
-                            {"type": "text", "text": "• "}, *item["runs"]
-                        ])
-                        children.extend(self.labeled_blocks(
-                            visible_item, bbox, "body", f"{path}.items[{index}]", "shared_box"
-                        ))
+                if label_mode == "plain":
+                    children.extend(self.visible_item_blocks(block["items"], bbox, path))
                 elif label_mode == "all_empty":
                     children.extend(
                         self.unlabeled_item_blocks(
@@ -2062,7 +2141,7 @@ class _Normalizer:
                 else:
                     canonical_labels.append(canonical)
             if not labels or missing:
-                visible_runs = value.get("runs")
+                visible_runs = value.get("runs") or []
                 has_visible_answer = isinstance(visible_runs, list) and any(
                     isinstance(run, Mapping)
                     and (
@@ -2079,6 +2158,14 @@ class _Normalizer:
                     )
                     for run in visible_runs
                 )
+                if (
+                    self.typing_only and self.section == "explanation" and labels
+                    and missing and not has_visible_answer
+                    and all(isinstance(label, str) and label.strip() for label in labels)
+                ):
+                    # These are recognized glyphs, not inferred canonical IDs.
+                    visible_runs = [{"type": "text", "text": label} for label in labels]
+                    has_visible_answer = True
                 if (
                     labels
                     and missing
@@ -2176,6 +2263,96 @@ def _collect_choice_ids(
     return result
 
 
+def _choice_matrix_labels(table: Mapping[str, Any]) -> list[str] | None:
+    """Recognize only a single header and five explicit, unmerged choice rows."""
+    columns = table.get("column_count")
+    rows = table.get("rows")
+    if type(columns) is not int or columns < 2 or not isinstance(rows, list) or len(rows) != 6:
+        return None
+    labels = []
+    for row_index, row in enumerate(rows):
+        cells = row.get("cells") if isinstance(row, Mapping) else None
+        if not isinstance(cells, list) or len(cells) != columns:
+            return None
+        for cell in cells:
+            if not isinstance(cell, Mapping) or any(
+                type(cell.get(key)) is not int or cell[key] != 1 for key in ("row_span", "col_span")
+            ) or cell.get("role") != ("header" if row_index == 0 else "body"):
+                return None
+            if not isinstance(cell.get("blocks"), list):
+                return None
+        if row_index == 0:
+            if cells[0]["blocks"] or any(not cell["blocks"] for cell in cells[1:]):
+                return None
+            continue
+        label_blocks = cells[0]["blocks"]
+        if len(label_blocks) != 1 or label_blocks[0].get("type") != "paragraph":
+            return None
+        runs = label_blocks[0].get("inlines")
+        if not isinstance(runs, list) or not runs or any(
+            not isinstance(run, Mapping) or run.get("type") != "text" or not isinstance(run.get("text"), str)
+            for run in runs
+        ):
+            return None
+        labels.append("".join(run["text"] for run in runs))
+    return labels if len(set(labels)) == 5 and set(labels) == set("①②③④⑤") else None
+
+
+def normalize_canonical_choice_matrix(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy printed matrix rows into canonical choices, retaining source evidence."""
+    normalized = copy.deepcopy(dict(document))
+    content = normalized.get("content")
+    identity = normalized.get("identity")
+    if not isinstance(content, Mapping) or not isinstance(identity, Mapping):
+        return normalized
+    question = content.get("question")
+    if (identity.get("answer_type") != "multiple_choice" or content.get("answer") is not None
+            or not isinstance(question, Mapping) or not isinstance(question.get("blocks"), list)):
+        return normalized
+
+    def walk(value: Any):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+
+    nodes = list(walk(question))
+    if any(node.get("type") == "choices" for node in nodes) or sum(
+        node.get("type") == "table" and node.get("semantic_type") == "choice_matrix" for node in nodes
+    ) != 1:
+        return normalized
+    for index, table in enumerate(question["blocks"]):
+        if not isinstance(table, Mapping) or table.get("type") != "table" or table.get("semantic_type") != "choice_matrix":
+            continue
+        labels = _choice_matrix_labels(table)
+        if labels is None:
+            continue
+        ids = _IdFactory(normalized["item_id"], "question", table["block_id"])
+        items = []
+        for row_index, row in enumerate(table["rows"][1:]):
+            label = labels[row_index]
+            header = copy.deepcopy(table["rows"][0])
+            for header_index, node in enumerate(walk(header)):
+                if "block_id" in node:
+                    node["block_id"] = ids.make("block", f"row[{row_index}].header.blocks[{header_index}]")
+            nested = copy.deepcopy(dict(table))
+            nested["block_id"] = ids.make("block", f"row[{row_index}].table")
+            nested["rows"] = [header, copy.deepcopy(row)]
+            items.append({
+                "choice_id": ids.make("choice", f"row[{row_index}]"),
+                "label": label,
+                "blocks": [nested],
+            })
+        question["blocks"][index] = {
+            key: copy.deepcopy(table[key])
+            for key in ("block_id", "source_region", "confidence", "review_status") if key in table
+        } | {"type": "choices", "source_layout": "vertical", "items": items}
+    return normalized
+
+
 def _collect_statement_ids(
     value: Any,
     result: dict[str, str] | None = None,
@@ -2215,6 +2392,7 @@ def normalize_candidate_for_apply(
     existing_choice_ids: Mapping[str, str] | None = None,
     existing_statement_ids: Mapping[str, str] | None = None,
     printed_number: str | None = None,
+    typing_only: bool = False,
 ) -> dict[str, Any]:
     """Add app-owned IDs and canonical source regions without mutating input."""
 
@@ -2229,6 +2407,7 @@ def normalize_candidate_for_apply(
         id_seed,
         existing_choice_ids,
         existing_statement_ids,
+        typing_only=typing_only,
     )
     candidate_blocks = candidate["blocks"]
     if section == "question":
@@ -2571,6 +2750,7 @@ def apply_candidate_job(
     use_jsonschema: bool = True,
     preserve_existing_answer: bool = False,
     discard_candidate_answer: bool = False,
+    typing_only: bool = False,
 ) -> dict[str, Any]:
     """Apply a completed candidate with compare-and-swap revision protection."""
 
@@ -2594,9 +2774,15 @@ def apply_candidate_job(
     _, image = _source_asset(question_path, current, source_asset_id, section)
     if image.sha256 != job.metadata.get("input_sha256"):
         raise CandidateIntegrityError("source image changed after candidate creation")
+    quick_answer_source = section == "explanation" and _eligible_quick_answer_source(current, source_asset_id)
+    if job.metadata.get("answer_only_source") is True and not quick_answer_source:
+        raise CandidateIntegrityError("quick-answer source is no longer eligible")
     if section == "explanation":
         selection = current.get("provenance", {}).get("solution_selection")
-        if isinstance(selection, Mapping) and (
+        independent_quick = quick_answer_source and job.metadata.get("answer_only_source") is True
+        if independent_quick and selection != job.metadata.get("solution_selection_snapshot"):
+            raise CandidateIntegrityError("solution selection changed after candidate creation")
+        if not independent_quick and isinstance(selection, Mapping) and (
             selection.get("source_asset_id") != source_asset_id
             or selection.get("source_sha256") != image.sha256
             or selection.get("revision") != job.metadata.get("selection_revision")
@@ -2607,11 +2793,23 @@ def apply_candidate_job(
     content = current.get("content")
     if not isinstance(item_id, str) or not isinstance(content, Mapping):
         raise TranscriptionError("question item_id/content is invalid")
-    existing_choice_ids = _collect_choice_ids(content.get("question"))
-    existing_statement_ids = _collect_statement_ids(content.get("question"))
     candidate = copy.deepcopy(job.candidate)
     if discard_candidate_answer or job.metadata.get("shared_parent_mode") is True:
         candidate["answer"] = None
+    matrix_recovered = False
+    candidate_answer = candidate.get("answer")
+    if not typing_only and section == "explanation" and isinstance(candidate_answer, Mapping) and candidate_answer.get("kind") == "choice":
+        canonical = normalize_canonical_choice_matrix(current)
+        matrix_recovered = canonical["content"]["question"] != content.get("question")
+        current = canonical
+        content = current["content"]
+    existing_choice_ids = _collect_choice_ids(content.get("question"))
+    existing_statement_ids = _collect_statement_ids(content.get("question"))
+    if quick_answer_source and not typing_only:
+        if any(block.get("role") != "answer" for block in candidate.get("blocks", [])):
+            raise CandidateValidationError("quick-answer sources cannot publish explanation blocks")
+        # Visible answer-role blocks are not a separate solution narrative.
+        candidate["blocks"] = []
     normalized = normalize_candidate_for_apply(
         candidate,
         item_id=item_id,
@@ -2620,12 +2818,26 @@ def apply_candidate_job(
         id_seed=job.metadata["idempotency_key"],
         existing_choice_ids=existing_choice_ids,
         existing_statement_ids=existing_statement_ids,
+        typing_only=typing_only,
         printed_number=(
             current.get("identity", {}).get("printed_number")
             if isinstance(current.get("identity"), Mapping)
             else None
         ),
     )
+    if typing_only and quick_answer_source and normalized["section"]["blocks"]:
+        # Preserve recognized source blocks without upgrading quick provenance
+        # to a detailed solution or inferring an answer from their meaning.
+        literal_blocks = normalized["section"]["blocks"]
+        if isinstance(normalized["answer"], Mapping) and normalized["answer"].get("kind") == "content":
+            literal_blocks = [*literal_blocks, *normalized["answer"]["blocks"]]
+        normalized["answer"] = {"kind": "content", "blocks": literal_blocks}
+        normalized["section"] = {"blocks": []}
+        normalized["issues"].append("빠른정답 출처의 인식 블록을 추론 없이 정답 원문으로 저장했습니다.")
+    if matrix_recovered and (
+        not isinstance(normalized["answer"], Mapping) or normalized["answer"].get("kind") != "choice"
+    ):
+        raise CandidateValidationError("choice-matrix recovery requires an explicitly linked printed answer")
     figure_assets = _materialize_figure_assets(
         question_path,
         image,
@@ -2634,11 +2846,16 @@ def apply_candidate_job(
         normalized["figure_assets"],
     )
     updated = copy.deepcopy(current)
+    if matrix_recovered:
+        updated["review"]["question"] = "unreviewed"
+        updated["review"]["coverage"]["question"] = "unreviewed"
+        normalized["issues"].append("원본 선택표의 헤더와 각 행을 보존하여 canonical 선택지 구조로 연결했습니다.")
     # A missing explanation is null in the canonical contract, not an empty section.
-    updated["content"][section] = (
-        None if section == "explanation" and not normalized["section"]["blocks"]
-        else normalized["section"]
-    )
+    if not quick_answer_source:
+        updated["content"][section] = (
+            None if section == "explanation" and not normalized["section"]["blocks"]
+            else normalized["section"]
+        )
     assets = updated["resources"]["assets"]
     assets_by_id = {
         asset.get("asset_id"): asset for asset in assets if isinstance(asset, Mapping)
@@ -2658,10 +2875,11 @@ def apply_candidate_job(
     ):
         updated["content"]["answer"] = normalized["answer"]
         updated["review"]["answer"] = "unreviewed"
-    updated["review"][section] = "unreviewed"
-    updated["review"]["coverage"][section] = (
-        "unreviewed" if job.candidate["coverage_complete"] else "incomplete"
-    )
+    if not quick_answer_source:
+        updated["review"][section] = "unreviewed"
+        updated["review"]["coverage"][section] = (
+            "unreviewed" if job.candidate["coverage_complete"] else "incomplete"
+        )
     prior_review_issues = _review_issues_for_source_changed_reapply(
         current, section, source_asset_id
     )
@@ -2709,12 +2927,20 @@ def apply_candidate_job(
         }
     )
     review = updated["review"]
+    if (section == "explanation" and not quick_answer_source
+            and normalized["answer"] is None and not discard_candidate_answer
+            and job.metadata.get("shared_parent_mode") is not True):
+        from .answer_promotion import promote_answer_from_explanation
+        promoted, _ = promote_answer_from_explanation(updated)
+        if promoted is not None:
+            updated["content"]["answer"] = promoted
+            review["answer"] = "unreviewed"
     review["approved_revision"] = None
     review["approved_sha256"] = None
     review["reviewer"] = None
     review["reviewed_at"] = None
     updated["workflow"]["status"] = "needs_review"
-    if section == "explanation":
+    if section == "explanation" and not quick_answer_source:
         updated["provenance"]["last_auto_applied_hash"] = solution_content_hash(updated)
     # Approval was explicitly invalidated above.  preserve_approval keeps the
     # more informative automatic `incomplete` coverage flag from being reduced

@@ -75,6 +75,14 @@ class Trash:
         if self.is_deleted(project_id, item_id):
             raise TrashError("휴지통에 있는 대상입니다. 먼저 복원하세요.", 410)
 
+    def deletion_snapshot(self) -> Callable[[str, str | None], bool]:
+        """Fresh per-list predicate; never retained across requests or writes."""
+        with self.lock:
+            state = self._state()
+        def deleted(project_id: str, item_id: str | None = None) -> bool:
+            return project_id in state["projects"] or (item_id is not None and item_id in state["items"].get(project_id, {}))
+        return deleted
+
     def is_deleted(self, project_id: str, item_id: str | None = None) -> bool:
         state = self._state()
         return project_id in state["projects"] or (item_id is not None and item_id in state["items"].get(project_id, {}))

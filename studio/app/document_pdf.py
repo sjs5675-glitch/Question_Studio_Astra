@@ -53,11 +53,15 @@ def start_pdf(workspace: Path, identifier: str, request: JsonMap) -> JsonMap:
             owner = export_root(workspace, identifier, build_id)
             owner.mkdir(parents=True)
             immutable(owner / 'document.json', encoded(document))
+            frozen: set[str] = set()
             for asset in document['assets']:
                 data = confined(root, asset['relative_path']).read_bytes()
                 if hashlib.sha256(data).hexdigest() != asset['sha256']:
                     raise DocumentError('document_asset_corrupt', 'Asset changed while freezing PDF input')
-                immutable(confined(owner, asset['relative_path']), data)
+                # Assets are content-addressed: items sharing one source crop share one frozen file.
+                if asset['relative_path'] not in frozen:
+                    immutable(confined(owner, asset['relative_path']), data)
+                    frozen.add(asset['relative_path'])
             state: JsonMap = {'build_id': build_id, 'document_id': identifier, 'revision': current['revision'], 'output_role': request['output_role'], 'status': 'building'}
             atomic_write_json(owner / 'status.json', state)
         cancel = threading.Event()

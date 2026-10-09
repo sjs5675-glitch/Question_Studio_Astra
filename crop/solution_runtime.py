@@ -17,6 +17,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -35,6 +36,7 @@ import pypdfium2 as pdfium
 
 import ensemble
 from answer_cell_geometry import AnswerCell, isolated_answer_cell_bbox
+from solution_anchor_inheritance import inherit_missing_anchors
 from astra_runtime import inside
 import question_crop as qc
 from solution_learning.contracts import ExampleKind
@@ -76,11 +78,13 @@ from solution_link import (
     StageHookError,
     StartAnchor,
     assign_numbering_scopes,
+    bind_parent_review_authority,
     derive_link_statuses,
     expand_start_anchors,
     expanded_candidate_pairs,
     normalize_parent_number,
     normalize_subquestion_label,
+    split_printed_number,
     neighbor_evidence_state,
     page_identity,
     propagate_problem_anchors,
@@ -105,7 +109,7 @@ REPAIR_SCHEMA = ROOT / "solution_crop_repair.schema.json"
 SCOPE_VERIFY_PROMPT = ROOT / "prompts" / "verify_scope_pair.md"
 SCOPE_VERIFY_SCHEMA = ROOT / "scope_pair_verification.schema.json"
 SCOPE_VERIFY_CONTRACT_VERSION = "4"
-RUNTIME_VERSION = "78"
+RUNTIME_VERSION = "80"
 AI_CONTRACT_CACHE_VERSION = "12"
 LEGACY_AI_CONTRACT_CACHE_VERSIONS = ("7", "8", "9", "10", "11")
 BOUNDARY_CONSENSUS_VERSION = "6"
@@ -368,6 +372,14 @@ def run_qwen_labeled(
     raise astra_cli.AstraError("legacy_text_provider_disabled")
 
 
+def _runtime_receipt_failed(receipt: object) -> bool:
+    # Detection proposals are not final authority receipts, but an explicit
+    # failed/incomplete transport can never count as successful detection.
+    return not isinstance(receipt, Mapping) or receipt.get("terminal_completed") is False or (
+        "status" in receipt and receipt["status"] != "succeeded"
+    )
+
+
 def run_codex_contract(
     *,
     stage: str,
@@ -378,16 +390,22 @@ def run_codex_contract(
     run_dir: Path,
     model: str | None,
     force: bool,
-    timeout: int = 600,
+    timeout: int | None = None,
 ) -> dict[str, Any] | None:
+    # Full solution-page detection can exceed ten minutes; keep other stages
+    # and callers' explicit limits unchanged.
+    if timeout is None:
+        timeout = 1200 if stage == "solution-blocks-codex" else 600
     model = astra_cli.MODEL
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     keys = _contract_cache_keys(stage, prompt, schema_path, images, model)
     key = keys[0]
-    if not force and output.exists():
+    if not force and output.exists() and not _boundary_error_path(output).exists():
         try:
             wrapper = json.loads(output.read_text(encoding="utf-8"))
-            if wrapper.get("meta", {}).get("cache_key") in keys:
+            if wrapper.get("meta", {}).get("cache_key") in keys and not _runtime_receipt_failed(
+                wrapper.get("meta", {}).get("runtime_receipt", {})
+            ):
                 validate_contract(wrapper["result"], schema)
                 return wrapper["result"]
         except (OSError, KeyError, json.JSONDecodeError, ContractError):
@@ -405,8 +423,12 @@ def run_codex_contract(
         (logs / f"{log_stem}.events.jsonl").write_text(process.stdout, encoding="utf-8")
         (logs / f"{log_stem}.stderr.log").write_text(process.stderr, encoding="utf-8")
         if process.returncode != 0 or not last.exists():
+            output.unlink(missing_ok=True)
             _persist_boundary_error(output, "astra", astra_cli.MODEL, process.stderr or "cli_failed")
             return None
+        receipt = json.loads(process.stdout)
+        if _runtime_receipt_failed(receipt):
+            raise ContractError("provider_terminal_failure")
         response_text = last.read_bytes().decode("utf-8")
         result = qc.extract_json_message(response_text)
         validate_contract(result, schema)
@@ -414,8 +436,11 @@ def run_codex_contract(
             output,
             {"meta": {"stage": stage, "cache_key": key, "model": model, "policy_version": astra_cli.POLICY_VERSION, "effort": astra_cli.effort_for(stage), "runtime_receipt": json.loads(process.stdout), "request_prompt": prompt, "response_text": response_text}, "result": result},
         )
+        _boundary_error_path(output).unlink(missing_ok=True)
         return result
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ContractError):
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ContractError) as error:
+        output.unlink(missing_ok=True)
+        _persist_boundary_error(output, "astra", astra_cli.MODEL, _provider_error_reason(error))
         return None
     finally:
         last.unlink(missing_ok=True)
@@ -1179,14 +1204,7 @@ def solution_asset_output_path(
 
 
 def _split_number(value: str, unit_kind: str | None) -> tuple[str, str | None]:
-    text = unicodedata.normalize("NFKC", str(value)).strip()
-    if unit_kind == "subquestion":
-        match = re.match(r"^(.*?)(?:\(([^()]+)\)|\[([^\[\]]+)\])$", text)
-        if match and match.group(1).strip():
-            return normalize_parent_number(match.group(1)), normalize_subquestion_label(
-                match.group(2) or match.group(3)
-            )
-    return normalize_parent_number(text), None
+    return split_printed_number(value, unit_kind)
 
 
 def _semantic_label(value: object) -> str:
@@ -3201,6 +3219,8 @@ class RuntimeState:
     prior_empty_candidate_ids: set[str] = field(default_factory=set)
     prior_missing_detailed_ids: set[str] = field(default_factory=set)
     prior_link_present: bool = False
+    reviewed_context_provenance: Mapping[str, Any] | None = None
+    alignment_reviewed_context_provenance: Mapping[str, Any] | None = None
     search_attempted_pages: set[int] = field(default_factory=set)
     expanded_assets: dict[str, SolutionAsset] = field(default_factory=dict)
     scope_input_contexts: dict[tuple[str, str], JsonMap] = field(default_factory=dict)
@@ -3351,6 +3371,158 @@ class SolutionRuntimeAdapter:
         ]
         return scope_alignment_mod.normalize_tokens(cleaned)
 
+    @staticmethod
+    def _reviewed_episode_context(solutions_dir, snapshot, problem_sha, solution_sha):
+        """Read a run-local reviewed input; never mutate the source snapshot."""
+        path = solutions_dir / "reviewed_episode_context.json"
+        if not os.path.lexists(path):
+            return {}, None
+
+        def require(condition, reason):
+            if not condition:
+                raise StageHookError("reviewed episode context " + reason)
+
+        def sha(value):
+            return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+        def strings(value, nonempty=False):
+            return (isinstance(value, list) and (bool(value) or not nonempty)
+                    and all(isinstance(v, str) and bool(v.strip()) for v in value))
+
+        def local_file(relative):
+            require(isinstance(relative, str) and bool(relative)
+                    and "\\" not in relative and ":" not in relative
+                    and not relative.startswith("/")
+                    and all(part not in {"", ".", ".."} for part in relative.split("/")),
+                    "proof path invalid")
+            candidate = solutions_dir.absolute() / relative
+            # Check *every* ancestor, including run/root, before reading bytes.
+            for component in reversed((candidate, *candidate.parents)):
+                info = component.lstat()
+                require(not stat.S_ISLNK(info.st_mode)
+                        and not (getattr(info, "st_file_attributes", 0) & 0x400),
+                        "symlink or junction forbidden")
+            require(candidate.resolve().is_relative_to(solutions_dir.resolve())
+                    and stat.S_ISREG(candidate.lstat().st_mode), "proof boundary invalid")
+            return candidate
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                require(key not in result, "duplicate JSON field")
+                result[key] = value
+            return result
+
+        try:
+            raw = local_file(path.name).read_bytes()
+            payload = json.loads(raw, object_pairs_hook=unique_object)
+            require(isinstance(payload, dict) and set(payload) == {
+                "schema_version", "mode", "trust_flag", "confirmed", "source_solution_sha256",
+                "problem_source_sha256", "corrections"}, "schema fields invalid")
+            require(type(payload["schema_version"]) is int and payload["schema_version"] == 1
+                    and payload["mode"] == "REVIEW"
+                    and type(payload["trust_flag"]) is int and payload["trust_flag"] == 0
+                    and type(payload["confirmed"]) is int and payload["confirmed"] == 0,
+                    "schema or review authority invalid")
+            require(sha(problem_sha) and sha(solution_sha)
+                    and sha(payload["problem_source_sha256"])
+                    and sha(payload["source_solution_sha256"])
+                    and payload["problem_source_sha256"] == problem_sha
+                    and payload["source_solution_sha256"] == solution_sha
+                    and snapshot.solution_sha256 == solution_sha, "source binding mismatch")
+            require(isinstance(payload["corrections"], list) and bool(payload["corrections"]),
+                    "corrections missing")
+            return SolutionRuntimeAdapter._validated_reviewed_context(
+                solutions_dir, snapshot, payload, raw, local_file, require, sha, strings,
+                problem_sha, solution_sha
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise StageHookError("reviewed episode context invalid input") from exc
+
+    @staticmethod
+    def _validated_reviewed_context(solutions_dir, snapshot, payload, raw, local_file,
+                                   require, sha, strings, problem_sha, solution_sha):
+        overrides = {}
+        proofs = {}
+        episodes = {episode.episode_id: episode for episode in snapshot.episodes}
+        for correction in payload["corrections"]:
+            require(isinstance(correction, dict) and set(correction) == {
+                "episode_id", "old_section_tokens", "expected_ordered_numbers",
+                "expected_order_key", "reviewed_hierarchy_path", "proof_files",
+                "reviewer", "observation"}, "correction fields invalid")
+            require(isinstance(correction["episode_id"], str)
+                    and correction["episode_id"] in episodes
+                    and correction["episode_id"] not in overrides, "duplicate or unknown target")
+            episode = episodes[correction["episode_id"]]
+            order = correction["expected_order_key"]
+            require(strings(correction["old_section_tokens"])
+                    and strings(correction["expected_ordered_numbers"], True)
+                    and isinstance(order, list) and len(order) == 2
+                    and all(type(value) is int and value >= 0 for value in order)
+                    and list(episode.section_tokens) == correction["old_section_tokens"]
+                    and list(episode.entry_numbers) == correction["expected_ordered_numbers"]
+                    and [episode.page_span[0], episode.block_span[0]] == order,
+                    "target changed")
+            require(strings(correction["reviewed_hierarchy_path"], True)
+                    and isinstance(correction["reviewer"], str) and bool(correction["reviewer"].strip())
+                    and isinstance(correction["observation"], str) and bool(correction["observation"].strip()),
+                    "review text invalid")
+            overrides[episode.episode_id] = scope_alignment_mod.normalize_tokens(
+                correction["reviewed_hierarchy_path"]
+            )
+            require(bool(overrides[episode.episode_id]), "review tokens empty")
+            require(isinstance(correction["proof_files"], list) and bool(correction["proof_files"]),
+                    "proof files missing")
+            targets = set()
+            correction_paths = set()
+            for proof in correction["proof_files"]:
+                require(isinstance(proof, dict), "proof fields invalid")
+                target = proof.get("target")
+                require(isinstance(target, str) and target in {
+                    "problem_source", "solution_source", "problem_page", "solution_page"},
+                    "unknown proof target")
+                expected_fields = {"path", "sha256", "target", "source_sha256"}
+                if target.endswith("_page"):
+                    expected_fields.add("pdf_page")
+                    require(type(proof.get("pdf_page")) is int and proof["pdf_page"] > 0,
+                            "proof page invalid")
+                require(set(proof) == expected_fields and sha(proof["sha256"])
+                        and sha(proof["source_sha256"]), "proof fields invalid")
+                expected_sha = problem_sha if target.startswith("problem") else solution_sha
+                require(proof["source_sha256"] == expected_sha, "proof source mismatch")
+                proof_path = local_file(proof["path"])
+                # Windows paths are case-insensitive; reject aliases within a correction.
+                identity = os.path.normcase(str(proof_path.resolve()))
+                require(identity not in correction_paths, "duplicate proof")
+                correction_paths.add(identity)
+                actual = _digest_file(proof_path)
+                require(actual == proof["sha256"], "proof changed")
+                if target.endswith("_source"):
+                    require(actual == expected_sha, "proof source bytes mismatch")
+                require(proof["path"] not in proofs or proofs[proof["path"]] == proof,
+                        "conflicting proof binding")
+                proofs[proof["path"]] = {**proof, "sha256": actual}
+                targets.add(target)
+            require(targets == {"problem_source", "solution_source", "problem_page", "solution_page"},
+                    "proof targets incomplete")
+        inventory = [proofs[key] for key in sorted(proofs)]
+        require(local_file("reviewed_episode_context.json").read_bytes() == raw,
+                "input changed during validation")
+        for proof in inventory:
+            require(_digest_file(local_file(proof["path"])) == proof["sha256"],
+                    "proof changed during validation")
+        provenance = {
+            "relative_path": "solutions/reviewed_episode_context.json",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "proof_files": inventory,
+            "proof_inventory_sha256": hashlib.sha256(
+                json.dumps(inventory, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "episode_ids": sorted(overrides),
+            "mode": "REVIEW", "trust_flag": 0, "confirmed": 0,
+        }
+        return overrides, provenance
+
     def build_scope_alignment(
         self,
         context: LinkContext,
@@ -3370,8 +3542,12 @@ class SolutionRuntimeAdapter:
         if self.provider_profile == "codex_only":
             consensus_dir = consensus_dir / "codex_only"
         if not (solutions_dir / "page_map.json").is_file():
+            if os.path.lexists(solutions_dir / "reviewed_episode_context.json"):
+                raise StageHookError("reviewed episode context scope cache missing")
             return None
         if not any(consensus_dir.glob("page-*.json")):
+            if os.path.lexists(solutions_dir / "reviewed_episode_context.json"):
+                raise StageHookError("reviewed episode context consensus missing")
             return None
         snapshot = solution_scope_mod.build_scope_index(
             solutions_dir, provider_profile=self.provider_profile
@@ -3396,6 +3572,14 @@ class SolutionRuntimeAdapter:
                 raise StageHookError(
                     f"cannot resolve current {name} from runtime source"
                 )
+        reviewed_context, reviewed_provenance = self._reviewed_episode_context(
+            solutions_dir, snapshot, problem_index.source_sha256, snapshot.solution_sha256
+        )
+        if reviewed_provenance is not None:
+            # Validate actual problem PDF before publishing any derived index.
+            state = self._state(context)
+            if _digest_file(self._source_pdf(state)) != problem_index.source_sha256:
+                raise StageHookError("reviewed episode context actual problem source changed")
         reconciliation = _reconcile_solution_printed_page_map(
             solutions_dir,
             consensus_dir,
@@ -3488,7 +3672,7 @@ class SolutionRuntimeAdapter:
                     episode_id=episode.episode_id,
                     order_key=(episode.page_span[0], episode.block_span[0]),
                     roles=episode.role_mix,
-                    section_tokens=episode.section_tokens,
+                    section_tokens=reviewed_context.get(episode.episode_id, episode.section_tokens),
                     label_tokens=scope_alignment_mod.normalize_tokens(
                         [episode.raw_label] if episode.raw_label else []
                     ),
@@ -3570,12 +3754,69 @@ class SolutionRuntimeAdapter:
                 ).encode("utf-8")
             ).hexdigest(),
         }
-        return ScopeAlignmentBundle(alignment, episode_assets, provenance)
+        if reviewed_provenance is not None:
+            provenance["reviewed_episode_context"] = reviewed_provenance
+            # A manually supplied title is candidate evidence, not authority.
+            alignment = replace(alignment, entries=tuple(
+                replace(entry, aligned_episode_id=None, margin=0.0,
+                        evidence=tuple(dict.fromkeys((*entry.evidence, "reviewed_episode_context_review_only"))))
+                if entry.aligned_episode_id in reviewed_context else entry
+                for entry in alignment.entries
+            ), edges=tuple(
+                replace(edge, trusted=False, score=(0, *edge.score[1:]),
+                        status="allowed" if edge.status == "selected" else edge.status)
+                if edge.episode_id in reviewed_context else edge
+                for edge in alignment.edges
+            ))
+            _, current_reviewed_provenance = self._reviewed_episode_context(
+                solutions_dir, snapshot, problem_index.source_sha256, snapshot.solution_sha256
+            )
+            if current_reviewed_provenance != reviewed_provenance:
+                raise StageHookError("reviewed episode context changed during alignment")
+        state.alignment_reviewed_context_provenance = reviewed_provenance
+        parent_review_authority = bind_parent_review_authority(
+            problem_index.items, episode_assets, snapshot.to_dict(),
+            problem_source_sha256=problem_index.source_sha256,
+            solution_source_sha256=snapshot.solution_sha256,
+        )
+        return ScopeAlignmentBundle(
+            alignment, episode_assets, provenance,
+            parent_review_authority=parent_review_authority,
+        )
+
+    def _current_reviewed_context(self, context, state):
+        solutions_dir = context.run_dir / "solutions"
+        if not os.path.lexists(solutions_dir / "reviewed_episode_context.json"):
+            return None
+        problem_sha = _digest_file(self._source_pdf(state))
+        if problem_sha != state.manifest.get("source_sha256"):
+            raise StageHookError("reviewed episode context actual problem source changed")
+        snapshot = solution_scope_mod.build_scope_index(
+            solutions_dir, provider_profile=self.provider_profile
+        )
+        _, provenance = self._reviewed_episode_context(
+            solutions_dir, snapshot, problem_sha, _digest_file(context.solution_path)
+        )
+        return provenance
 
     def _state(self, context: LinkContext) -> RuntimeState:
         key = (str(context.run_dir.resolve()), str(context.solution_path.resolve()))
         if key in self.states:
-            return self.states[key]
+            state = self.states[key]
+            if (os.path.lexists(context.run_dir / "solutions/reviewed_episode_context.json")
+                    or getattr(state, "reviewed_context_provenance", None) is not None):
+                current = self._current_reviewed_context(context, state)
+                try:
+                    prior = json.loads((context.run_dir / "solutions/link_manifest.json").read_bytes())
+                    old = prior.get("scope_contract", {}).get("provenance", {}).get("reviewed_episode_context")
+                except (OSError, ValueError, AttributeError):
+                    old = None
+                if current != old:
+                    state.prior_link_present = False
+                    state.prior_empty_candidate_ids.clear()
+                    state.prior_missing_detailed_ids.clear()
+                state.reviewed_context_provenance = current
+            return state
         manifest_path = context.run_dir / "manifest.json"
         run_state_path = context.run_dir / "run_state.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3587,6 +3828,7 @@ class SolutionRuntimeAdapter:
         state.manifest_items_by_id = {
             str(item["unit_id"]): item for item in items if isinstance(item, dict) and item.get("unit_id")
         }
+        state.reviewed_context_provenance = self._current_reviewed_context(context, state)
         prior_link = context.run_dir / "solutions" / "link_manifest.json"
         try:
             prior_manifest = json.loads(prior_link.read_text(encoding="utf-8"))
@@ -3615,6 +3857,9 @@ class SolutionRuntimeAdapter:
                 and isinstance(prior_solution, Mapping)
                 and prior_profile == self.provider_profile
                 and scope_profile == self.provider_profile
+                and (scope_provenance.get("reviewed_episode_context")
+                     if isinstance(scope_provenance, Mapping) else None)
+                == state.reviewed_context_provenance
                 and (
                     legacy_full
                     or prior_stage_version == self.hooks().version
@@ -3818,27 +4063,39 @@ class SolutionRuntimeAdapter:
             return None
         schema = json.loads(BLOCK_SCHEMA.read_text(encoding="utf-8"))
         key = _contract_key(f"{stage}-codex", prompt, BLOCK_SCHEMA, images, astra_cli.MODEL)
-        if not context.force and output.exists():
+        if not context.force and output.exists() and not _boundary_error_path(output).exists():
             try:
                 wrapper = json.loads(output.read_text(encoding="utf-8"))
                 cached = wrapper["result"]
                 validate_contract(cached, schema)
-                if wrapper.get("meta", {}).get("cache_key") == key and self._solution_proposal_valid(cached, page_index):
+                if wrapper.get("meta", {}).get("cache_key") == key and self._solution_proposal_valid(cached, page_index) and not _runtime_receipt_failed(wrapper.get("meta", {}).get("runtime_receipt", {})):
                     return cached
             except (OSError, KeyError, json.JSONDecodeError, ContractError):
                 cached = None
         if cache_only:
             return None
-        value = self.codex_runner(stage=f"{stage}-codex", prompt=prompt, schema_path=BLOCK_SCHEMA, images=images, output=output, run_dir=context.run_dir, model=astra_cli.MODEL, force=context.force)
+        # Retry only a failed page, at most twice per detection request. Never
+        # widen the provider timeout or force unrelated, valid page caches.
+        value = None
+        for _attempt in range(2):
+            value = None
+            try:
+                value = self.codex_runner(stage=f"{stage}-codex", prompt=prompt, schema_path=BLOCK_SCHEMA, images=images, output=output, run_dir=context.run_dir, model=astra_cli.MODEL, force=context.force)
+                if isinstance(value, dict):
+                    validate_contract(value, schema)
+                    if not self._solution_proposal_valid(value, page_index):
+                        raise ContractError("invalid_page_identity")
+                    break
+            except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+                reason = ("invalid_page_identity" if str(error) == "invalid_page_identity"
+                          else "schema_invalid" if isinstance(error, ContractError)
+                          else _provider_error_reason(error))
+                _persist_boundary_error(output, "astra", astra_cli.MODEL, reason)
+            value = None
+            output.unlink(missing_ok=True)
         if not isinstance(value, dict):
-            return None
-        try:
-            validate_contract(value, schema)
-        except ContractError:
-            _persist_boundary_error(output, "astra", astra_cli.MODEL, "schema_invalid")
-            return None
-        if not self._solution_proposal_valid(value, page_index):
-            _persist_boundary_error(output, "astra", astra_cli.MODEL, "invalid_page_identity")
+            if not _boundary_error_path(output).exists():
+                _persist_boundary_error(output, "astra", astra_cli.MODEL, "detection_failed")
             return None
         meta = {}
         if output.exists():
@@ -3848,6 +4105,7 @@ class SolutionRuntimeAdapter:
                 meta = {}
         meta.update({"model": astra_cli.MODEL, "policy_version": astra_cli.POLICY_VERSION, "cache_key": key})
         _atomic_json(output, {"meta": meta, "result": value})
+        _boundary_error_path(output).unlink(missing_ok=True)
         return value
 
     def _legacy_page_calibration(
@@ -3912,14 +4170,22 @@ class SolutionRuntimeAdapter:
         root = context.run_dir / "solutions" / "detections" / stage
         raw = root / "raw" / "codex" / f"page-{page_index + 1:04d}.json"
         value = self._solution_boundary_proposal(context, "codex", stage, prompt, images, raw, page_index)
-        if value is None:
-            return None
-        canonical = copy.deepcopy(value)
-        canonical["warnings"] = list(dict.fromkeys(list(canonical.get("warnings", [])) + ["astra_current_evidence_authority_pending"]))
         directory = root / "consensus"
         if self.provider_profile == "codex_only":
             directory /= "codex_only"
-        _atomic_json(directory / raw.name, {"meta": {"providers": ["astra"], "model": astra_cli.MODEL, "policy_version": astra_cli.POLICY_VERSION, "complete_primary_agreement": False, "provider_profile": self.provider_profile, "raw_sha256": _digest_file(raw)}, "result": canonical})
+        if value is None:
+            (directory / raw.name).unlink(missing_ok=True)
+            return None
+        canonical = copy.deepcopy(value)
+        canonical["warnings"] = list(dict.fromkeys(list(canonical.get("warnings", [])) + ["astra_current_evidence_authority_pending"]))
+        payload = {"meta": {"providers": ["astra"], "model": astra_cli.MODEL, "policy_version": astra_cli.POLICY_VERSION, "complete_primary_agreement": False, "provider_profile": self.provider_profile, "raw_sha256": _digest_file(raw)}, "result": canonical}
+        consensus = directory / raw.name
+        try:
+            if json.loads(consensus.read_text(encoding="utf-8")) == payload:
+                return canonical
+        except (OSError, json.JSONDecodeError):
+            pass
+        _atomic_json(consensus, payload)
         return canonical
 
     def _detect_solution_block(
@@ -4805,7 +5071,17 @@ class SolutionRuntimeAdapter:
             problem_page_map,
             tuple(problem_items),
         )
-        state.problem_items_by_id = {item.item_id: item for item in problem_items}
+        state.problem_index = inherit_missing_anchors(
+            state.problem_index,
+            {
+                item_id: int((item.get("source_pages") or [1])[0]) - 1
+                for item_id, item in state.manifest_items_by_id.items()
+            },
+            problem_boundaries,
+        )
+        state.problem_items_by_id = {
+            item.item_id: item for item in state.problem_index.items
+        }
         return state.problem_index
 
     @staticmethod
@@ -6012,7 +6288,35 @@ class SolutionRuntimeAdapter:
                         if score == best_score and score > 0
                     }
                     review_reason = None
-                    if not matching_scopes and role == SolutionRole.DETAILED_SOLUTION:
+                    unique_quick_entry = False
+                    if not matching_scopes and role == SolutionRole.QUICK_ANSWER:
+                        # Scope labels may differ, but a repeated answer number
+                        # anywhere in the existing search window is not unique.
+                        occurrences = sum(
+                            len(self._recovery_target_entries(candidate_block, problem))
+                            for candidate_page_index, candidate_result in current_results.items()
+                            for candidate_page in (page_by_index.get(candidate_page_index),)
+                            if candidate_page is not None
+                            and candidate_page.printed_page is not None
+                            for problem, _score in scored_problems
+                            if problem.anchor is not None
+                            and problem.anchor.reference_document in {"unknown", source_document}
+                            and (problem.anchor.reference_document == "unknown"
+                                 or problem.anchor.segment_id == candidate_page.segment_id)
+                            and _problem_allows_solution_page(
+                                problem, candidate_page.printed_page, role
+                            )
+                            for candidate_block in candidate_result.get("blocks", [])
+                            if candidate_block.get("role") == SolutionRole.QUICK_ANSWER.value
+                        )
+                        unique_quick_entry = (
+                            occurrences == 1 and variant_score >= 0
+                            and all(_layout_scope_score(problem, block) >= 0
+                                    for problem, _score in scored_problems)
+                        )
+                    if not matching_scopes and (
+                        role == SolutionRole.DETAILED_SOLUTION or unique_quick_entry
+                    ):
                         referenced_scopes = {
                             problem.scope_id for problem, _score in scored_problems
                         }
@@ -6203,10 +6507,66 @@ class SolutionRuntimeAdapter:
                 )
         return tuple(sorted(assets, key=lambda asset: asset.sequence))
 
+    def recover_solution_detections(
+        self, context: LinkContext, *, expected_source_sha256: str,
+    ) -> dict[str, Any]:
+        """Validate/recover every solution page in an explicitly supplied copy.
+
+        Does not read problem crops, relink, or fabricate page results. Valid
+        input-keyed raw caches are reused; only failed/missing pages invoke
+        the runner (at most two attempts each). Caller owns copying the leaf.
+        """
+        if context.force:
+            raise StageHookError("detection_recovery_requires_force_false")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha256):
+            raise StageHookError("solution_source_sha256_invalid")
+        if _digest_file(context.solution_path) != expected_source_sha256:
+            raise StageHookError("solution_source_sha256_mismatch")
+        texts = self.text_reader(context.solution_path)
+        if not texts or [page.pdf_index for page in texts] != list(range(len(texts))):
+            raise StageHookError("solution_detection_page_inventory_invalid")
+        state = RuntimeState({}, {}, solution_texts=texts)
+        for page in texts:
+            self._detect_solution_block(context, state, page.pdf_index, page.text, len(texts))
+        return self._require_detection_coverage(context, state, expected_source_sha256,
+                                               {"solution": set(range(len(texts)))})
+
+    def _require_detection_coverage(
+        self, context: LinkContext, state: RuntimeState, source_sha256: str,
+        requested_by_document: Mapping[str, set[int]],
+    ) -> dict[str, Any]:
+        documents = {}
+        for document, requested in requested_by_document.items():
+            results = state.block_results if document == "solution" else state.problem_block_results
+            completed = requested & set(results)
+            documents[document] = {
+                "requested_pages": sorted(requested),
+                "completed_pages": sorted(completed),
+                "failed_pages": sorted(requested - completed),
+            }
+        source_matches = _digest_file(context.solution_path) == source_sha256
+        complete = source_matches and not any(row["failed_pages"] for row in documents.values())
+        coverage = {"source_sha256": source_sha256, "provider_profile": self.provider_profile,
+                    "stage": "solution-blocks", "complete": complete,
+                    "source_matches": source_matches, "documents": documents}
+        _atomic_json(context.run_dir / "solutions" / "detection_coverage.json", coverage)
+        if not source_matches:
+            state.solution_index = None
+            raise StageHookError("solution_source_changed_during_detection")
+        if not complete:
+            state.solution_index = None
+            prefix = "all" if not any(row["completed_pages"] for row in documents.values()) else "some"
+            raise StageHookError(f"{prefix} required solution-block detections failed")
+        return coverage
+
     def detect_solution_index(self, context: LinkContext) -> SolutionIndex:
         state = self._state(context)
         if state.solution_index is not None:
+            if _digest_file(context.solution_path) != state.solution_index.source_sha256:
+                state.solution_index = None
+                raise StageHookError("solution_source_changed_during_detection")
             return state.solution_index
+        source_sha256 = _digest_file(context.solution_path)
         problem_index = self.detect_problem_index(context)
         page_map = self._ensure_solution_page_map(context, state)
         text_by_page = {page.pdf_index: page.text for page in state.solution_texts}
@@ -6303,13 +6663,6 @@ class SolutionRuntimeAdapter:
             ]
             for future in as_completed(futures):
                 future.result()
-        required_detections = bool(candidate_pages or problem_candidate_pages)
-        available_detections = bool(
-            candidate_pages & set(state.block_results)
-            or problem_candidate_pages & set(state.problem_block_results)
-        )
-        if required_detections and not available_detections:
-            raise StageHookError("all required solution-block detections failed")
         for document, requested, completed, document_map in (
             ("solution", candidate_pages, set(state.block_results), page_map),
             (
@@ -6333,6 +6686,8 @@ class SolutionRuntimeAdapter:
                         ),
                     }
                 )
+        self._require_detection_coverage(context, state, source_sha256,
+            {"solution": candidate_pages, "problem": problem_candidate_pages})
         for page_index in sorted(candidate_pages):
             self._refine_quick_answer_blocks(
                 context,
@@ -6432,12 +6787,15 @@ class SolutionRuntimeAdapter:
             result = self._detect_solution_block(context, state, page_index,
                                                 texts.get(page_index, ''), len(page_map))
             state.search_attempted_pages.add(page_index)
-            trace['new_pages'].append(page_index)
             if result is None:
                 trace['failed_pages'].append(page_index)
             else:
+                trace['new_pages'].append(page_index)
                 self._refine_quick_answer_blocks(context, state, page_index,
                                                 texts.get(page_index, ''), len(page_map))
+        trace['uninspected_pages'] = sorted({page.pdf_index for page in page_map} - set(state.block_results))
+        self._require_detection_coverage(context, state, current.source_sha256,
+                                         {"solution": requested})
         canonical = self._block_assets(state, state.problem_index, expanded=True)
         next_index = _ordinary_solution_index(state, current, canonical)
         for asset_id, previous in state.expanded_assets.items():
@@ -7481,7 +7839,13 @@ class SolutionRuntimeAdapter:
         verifications: Mapping[tuple[str, str], PairVerification],
     ) -> AlignmentSnapshotMetadata | None:
         """Return only complete, on-disk dual scope-verifier provenance."""
-
+        key = (str(context.run_dir.resolve()), str(context.solution_path.resolve()))
+        if (os.path.lexists(context.run_dir / "solutions/reviewed_episode_context.json")
+                or getattr(self.states.get(key), "reviewed_context_provenance", None) is not None
+                or getattr(self.states.get(key), "alignment_reviewed_context_provenance", None) is not None):
+            state = self._state(context)
+            if state.reviewed_context_provenance != state.alignment_reviewed_context_provenance:
+                raise StageHookError("reviewed episode context changed before metadata publication")
         versions = {
             "core_version": CORE_VERSION,
             "runtime_version": RUNTIME_VERSION,

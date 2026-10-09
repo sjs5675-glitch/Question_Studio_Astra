@@ -11,13 +11,14 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import quote
 
 from .figure_recrop import _assets, _figure, _safe_asset_path, _workflow_revision
@@ -82,13 +83,25 @@ class FigureProviderRequestError(RuntimeError):
 class FigureProfile:
     model: str
     estimated_output_usd: float
+    provider: str = "gemini"
 
 
 FIGURE_PROFILES = {
+    # Legacy Gemini profiles: kept only so existing generated figures (and their
+    # sealed job metadata) stay valid. New Gemini calls are refused below.
     "balanced": FigureProfile("gemini-3.1-flash-image", 0.101),
     "quality": FigureProfile("gemini-3-pro-image", 0.134),
+    # Active profile (user decision 2026-10-06): Codex subscription CLI image
+    # generation on this PC. No per-image API charge, so the USD estimate is 0.
+    "codex": FigureProfile("codex-cli-image", 0.0, provider="codex"),
 }
 PRICING_AS_OF = "2026-08-25"
+ACTIVE_FIGURE_PROFILE = "codex"
+
+
+def active_figure_profile() -> str:
+    """Profile used for every new figure generation (read at call time)."""
+    return ACTIVE_FIGURE_PROFILE
 
 
 @dataclass(frozen=True)
@@ -171,6 +184,147 @@ def _provider_inline_image(image: ValidatedImage) -> tuple[bytes, str]:
     return converted, "image/png"
 
 
+GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE = (
+    "Gemini 그림 생성은 사용자 결정(2026-10-06)으로 비활성화되었습니다. 기존 생성 그림은 그대로 보존됩니다."
+)
+GEMINI_FIGURE_GENERATION_ENABLED = False
+
+
+def gemini_figure_generation_enabled() -> bool:
+    """Single switch for the billable Gemini image service (read at call time)."""
+    return GEMINI_FIGURE_GENERATION_ENABLED
+
+
+def figure_profile_available(profile: Any) -> bool:
+    """True when new figures may be generated with this profile."""
+    selected = FIGURE_PROFILES.get(profile) if isinstance(profile, str) else None
+    if selected is None:
+        return False
+    if selected.provider == "gemini":
+        return gemini_figure_generation_enabled()
+    return True
+
+
+CODEX_FIGURE_BIN = os.environ.get(
+    "ASTRA_FIGURE_CODEX_BIN", "C:/Users/ExampleUser/AppData/Local/Programs/nodejs/codex.cmd"
+)
+CODEX_FIGURE_EFFORT = os.environ.get("ASTRA_FIGURE_CODEX_EFFORT", "medium")
+CODEX_FIGURE_TIMEOUT_SECONDS = 900
+CODEX_FIGURE_INSTRUCTION = """
+
+## How to deliver (Codex)
+
+- The reference figure is attached and is also saved as `reference.png` in the current directory.
+- Use your built-in image generation tool to create the redrawn figure. Do not draw it with code or scripts.
+- Save exactly one PNG file named `output.png` in the current directory, then reply with the single word DONE.
+- Do not create, modify, or delete any other file.
+"""
+
+
+class CodexFigureAdapter:
+    """Generate figures with the Codex subscription CLI (no API key, no per-image charge)."""
+
+    provider_name = "codex"
+
+    def __init__(
+        self,
+        *,
+        executable: str | None = None,
+        timeout: float = CODEX_FIGURE_TIMEOUT_SECONDS,
+        effort: str | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self._executable = executable or CODEX_FIGURE_BIN
+        self._timeout = timeout
+        self._effort = effort or CODEX_FIGURE_EFFORT
+        self._runner = runner or subprocess.run
+
+    def generate(
+        self,
+        *,
+        image: ValidatedImage,
+        prompt: str,
+        model: str,
+        image_size: str,
+        aspect_ratio: str | None = None,
+    ) -> GeneratedImage:
+        if not isinstance(image, ValidatedImage):
+            raise FigureGenerationError("figure generation requires a validated image")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise FigureGenerationError("figure generation prompt must be non-empty")
+        raw, media_type = _provider_inline_image(image)
+        if media_type != "image/png":
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(raw)) as opened:
+                    opened.load()
+                    converted = io.BytesIO()
+                    opened.convert("RGBA" if "A" in opened.getbands() else "RGB").save(converted, format="PNG")
+                    raw = converted.getvalue()
+            except (OSError, ValueError) as exc:
+                raise FigureGenerationError("Codex 그림 원본을 PNG로 변환할 수 없습니다.") from exc
+        # Python 3.13's mkdtemp applies an owner-only ACL on Windows; files the
+        # Codex sandbox account writes there would then be unreadable to us
+        # (PermissionError on output.png). Use a plain mkdir so normal
+        # inherited permissions apply, and clean up ourselves.
+        workdir = Path(tempfile.gettempdir()) / f"astra-codex-figure-{os.getpid()}-{threading.get_ident()}-{os.urandom(6).hex()}"
+        os.mkdir(workdir)
+        try:
+            reference = workdir / "reference.png"
+            reference.write_bytes(raw)
+            command = [
+                self._executable, "exec", "--skip-git-repo-check",
+                "-s", "workspace-write", "-C", str(workdir),
+                "-c", f"model_reasoning_effort={self._effort}",
+                "-i", str(reference), "-",
+            ]
+            try:
+                completed = self._runner(
+                    command,
+                    input=prompt + CODEX_FIGURE_INSTRUCTION,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self._timeout,
+                    cwd=str(workdir),
+                )
+            except FileNotFoundError as exc:
+                raise FigureProviderNotConfigured("Codex CLI를 찾을 수 없습니다.") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise FigureProviderRequestError("Codex 그림 생성 시간이 초과되었습니다.") from exc
+            output = workdir / "output.png"
+            if output.is_symlink() or not output.is_file():
+                tail = ((completed.stdout or "") + (completed.stderr or ""))[-300:]
+                raise FigureProviderRequestError(
+                    f"Codex가 그림 파일을 만들지 않았습니다(exit {completed.returncode}): {tail}"
+                )
+            data = output.read_bytes()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        if not data or len(data) > MAX_GENERATED_IMAGE_BYTES:
+            raise FigureProviderRequestError("Codex 그림 결과 크기가 올바르지 않습니다.")
+        return GeneratedImage(
+            data=data,
+            media_type="image/png",
+            provider_result={
+                "candidate_index": 0,
+                "part_index": 0,
+                "finish_reason": "codex_exit_0" if completed.returncode == 0 else f"codex_exit_{completed.returncode}",
+                "mime_type": "image/png",
+                "response_id": None,
+                "model_version": f"codex-cli/{self._effort}",
+                "usage_metadata": None,
+            },
+        )
+
+
+def default_figure_adapter(profile: FigureProfile) -> "FigureGenerationAdapter":
+    if profile.provider == "codex":
+        return CodexFigureAdapter()
+    return GeminiFigureAdapter()
+
+
 class GeminiFigureAdapter:
     provider_name = "gemini"
 
@@ -196,6 +350,9 @@ class GeminiFigureAdapter:
     ) -> GeneratedImage:
         if not isinstance(image, ValidatedImage):
             raise FigureGenerationError("figure generation requires a validated image")
+        if not gemini_figure_generation_enabled():
+            # Hard stop before any network/API-key use (billable service, user disabled it).
+            raise FigureProviderNotConfigured(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE)
         if not isinstance(prompt, str) or not prompt.strip():
             raise FigureGenerationError("figure generation prompt must be non-empty")
         stable_models = {profile.model for profile in FIGURE_PROFILES.values()}
@@ -624,8 +781,8 @@ def _validate_job_metadata(
     if (
         metadata.get("schema_version") != "0.1.0"
         or metadata.get("status") != "succeeded"
-        or metadata.get("provider") != "gemini"
         or profile is None
+        or metadata.get("provider") != profile.provider
         or metadata.get("model") != profile.model
         or metadata.get("image_size") != IMAGE_SIZE
         or metadata.get("prompt_version") != PROMPT_VERSION
@@ -800,8 +957,8 @@ def load_figure_artifact(
     if (
         metadata.get("schema_version") != "0.1.0"
         or metadata.get("status") != "succeeded"
-        or metadata.get("provider") != "gemini"
         or profile is None
+        or metadata.get("provider") != profile.provider
         or metadata.get("model") != profile.model
         or metadata.get("image_size") != IMAGE_SIZE
         or metadata.get("prompt_version") != PROMPT_VERSION
@@ -846,11 +1003,12 @@ def inspect_figure_generation_inputs(
     block_id: str,
     cache_root: Path | str,
     *,
-    profile: str = "quality",
+    profile: str | None = None,
     remove_blue_text: bool = False,
 ) -> dict[str, Any]:
     """Validate a target and calculate its semantic cache identity without writes."""
 
+    profile = profile or active_figure_profile()
     path = Path(item_path).resolve()
     document = load_json_object(path)
     if _workflow_revision(document) != expected_revision:
@@ -940,7 +1098,7 @@ def _publish_figure_artifact(
                 "schema_version": "0.1.0",
                 "artifact_key": key,
                 "status": "succeeded",
-                "provider": "gemini",
+                "provider": metadata["provider"],
                 "profile": metadata["profile"],
                 "model": metadata["model"],
                 "image_size": metadata["image_size"],
@@ -977,10 +1135,11 @@ def get_or_create_figure_artifact(
     expected_revision: int,
     block_id: str,
     *,
-    profile: str = "quality",
+    profile: str | None = None,
     remove_blue_text: bool = False,
     adapter: FigureGenerationAdapter | None = None,
 ) -> FigureArtifact:
+    profile = profile or active_figure_profile()
     inputs = inspect_figure_generation_inputs(
         item_path,
         expected_revision,
@@ -1053,9 +1212,11 @@ def _create_job(
     with _job_lock(final_path):
         if final_path.exists():
             return load_figure_job(final_path, cached=True)
-        adapter = adapter or GeminiFigureAdapter()
-        if getattr(adapter, "provider_name", None) != "gemini":
-            raise FigureGenerationError("figure generation adapter must be gemini")
+        if not figure_profile_available(profile_name):
+            raise FigureProviderNotConfigured(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE)
+        adapter = adapter or default_figure_adapter(profile)
+        if getattr(adapter, "provider_name", None) != profile.provider:
+            raise FigureGenerationError(f"figure generation adapter must be {profile.provider}")
         created_jobs_root = _owned_directory(item_dir, "jobs", "figure_generation")
         if created_jobs_root != jobs_root:
             raise FigureGenerationError("figure generation job path changed during request")
@@ -1102,7 +1263,7 @@ def _create_job(
                 "job_id": job_id,
                 "idempotency_key": key,
                 "status": "succeeded",
-                "provider": "gemini",
+                "provider": profile.provider,
                 "profile": profile_name,
                 "model": profile.model,
                 "image_size": IMAGE_SIZE,
@@ -1164,7 +1325,9 @@ def _asset_record(
         "derived_from_asset_id": source_asset_id,
         "generation": {
             "mode": "regenerate",
-            "provider": "gemini",
+            "provider": metadata.get("provider") or FIGURE_PROFILES.get(
+                str(metadata.get("profile")), FIGURE_PROFILES["quality"]
+            ).provider,
             "model": metadata["model"],
             "prompt_version": metadata["prompt_version"],
             "instruction": "reference pixels authoritative; no solving; no new labels",
@@ -1211,7 +1374,8 @@ def materialize_figure_artifact_cas(
     )
     if (
         artifact.metadata.get("artifact_key") != expected_key
-        or artifact.metadata.get("profile") != "quality"
+        or artifact.metadata.get("profile") not in FIGURE_PROFILES
+        or FIGURE_PROFILES[artifact.metadata["profile"]].model != artifact.metadata.get("model")
         or artifact.metadata.get("remove_blue_text") is not False
     ):
         raise FigureJobIntegrityError("figure artifact does not match this target")

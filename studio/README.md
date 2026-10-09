@@ -1,5 +1,12 @@
 # Question JSON Studio
 
+> **현재 운영 안내 (2026-10-06 갱신)** — 이 문서 아래 내용은 옛 Question JSON Studio 기준이라 포트 8875, 외부 `C:/Question_Crop` 경로 등 지금과 다른 내용이 있습니다. 그대로 실행하지 마세요.
+> - 시작: 프로젝트 루트의 `Open-Astra.cmd` (또는 `powershell -NoProfile -File Open-Astra.ps1`), 상태만 확인: `Open-Astra.ps1 -CheckOnly`
+> - 종료: `studio/stop_app.ps1 -OwnerId preview11` — 먼저 같은 PowerShell에서 `ASTRA_RUNTIME`, `ASTRA_PORTS_FILE`, `ASTRA_WORKSPACE`를 위 운영 경로로 지정해야 합니다(지정하지 않으면 운영 서버를 찾지 못하고 아무것도 멈추지 않습니다).
+> - 운영 작업공간·런타임: `.runtime/t12s-cf76f8c9/{workspace,runtime}`, 포트는 `.runtime/t12s-cf76f8c9/ports.json` (Studio 현재 8876)
+> - Crop 엔진: 이 저장소의 `crop/` (외부 `C:/Question_Crop` 아님)
+> - 프로젝트 개요는 루트 `README.md`를 우선합니다.
+
 문제 PDF와 해설 PDF를 입력하면 로컬 `Question_Crop` 엔진으로 문항을 나누고 연결한 뒤, 안전한 후보 탐색을 모두 수행한 문제·해설 OCR과 canonical JSON 저장을 한 번에 수행하는 로컬 앱입니다. `full`에서는 그림 재생성 후보도 저장하며, `codex_only`에서는 원본 PDF/그림을 보존합니다. 기존 `Question_Crop` 결과는 수정하지 않습니다.
 
 ## 현재 구현 상태

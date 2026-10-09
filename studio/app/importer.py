@@ -237,6 +237,7 @@ def import_leaf_run(
     *,
     project_name: str | None = None,
     source_name: str | None = None,
+    project_info: Mapping[str, Any] | None = None,
 ) -> ImportResult:
     leaf_run = Path(leaf_run).expanduser().resolve()
     workspace_root = Path(workspace_root).expanduser().resolve()
@@ -541,6 +542,10 @@ def import_leaf_run(
         ).stem
         project["metadata"]["filename_base"] = display_name
         project["metadata"]["book_title"] = display_name
+        if project_info:
+            from .project_info import apply_info
+
+            apply_info(project["metadata"], {key: value for key, value in project_info.items() if key != "title"})
         atomic_write_json(staging / "project.json", project)
         if link_manifest is not None:
             enrich_project_from_leaf(staging, leaf_run)

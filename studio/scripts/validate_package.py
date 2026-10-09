@@ -280,13 +280,13 @@ class Validator:
             self.add_reference(
                 block.get("asset_id"),
                 f"{where}.asset_id",
-                {"figure_original", "figure_regenerated", "table_snapshot"},
+                {"figure_original", "figure_regenerated", "figure_generated", "table_snapshot"},
                 allowed_sections,
             )
             self.add_reference(
                 block.get("original_asset_id"),
                 f"{where}.original_asset_id",
-                {"figure_original", "table_snapshot"},
+                {"figure_original", "figure_generated", "table_snapshot"},
                 allowed_sections,
             )
             if isinstance(block.get("asset_id"), str):
@@ -823,7 +823,12 @@ class Validator:
                                 {"question", "shared"},
                             )
             else:
-                self.error("provenance.problem", "객체가 필요함")
+                source_system = provenance.get("source_system")
+                generated = isinstance(source_system, dict) and source_system.get("name") == "item_generation"
+                if not generated:
+                    self.error("provenance.problem", "객체가 필요함")
+                elif not isinstance(provenance.get("generation"), dict):
+                    self.error("provenance.generation", "생성 문항에는 generation 기록이 필요함")
 
             links = provenance.get("solution_links")
             if isinstance(links, list):

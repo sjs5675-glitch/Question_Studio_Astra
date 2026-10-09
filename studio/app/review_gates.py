@@ -167,7 +167,7 @@ def _asset_issues(document: Mapping[str, Any], content: Mapping[str, Any]) -> li
                 )
             )
         review = _mapping(asset.get("review"))
-        is_figure = asset.get("role") in {"figure_original", "figure_regenerated"}
+        is_figure = asset.get("role") in {"figure_original", "figure_regenerated", "figure_generated"}
         if is_figure and asset_id in selected_figure_ids:
             status = review.get("status")
             if status == "rejected":

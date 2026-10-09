@@ -25,7 +25,7 @@ from .hwpx_export import MIMETYPE, validate_clean_hwpx_template
 
 TEMPLATE_ID = "neutral-a4-v1"
 DEFAULT_SOURCE_ROOT = Path(
-    r"C:\Users\USER\OneDrive\학원 자료 모음\exam-studio-multi"
+    r"C:\Users\ExampleUser\OneDrive\학원 자료 모음\exam-studio-multi"
 )
 DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parents[1] / "templates" / f"{TEMPLATE_ID}.hwpx"
 

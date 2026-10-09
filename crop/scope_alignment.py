@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 SCOPE_ALIGNMENT_VERSION = "1"
@@ -154,12 +154,23 @@ class ScopeCandidateGroup:
 
 
 @dataclass(frozen=True)
+class ParentReviewAdmission:
+    """Restricted projection; requires exact native child/PDF binding to consume."""
+
+    scope_id: str
+    episode_id: str
+    role: str
+    parent_numbers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ScopeAlignment:
     """Full role-aware alignment result, serializable and cache-key-stable."""
 
     entries: tuple[AlignedScope, ...]
     edges: tuple[ScopeEdge, ...] = ()
     candidate_groups: tuple[ScopeCandidateGroup, ...] = ()
+    parent_review_admissions: tuple[ParentReviewAdmission, ...] = ()
 
     def get(self, scope_id: str, role: str) -> AlignedScope | None:
         for entry in self.entries:
@@ -170,6 +181,12 @@ class ScopeAlignment:
     def to_dict(self) -> dict[str, Any]:
         return {
             "scope_alignment_version": SCOPE_ALIGNMENT_VERSION,
+            "parent_review_admissions": [
+                {"scope_id": a.scope_id, "episode_id": a.episode_id,
+                 "role": a.role, "parent_numbers": list(a.parent_numbers)}
+                for a in sorted(self.parent_review_admissions,
+                                key=lambda a: (a.scope_id, a.role, a.episode_id))
+            ],
             "entries": [entry.to_dict() for entry in sorted(
                 self.entries, key=lambda e: (e.scope_id, e.role)
             )],
@@ -525,77 +542,173 @@ def _candidate_groups(
     episodes: Sequence[EpisodeProfile],
     role: str,
 ) -> tuple[ScopeCandidateGroup, ...]:
-    def section_compatible(left: Sequence[str], right: Sequence[str]) -> bool:
-        return not left or not right or bool(set(left) & set(right))
-
-    ordered_scopes = sorted(scopes, key=lambda item: (item.first_sequence, item.scope_id))
-    ordered_episodes = sorted(
-        (item for item in episodes if role in item.roles or ROLE_MIXED in item.roles),
-        key=lambda item: (item.order_key, item.episode_id),
-    )
+    # Groups carry only individually proven relations. A connected component's
+    # Cartesian product would manufacture unproven edges at the runtime seam.
+    relations = _fragment_relations(scopes, episodes)
     groups: list[ScopeCandidateGroup] = []
-    for scope in ordered_scopes:
-        target_count = len({_norm_number(number) for number in scope.ordered_numbers})
-        for start in range(len(ordered_episodes)):
-            for end in range(start + 2, len(ordered_episodes) + 1):
-                window = ordered_episodes[start:end]
-                covered = {
-                    _norm_number(number)
-                    for item in window
-                    for number in item.ordered_numbers
-                }
-                if len(covered) < target_count:
+    by_episode: dict[str, list[str]] = {}
+    for scope in sorted(scopes, key=lambda s: (s.first_sequence, s.scope_id)):
+        ids = relations.get((scope.scope_id, role), ())
+        if len(ids) > 1:
+            groups.append(ScopeCandidateGroup((scope.scope_id,), ids, role))
+        for episode_id in ids:
+            by_episode.setdefault(episode_id, []).append(scope.scope_id)
+    for episode_id, scope_ids in by_episode.items():
+        if len(scope_ids) > 1:
+            groups.append(ScopeCandidateGroup(tuple(scope_ids), (episode_id,), role))
+    return tuple(groups)
+
+
+def _fragment_relations(
+    scopes: Sequence[ProblemScopeProfile], episodes: Sequence[EpisodeProfile],
+    *, parent_admissions: list[ParentReviewAdmission] | None = None,
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """REVIEW-only interval relations, separate from whole-scope DP trust.
+
+    Children repeat a parent locally; they are not independent numbering
+    anchors. Collapse only adjacent repeats, never a restart. A dense episode
+    can serve disjoint problem intervals without spending one DP slot per
+    scope. Numeric intersection alone is never a recovery signal.
+    """
+    def run(numbers: Sequence[str]) -> tuple[str, ...]:
+        out: list[str] = []
+        for raw in numbers:
+            value = _norm_number(raw)
+            if not out or out[-1] != value:
+                out.append(value)
+        ranks = [tuple(int(p) for p in n.split("-"))
+                 for n in out if all(p.isdigit() for p in n.split("-"))]
+        if len(ranks) != len(out) or any(a >= b for a, b in zip(ranks, ranks[1:])):
+            return ()
+        return tuple(out)
+
+    def semantic(tokens: Sequence[str]) -> set[str]:
+        return {t for t in tokens if not t.isdigit()
+                and t not in GENERIC_TOKENS and t not in {"i", "ii", "iii", "iv", "v"}}
+
+    relations: dict[tuple[str, str], list[str]] = {}
+    scope_runs = {s.scope_id: run(s.ordered_numbers) for s in scopes}
+    for episode in sorted(episodes, key=lambda e: (e.order_key, e.episode_id)):
+        right = run(episode.ordered_numbers)
+        context = semantic(episode.section_tokens)
+        leaf = tuple(t for t in episode.section_tokens if t in context)[-2:]
+        matches: list[tuple[ProblemScopeProfile, tuple[str, ...]]] = []
+        for scope in scopes:
+            left = scope_runs[scope.scope_id]
+            scope_context = tuple(t for t in scope.section_tokens
+                                  if t in semantic(scope.section_tokens))
+            shared = set(scope_context) & context
+            # Match a complete leaf, not upper-chapter furniture. Space-only
+            # typography differences (미래 사회 / 미래사회) are equivalent;
+            # no stemming, synonyms or numeric chapter tokens are inferred.
+            compact_leaf = "".join(leaf)
+            spacing_equal = len(set(leaf)) >= 2 and any(
+                "".join(scope_context[a:b]) == compact_leaf
+                for a in range(len(scope_context))
+                for b in range(a + 2, len(scope_context) + 1)
+            )
+            if (not left or not right or len(set(leaf)) < 2
+                    or not (set(leaf) <= shared or spacing_equal)):
+                continue
+            common = set(left) & set(right)
+            projection = tuple(n for n in right if n in common)
+            if projection != tuple(n for n in left if n in common):
+                continue
+            if not projection:
+                continue
+            left_positions = [left.index(n) for n in projection]
+            positions = [right.index(n) for n in projection]
+            if (positions[-1] - positions[0] + 1 != len(positions)
+                    or left_positions[-1] - left_positions[0] + 1 != len(left_positions)):
+                continue
+            if episode.printed_problem_page_range is not None and scope.printed_pages:
+                start, end = episode.printed_problem_page_range
+                if not all(start <= p <= end for p in scope.printed_pages):
                     continue
-                if not all(
-                    section_compatible(scope.section_tokens, item.section_tokens)
-                    for item in window
-                ):
-                    break
-                combined = EpisodeProfile(
-                    episode_id="+".join(item.episode_id for item in window),
-                    order_key=window[0].order_key,
-                    roles=(role,),
-                    section_tokens=tuple(dict.fromkeys(token for item in window for token in item.section_tokens)),
-                    label_tokens=tuple(dict.fromkeys(token for item in window for token in item.label_tokens)),
-                    ordered_numbers=tuple(number for item in window for number in item.ordered_numbers),
-                    printed_problem_page_range=None,
-                    printed_solution_pages=tuple(page for item in window for page in item.printed_solution_pages),
-                    coverage_complete=all(item.coverage_complete for item in window),
-                )
-                edge = score_edge(scope, combined, role)
-                if edge.trusted and combined.coverage_complete:
-                    groups.append(ScopeCandidateGroup((scope.scope_id,), tuple(item.episode_id for item in window), role))
-                break
-    for episode in ordered_episodes:
-        target_count = len({_norm_number(number) for number in episode.ordered_numbers})
-        for start in range(len(ordered_scopes)):
-            for end in range(start + 2, len(ordered_scopes) + 1):
-                window = ordered_scopes[start:end]
-                covered = {
-                    _norm_number(number)
-                    for item in window
-                    for number in item.ordered_numbers
-                }
-                if len(covered) < target_count:
+            if scope.anchor_printed_ranges and episode.printed_solution_pages:
+                if not all(any(a <= p <= b for a, b in scope.anchor_printed_ranges)
+                           for p in episode.printed_solution_pages):
                     continue
-                if not all(
-                    section_compatible(item.section_tokens, episode.section_tokens)
-                    for item in window
-                ):
-                    break
-                combined = ProblemScopeProfile(
-                    scope_id="+".join(item.scope_id for item in window),
-                    first_sequence=window[0].first_sequence,
-                    section_tokens=tuple(dict.fromkeys(token for item in window for token in item.section_tokens)),
-                    explicit_label_tokens=tuple(dict.fromkeys(token for item in window for token in item.explicit_label_tokens)),
-                    ordered_numbers=tuple(number for item in window for number in item.ordered_numbers),
-                    printed_pages=tuple(page for item in window for page in item.printed_pages),
-                    anchor_printed_ranges=tuple(value for item in window for value in item.anchor_printed_ranges),
-                )
-                if score_edge(combined, episode, role).trusted and episode.coverage_complete:
-                    groups.append(ScopeCandidateGroup(tuple(item.scope_id for item in window), (episode.episode_id,), role))
-                break
-    return tuple(dict.fromkeys(groups))
+            matches.append((scope, projection))
+        # Trim conflicts only from already proven projections. Do not change
+        # the whole-edge competition guard below or manufacture edge allows.
+        if parent_admissions is not None and episode.coverage_complete:
+            unique = [(s, tuple(n for n in p if not any(
+                s.scope_id != other.scope_id and n in q for other, q in matches)))
+                      for s, p in matches]
+            unique = [(s, p) for s, p in unique if p]
+            unique.sort(key=lambda pair: (pair[0].first_sequence, pair[0].scope_id))
+            original_cover = {n for _, p in matches for n in p} == set(right)
+            order_ok = not any(right.index(a[1][-1]) >= right.index(b[1][0])
+                               for a, b in zip(unique, unique[1:]))
+            if order_ok:
+                for scope, projection in matches:
+                    if (scope.explicit_label_tokens and episode.label_tokens
+                            and set(scope.explicit_label_tokens) != set(episode.label_tokens)
+                            and ''.join(scope.explicit_label_tokens) != ''.join(episode.label_tokens)):
+                        continue
+                    kept = next((p for s, p in unique if s.scope_id == scope.scope_id), ())
+                    if not kept or kept == projection:
+                        continue
+                    positions = [right.index(n) for n in kept]
+                    left_positions = [scope_runs[scope.scope_id].index(n) for n in kept]
+                    if (positions[-1] - positions[0] + 1 != len(positions)
+                            or left_positions[-1] - left_positions[0] + 1 != len(left_positions)):
+                        continue
+                    if not (set(projection) == set(scope_runs[scope.scope_id])
+                            or set(projection) == set(right) or original_cover):
+                        continue
+                    for role in (ROLE_DETAILED, ROLE_QUICK):
+                        if role in episode.roles or ROLE_MIXED in episode.roles:
+                            parent_admissions.append(ParentReviewAdmission(
+                                scope.scope_id, episode.episode_id, role, kept))
+        # Repeated numbering in competing problem scopes is not ownership.
+        matches = [(s, p) for s, p in matches if not any(
+            s.scope_id != other.scope_id and set(p) & set(q) for other, q in matches)]
+        ordered = sorted(matches, key=lambda pair: pair[0].first_sequence)
+        collective_cover = {n for _, projection in ordered for n in projection} == set(right)
+        # A crossing intersection alone proves neither boundary. It is usable
+        # only when disjoint, chapter-compatible scopes cover the episode.
+        ordered = [(s, p) for s, p in ordered
+                   if set(p) == set(scope_runs[s.scope_id]) or set(p) == set(right)
+                   or collective_cover]
+        if any(right.index(a[1][-1]) >= right.index(b[1][0])
+               for a, b in zip(ordered, ordered[1:])):
+            continue
+        for scope, _ in ordered:
+            if scope_runs[scope.scope_id] == right:
+                continue  # whole-run identity belongs to the existing DP
+            for role in (ROLE_DETAILED, ROLE_QUICK):
+                if role in episode.roles or ROLE_MIXED in episode.roles:
+                    relations.setdefault((scope.scope_id, role), []).append(episode.episode_id)
+    return {key: tuple(value) for key, value in relations.items()}
+
+
+def _admit_fragments(alignment: ScopeAlignment, scopes: Sequence[ProblemScopeProfile],
+                     episodes: Sequence[EpisodeProfile]) -> ScopeAlignment:
+    parent_admissions: list[ParentReviewAdmission] = []
+    relations = _fragment_relations(scopes, episodes, parent_admissions=parent_admissions)
+    alignment = replace(alignment, parent_review_admissions=tuple(parent_admissions))
+    if not relations:
+        return alignment
+    changed = set()
+    entries = []
+    for entry in alignment.entries:
+        additions = relations.get((entry.scope_id, entry.role), ())
+        if not additions:
+            entries.append(entry)
+            continue
+        allows = tuple(dict.fromkeys((*entry.allows, *additions)))
+        changed.update((entry.scope_id, ep, entry.role) for ep in allows)
+        entries.append(replace(entry, aligned_episode_id=None, allows=allows, margin=0.0,
+                               evidence=tuple(dict.fromkeys((*entry.evidence, "scope_fragment_review")))))
+    edges = tuple(replace(edge, trusted=False, score=(0, *edge.score[1:]),
+                          admissible=True, status="allowed", reject_reason=None,
+                          evidence=tuple(dict.fromkeys((*edge.evidence, "scope_fragment_review", "ordered_contiguous_projection", "hierarchy_leaf_match",
+                                                       *(("original_reject:" + edge.reject_reason,) if edge.reject_reason else ())))))
+                  if (edge.scope_id, edge.episode_id, edge.role) in changed else edge
+                  for edge in alignment.edges)
+    return replace(alignment, entries=tuple(entries), edges=edges)
 
 
 def align_scopes(
@@ -759,11 +872,11 @@ def align_scopes(
             )
             continue
         adjusted_quick.append(entry)
-    return ScopeAlignment(
+    return _admit_fragments(ScopeAlignment(
         entries=tuple(detail_entries) + tuple(adjusted_quick),
         edges=tuple(detail_edges) + tuple(final_quick_edges),
         candidate_groups=(
             _candidate_groups(scopes, episodes, ROLE_DETAILED)
             + _candidate_groups(scopes, episodes, ROLE_QUICK)
         ),
-    )
+    ), scopes, episodes)

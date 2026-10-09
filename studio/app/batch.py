@@ -16,8 +16,9 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait as wait_futures
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -27,11 +28,31 @@ from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from astra_runtime import inside
+from .batch_progress import crop_log_progress
+from .batch_content import ContentProjection, project_content_projection
+
+
+def _ocr_concurrency() -> int:
+    """Number of OCR provider calls run at once (ASTRA_OCR_WORKERS, default 8).
+
+    Measured on real items: 1 worker 16.3 s/item, 4 workers 4.7 s/item,
+    8 workers 2.9 s/item wall time with unchanged per-call latency.
+    """
+
+    try:
+        value = int(os.environ.get("ASTRA_OCR_WORKERS", "8"))
+    except ValueError:
+        value = 8
+    return max(1, min(8, value))
 from astra_page_failure import parse_page_failure, page_failure_message
 from . import ASTRA
 from .importer import import_leaf_run
 from .figure_generation import (
     FIGURE_PROFILES,
+    GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE,
+    active_figure_profile,
+    figure_profile_available,
+    gemini_figure_generation_enabled,
     IMAGE_SIZE,
     PRICING_AS_OF,
     FigureGenerationAdapter,
@@ -39,6 +60,7 @@ from .figure_generation import (
     FigureProviderNotConfigured,
     FigureProviderRequestError,
     GeminiFigureAdapter,
+    default_figure_adapter,
     GeneratedImage,
     get_or_create_figure_artifact,
     inspect_figure_generation_inputs,
@@ -169,6 +191,7 @@ SOLUTION_CONFIRMATION_RECEIPT_FIELDS = {
 RESUME_RETENTION = timedelta(days=7)
 REQUEST_FIELDS = {
     "project_name",
+    "project_info",
     "source_path",
     "solution_path",
     "pages",
@@ -251,9 +274,11 @@ def validate_figure_options(
         raise BatchError("Invalid regenerate_figures")
     if provider_profile == "codex_only" and regenerate:
         raise BatchError("Codex-only batches cannot regenerate figures")
-    profile = payload.get("figure_profile", "balanced")
+    profile = payload.get("figure_profile", active_figure_profile())
     if not isinstance(profile, str) or profile not in FIGURE_PROFILES:
         raise BatchError("Unsupported figure profile")
+    if regenerate and not figure_profile_available(profile):
+        raise BatchError(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE, status=409)
     remove_blue_text = payload.get("remove_blue_text", False)
     if not isinstance(remove_blue_text, bool):
         raise BatchError("Invalid remove_blue_text")
@@ -286,6 +311,12 @@ class BatchError(RuntimeError):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _fragment_review_sha(run_dir: Path) -> str | None:
+    """SHA of the solution review-admission sidecar that linking consumed, if any."""
+    path = run_dir / "solutions" / "review_admission.json"
+    return sha256_file(path) if path.is_file() else None
 
 
 def _now() -> str:
@@ -445,8 +476,12 @@ class BatchCoordinator:
         blocked: list[dict[str, Any]] = []
         figure_count = 0
         existing_regenerated = 0
+        bank_profile = active_figure_profile()
         for entry in resolved:
-            if self.project_provider_profile(str(entry["project_id"])) == "codex_only":
+            if (
+                FIGURE_PROFILES[bank_profile].provider != "codex"
+                and self.project_provider_profile(str(entry["project_id"])) == "codex_only"
+            ):
                 raise BatchError(
                     "Codex-only projects cannot regenerate figures", status=409
                 )
@@ -486,6 +521,7 @@ class BatchCoordinator:
                         entry["source_revision"],
                         block_id,
                         self.figure_cache_root,
+                        profile=bank_profile,
                     )
                 except (ModelError, OSError):
                     blocked.append({**public_target, "reason": "invalid_source"})
@@ -526,7 +562,7 @@ class BatchCoordinator:
             "unique_generation_keys": len(keys),
             "provider_calls_max": provider_calls,
             "estimated_output_usd_max": float(
-                Decimal(str(FIGURE_PROFILES["quality"].estimated_output_usd))
+                Decimal(str(FIGURE_PROFILES[bank_profile].estimated_output_usd))
                 * provider_calls
             ),
             "pricing_as_of": PRICING_AS_OF,
@@ -535,7 +571,7 @@ class BatchCoordinator:
             "blocked_targets": blocked,
             "items": refs,
             "targets": targets,
-            "profile": "quality",
+            "profile": bank_profile,
             "image_size": IMAGE_SIZE,
             "remove_blue_text": False,
         }
@@ -579,6 +615,8 @@ class BatchCoordinator:
         return result
 
     def preflight_bank_figures(self, items: Any) -> dict[str, Any]:
+        if not figure_profile_available(active_figure_profile()):
+            raise BatchError(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE, status=409)
         plan = self._build_bank_figure_plan(items)
         plan_sha256 = self._bank_figure_plan_sha(plan)
         now = datetime.now(timezone.utc)
@@ -603,6 +641,8 @@ class BatchCoordinator:
     ) -> dict[str, Any]:
         if confirmed is not True:
             raise BatchError("Figure generation requires explicit confirmation")
+        if not figure_profile_available(active_figure_profile()):
+            raise BatchError(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE, status=409)
         try:
             validate_id(plan_id, field="plan_id")
         except ModelError as exc:
@@ -657,7 +697,7 @@ class BatchCoordinator:
                 "request": {
                     "plan_id": plan_id,
                     "plan_sha256": plan_sha256,
-                    "profile": "quality",
+                    "profile": str(current.get("profile") or active_figure_profile()),
                     "remove_blue_text": False,
                     "items": current["items"],
                     "targets": current["targets"],
@@ -2611,6 +2651,7 @@ class BatchCoordinator:
         if not link_path.is_file() and initial_link_sha is not None:
             raise BatchError("Solution link manifest is unavailable", status=409)
         current_link_sha = sha256_file(link_path) if link_path.is_file() else None
+        current_review_sha = _fragment_review_sha(run_dir)
         expected_link_sha = (
             str(reconciled_link_sha).casefold()
             if isinstance(reconciled_link_sha, str)
@@ -2621,6 +2662,7 @@ class BatchCoordinator:
             str, list[tuple[str, str, str | None]]
         ] = {}
         pending_recoveries: list[tuple[str, str, str | None]] = []
+        stale_link_hashes: set[str] = set()
         for record in project_records:
             request = record.get("request")
             if (
@@ -2670,6 +2712,11 @@ class BatchCoordinator:
                     )
                 )
             ):
+                if result.get("fragment_review_sha256") != current_review_sha:
+                    # Linking evidence changed after that run: its links are stale,
+                    # so recompute from the current state instead of reusing them.
+                    stale_link_hashes.add(str(result["link_manifest_sha256"]))
+                    continue
                 recoverable_hashes.setdefault(
                     str(result["link_manifest_sha256"]), []
                 ).append(
@@ -2759,7 +2806,7 @@ class BatchCoordinator:
                 superseded_pending_job_ids = sorted(
                     {job_id for _, job_id, _ in pending_recoveries if job_id != selected_job}
                 )
-            else:
+            elif current_link_sha not in stale_link_hashes:
                 raise BatchError("Solution links changed; run preflight again", status=409)
         elif current_link_sha in recoverable_hashes:
             matches = recoverable_hashes[current_link_sha]
@@ -2900,7 +2947,7 @@ class BatchCoordinator:
             "studio_approved_item_count": len(studio_approved_items),
             "current_status_counts": counts,
             "problem_crops_reused": True,
-            "cache_status": "recovery" if upstream_already_completed else "unknown",
+            "cache_status": "recovery" if upstream_already_completed else "reuse_if_valid",
             "provider_calls_possible": not upstream_already_completed,
             "provider_calls_max": 0 if upstream_already_completed else None,
             "estimated_cost_usd_max": 0.0 if upstream_already_completed else None,
@@ -2909,8 +2956,7 @@ class BatchCoordinator:
             "superseded_pending_job_ids": superseded_pending_job_ids,
         }
 
-    @staticmethod
-    def _public_solution_relink_plan(record: Mapping[str, Any]) -> dict[str, Any]:
+    def _public_solution_relink_plan(self, record: Mapping[str, Any]) -> dict[str, Any]:
         result = {
             key: copy.deepcopy(record[key])
             for key in ("plan_id", "plan_sha256", "expires_at")
@@ -2918,6 +2964,7 @@ class BatchCoordinator:
         for key, value in record["plan"].items():
             if key != "solution_path":
                 result[key] = copy.deepcopy(value)
+        result.update(self._content_projection(record["plan"]))
         return result
 
     def preflight_solution_relink(self, project_id: Any) -> dict[str, Any]:
@@ -3007,7 +3054,7 @@ class BatchCoordinator:
                 "created_at": timestamp,
                 "updated_at": timestamp,
                 "finished_at": None,
-                "request": copy.deepcopy(current),
+                "request": {**copy.deepcopy(current), "typing_only": True, "link_assets_only": True},
                 "crop_job_id": current["crop_job_id"],
                 "project_id": project_id,
                 "recovery_of": current.get("recovery_source_job_id"),
@@ -3108,6 +3155,17 @@ class BatchCoordinator:
             ):
                 raise BatchError("project_name must be a non-blank string of at most 200 characters without control characters")
             project_name = value.strip()
+        project_info = None
+        if payload.get("project_info") is not None:
+            from .project_info import ProjectInfoError, normalize_info
+
+            raw_info = payload["project_info"]
+            if not isinstance(raw_info, Mapping) or "title" in raw_info:
+                raise BatchError("project_info must be an object without title")
+            try:
+                project_info = normalize_info(raw_info, require_title=False) or None
+            except ProjectInfoError as exc:
+                raise BatchError(str(exc)) from exc
         source = self._pdf(
             self._alias(payload, ("source_path", "problem_pdf", "source")),
             "source_path",
@@ -3157,6 +3215,7 @@ class BatchCoordinator:
             # Private persistence fields are removed from list/get/create views.
             "request": {
                 "project_name": project_name,
+                "project_info": project_info,
                 "source_path": str(source),
                 "solution_path": str(solution) if solution else None,
                 "source_name": self._display_name(source_name, source.name),
@@ -3250,6 +3309,13 @@ class BatchCoordinator:
                     or solution["updated_at"] < upstream["requested_at"]):
                 continue
             item["upstream_solution_state"] = solution["state"]
+        projections = {}
+        for record, item in zip(records, visible):
+            project_id = record.get("project_id")
+            if isinstance(project_id, str):
+                if project_id not in projections:
+                    projections[project_id] = self._content_projection(record)
+                item.setdefault("summary", {}).update(projections[project_id])
         return visible
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -3257,7 +3323,113 @@ class BatchCoordinator:
             record = self._jobs.get(job_id)
             if record is None:
                 raise BatchError("Batch job was not found", status=404)
-            return self._public(record)
+            result = self._public(record)
+        result.setdefault("summary", {}).update(self._content_projection(result))
+        return result
+
+    def _content_projection(self, record: Mapping[str, Any]) -> ContentProjection:
+        project_dir = self._stored_project_dir(record)
+        if project_dir is None:
+            return {}
+        try:
+            return project_content_projection(project_dir)
+        except (ModelError, OSError):
+            return {"content_error_count": 1}
+
+    def progress_detail(self, job_id: str) -> dict[str, Any]:
+        """Observe one batch without updating it or holding the job lock for I/O."""
+        from .batch_progress import build_progress_detail
+
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None:
+                raise BatchError("Batch job was not found", status=404)
+            record = copy.deepcopy(record)
+        record.setdefault("summary", {}).update(self._content_projection(record))
+        crop = None
+        log_lines = None
+        solution_counts = None
+        crop_id = record.get("crop_job_id")
+        if isinstance(crop_id, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", crop_id):
+            try:
+                crop = self._crop_job_snapshot(crop_id)
+            except (BatchError, ModelError, OSError):
+                pass
+            log_lines = self._crop_log_lines(crop_id)
+            solution_counts = self._crop_solution_counts(crop_id)
+        return build_progress_detail(
+            record, crop, log_lines=log_lines, solution_counts=solution_counts
+        )
+
+    def _crop_job_dir(self, crop_job_id: str) -> Path | None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", crop_job_id):
+            return None
+        root = (self.crop_root / "runs" / "app").resolve()
+        job_dir = (root / crop_job_id).resolve()
+        if job_dir.parent != root or not job_dir.is_dir():
+            return None
+        return job_dir
+
+    def _crop_log_lines(self, crop_job_id: str, limit_bytes: int = 4 * 1024 * 1024) -> list[str] | None:
+        """Read-only view of the crop worker log (bounded) for progress parsing."""
+
+        job_dir = self._crop_job_dir(crop_job_id)
+        if job_dir is None:
+            return None
+        try:
+            with (job_dir / "worker.log").open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                if size > limit_bytes:
+                    return None
+                stream.seek(0)
+                return stream.read().decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+
+    def _crop_solution_counts(self, crop_job_id: str) -> dict[str, Any] | None:
+        """Count solution-linking artifacts written so far (read-only)."""
+
+        job_dir = self._crop_job_dir(crop_job_id)
+        if job_dir is None:
+            return None
+        solution_dirs = [path for path in (job_dir / "output").glob("source_*/solutions") if path.is_dir()]
+        if len(solution_dirs) != 1:
+            return None
+        root = solution_dirs[0]
+
+        def count(path: Path, pattern: str = "*") -> int:
+            try:
+                return sum(1 for entry in path.glob(pattern) if entry.is_file())
+            except OSError:
+                return 0
+
+        detections = root / "detections"
+        counts: dict[str, Any] = {
+            "problem_hints": count(detections / "problem-hints", "*.json"),
+            "solution_pages": count(detections / "solution-blocks", "*.json"),
+            "verifications": count(detections / "verifications", "*.json"),
+            "crops": count(root / "crops"),
+        }
+        try:
+            manifest = load_json_object(root / "link_manifest.json")
+            items = manifest.get("items")
+            if isinstance(items, Mapping):
+                links = [item for item in items.values() if isinstance(item, Mapping)]
+                counts.update(
+                    answers=sum(bool(item.get("answer_ids")) for item in links),
+                    explanations=sum(bool(item.get("explanation_ids")) for item in links),
+                    none=sum(not item.get("answer_ids") and not item.get("explanation_ids") for item in links),
+                )
+        except (ModelError, OSError):
+            counts["connection_counts_unavailable"] = True
+        try:
+            progress = load_json_object(root / "recovery-progress.json")
+            if isinstance(progress.get("stage_text"), str):
+                counts["stage_text"] = progress["stage_text"]
+        except (OSError, ModelError):
+            pass
+        return counts
 
     def project_provider_profile(self, project_id: str) -> str:
         try:
@@ -3284,9 +3456,11 @@ class BatchCoordinator:
                 raise BatchError("Project provider profile is invalid", status=409) from exc
         with self._lock:
             records = [
-                copy.deepcopy(record)
+                {"request": {"provider_profile": copy.deepcopy(record["request"]["provider_profile"])}}
                 for record in self._jobs.values()
                 if record.get("project_id") == project_id
+                and isinstance(record.get("request"), Mapping)
+                and "provider_profile" in record["request"]
             ]
         for item in records:
             request = item.get("request")
@@ -3614,7 +3788,16 @@ class BatchCoordinator:
         if provider_profile == "codex_only":
             raise BatchError("Codex-only batches cannot retry figures", status=409)
         targets = self._figure_retry_targets(source_copy)
-        profile = request.get("figure_profile")
+        # Keep the stored profile only while it is still allowed; otherwise
+        # retry with the active (Codex) profile. Gemini is disabled in production.
+        stored_profile = request.get("figure_profile")
+        profile = (
+            stored_profile
+            if isinstance(stored_profile, str) and figure_profile_available(stored_profile)
+            else active_figure_profile()
+        )
+        if not figure_profile_available(profile):
+            raise BatchError(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE, status=409)
         remove_blue_text = request.get("remove_blue_text")
         try:
             budget_usd = Decimal(str(request.get("figure_budget_usd")))
@@ -3948,8 +4131,10 @@ class BatchCoordinator:
                     changes["event"] = f"state:{changes['state']}"
                 elif "stage" in changes:
                     changes["event"] = f"stage:{changes['stage']}"
+            # Workers retain and mutate their local summaries/targets after
+            # publication. The live record must own a detached durable snapshot.
             record.update(
-                changes,
+                copy.deepcopy(changes),
                 revision=int(record.get("revision") or 0) + 1,
                 updated_at=_now(),
             )
@@ -4168,7 +4353,7 @@ class BatchCoordinator:
             )
         if result.get("kind") == "bank_figure_generation":
             result["options"] = {
-                "figure_profile": "quality",
+                "figure_profile": str(request.get("profile") or "quality"),
                 "figure_budget_usd": request.get("estimated_output_usd_max"),
                 "remove_blue_text": False,
                 "figure_budget_scope": "estimated_image_output_only",
@@ -4278,7 +4463,7 @@ class BatchCoordinator:
                 raise BatchError("The stored OCR failure list is invalid", status=409)
             unit_id = failure.get("unit_id")
             section = failure.get("section")
-            if not isinstance(unit_id, str) or section not in {"question", "explanation"}:
+            if not isinstance(unit_id, str) or section not in {"question", "explanation", "answer"}:
                 raise BatchError("The stored OCR failure list is invalid", status=409)
             selected[(unit_id, str(section))] = str(
                 failure.get("error_code") or "ocr_failed"
@@ -4329,6 +4514,9 @@ class BatchCoordinator:
                 if section == "question"
                 else self._registered_explanation_asset(document)
             )
+            if section == "answer":
+                quick = self._typing_quick_answer_link(document, item_root=question_path.parent)
+                asset_id = quick.get("source_asset_id") if quick else None
             if not asset_id:
                 raise BatchError("A failed OCR target is unavailable", status=409)
             targets.append((question_path, asset_id, section, unit_id, error_code))
@@ -4520,7 +4708,8 @@ class BatchCoordinator:
             if not project_dir.is_relative_to(self.workspace_root) or not project_path.is_file():
                 raise RuntimeError("solution relink project is unavailable")
             if (record.get("studio_reconciliation") or {}).get("state") == "completed":
-                self._run_solution_pipeline_stage(job_id)
+                if request.get("link_assets_only") is not True:
+                    self._run_solution_pipeline_stage(job_id)
                 self._finish(job_id, state="completed", stage="completed", progress=100,
                     message=self.get(job_id)["message"])
                 return
@@ -4630,7 +4819,7 @@ class BatchCoordinator:
                     {
                         "source": str(solution_path),
                         "crop_dpi": int(request.get("crop_dpi") or 300),
-                        "force": True,
+                        "force": False,
                     },
                 )
                 current_record = self._wait_for_crop(
@@ -4681,6 +4870,7 @@ class BatchCoordinator:
                 "link_manifest_sha256": new_link_sha,
                 "solution_sha256": request.get("solution_sha256"),
                 "provider_profile": provider_profile,
+                "fragment_review_sha256": _fragment_review_sha(run_dir),
             }
             self._update(
                 job_id,
@@ -4706,6 +4896,7 @@ class BatchCoordinator:
                 project_dir,
                 run_dir,
                 preserve_approved=True,
+                append_quick_answers_only=request.get("link_assets_only") is True,
                 expected_link_manifest_sha256=new_link_sha,
                 expected_project_revision=request.get("project_revision"),
             )
@@ -4753,7 +4944,8 @@ class BatchCoordinator:
                 "link_manifest_sha256": new_link_sha,
             }
             self._update(job_id, summary=summary)
-            self._run_solution_pipeline_stage(job_id)
+            if request.get("link_assets_only") is not True:
+                self._run_solution_pipeline_stage(job_id)
             self._finish(
                 job_id,
                 state="completed",
@@ -4763,11 +4955,24 @@ class BatchCoordinator:
             )
         except _BatchCancelled:
             return
-        except Exception:
+        except Exception as exc:
             try:
                 with self._lock:
                     live = copy.deepcopy(self._jobs[job_id])
                     summary = copy.deepcopy(live["summary"])
+                frames = traceback.extract_tb(exc.__traceback__)
+                self._update(
+                    job_id,
+                    error_detail={
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:2000],
+                        "failed_stage": live.get("stage"),
+                        "location": [
+                            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                            for frame in frames[-6:]
+                        ],
+                    },
+                )
                 if isinstance(live.get("upstream_result"), Mapping):
                     self._update(
                         job_id,
@@ -4798,7 +5003,8 @@ class BatchCoordinator:
                 return
 
     def _collect_solution_targets(
-        self, project_dir: Path, item_ids: Sequence[str] | None = None
+        self, project_dir: Path, item_ids: Sequence[str] | None = None, *, typing_only: bool = False,
+        answer_backfill_only: bool = False,
     ) -> list[dict[str, Any]]:
 
         from .solution_verification import candidate_generation, ranked_solution_links
@@ -4809,36 +5015,50 @@ class BatchCoordinator:
         for item_id in selected_ids:
             if not isinstance(item_id, str):
                 continue
+            if self.is_deleted(str(project.get("project_id") or project_dir.name), item_id):
+                continue
             question_path = project_dir / "items" / item_id / "question.json"
             if not question_path.is_file():
                 continue
             document = load_json_object(question_path)
-            link = self._registered_explanation_link(document)
-            selection = document.get("provenance", {}).get("solution_selection")
-            asset_id = str(link["source_asset_id"]) if link else ""
-            source_sha = self._asset_sha256(document, asset_id) if asset_id else None
-            ranked_links, ranking_tied = ranked_solution_links(document)
-            candidate_asset_ids = list(dict.fromkeys(
-                str(candidate["source_asset_id"])
-                for candidate in ranked_links
-                if isinstance(candidate.get("source_asset_id"), str)
-            ))
-            selection_revision = selection.get("revision") if isinstance(selection, Mapping) else None
-            key = f"{item_id}:{asset_id}:{source_sha or 'none'}:{selection_revision or 0}"
-            targets.append({
-                "key": key, "item_id": item_id, "asset_id": asset_id,
-                "source_sha256": source_sha, "selection_revision": selection_revision,
-                "input_revision": document.get("workflow", {}).get("revision"),
-                "input_content_hash": solution_content_hash(document),
-                "state": "pending" if source_sha else "no_source",
-                "candidate_generation": candidate_generation(document),
-                "candidate_asset_ids": candidate_asset_ids,
-                "candidate_cursor": 0,
-                "attempted_image_sha256": [],
-                "verification_calls": 0,
-                "remaining_candidate_count": len(candidate_asset_ids),
-                "ranking_tied": ranking_tied,
-            })
+            link = (self._typing_explanation_link(document, item_root=question_path.parent)
+                    if typing_only else self._registered_explanation_link(document))
+            quick = self._typing_quick_answer_link(document, item_root=question_path.parent)
+            if link and link.get("kind") == "quick_answer" and quick is None:
+                link = None
+            links = [] if answer_backfill_only else [link]
+            if document.get("content", {}).get("answer") is None and quick:
+                links = [quick, *[chosen for chosen in links
+                                  if not chosen or chosen.get("source_asset_id") != quick["source_asset_id"]]]
+            for link in links:
+                selection = document.get("provenance", {}).get("solution_selection")
+                asset_id = str(link["source_asset_id"]) if link else ""
+                source_sha = self._asset_sha256(document, asset_id) if asset_id else None
+                ranked_links, ranking_tied = ([link] if link else [], False) if typing_only else ranked_solution_links(document)
+                candidate_asset_ids = list(dict.fromkeys(
+                    str(candidate["source_asset_id"])
+                    for candidate in ranked_links
+                    if isinstance(candidate.get("source_asset_id"), str)
+                ))
+                selection_revision = selection.get("revision") if isinstance(selection, Mapping) else None
+                key = f"{item_id}:{asset_id}:{source_sha or 'none'}:{selection_revision or 0}"
+                if link and link.get("kind") == "quick_answer":
+                    key = f"quick:{key}"
+                targets.append({
+                    "key": key, "item_id": item_id, "asset_id": asset_id,
+                    "source_sha256": source_sha, "selection_revision": selection_revision,
+                    "source_kind": link.get("kind") if link else None,
+                    "input_revision": document.get("workflow", {}).get("revision"),
+                    "input_content_hash": solution_content_hash(document),
+                    "state": "pending" if source_sha else "no_source",
+                    "candidate_generation": candidate_generation(document),
+                    "candidate_asset_ids": candidate_asset_ids,
+                    "candidate_cursor": 0,
+                    "attempted_image_sha256": [],
+                    "verification_calls": 0,
+                    "remaining_candidate_count": len(candidate_asset_ids),
+                    "ranking_tied": ranking_tied,
+                })
         return targets
 
     def enqueue_solution_operation(self, project_id: str, item_id: str, operation_id: str) -> str:
@@ -4856,8 +5076,10 @@ class BatchCoordinator:
                 "revision": 1, "event": "queued", "state": "queued", "stage": "solution_transcription",
                 "progress": 0, "message": "Solution image transcription is queued.",
                 "created_at": timestamp, "updated_at": timestamp, "finished_at": None,
-                "request": {"ocr_profile": "balanced", "provider_profile": profile}, "project_id": project_id, "item_id": item_id,
+                "request": {"ocr_profile": "balanced", "provider_profile": profile, "typing_only": True}, "project_id": project_id, "item_id": item_id,
                 "operation_id": operation_id, "summary": {}, "error_code": None,
+                "solution_targets": (self._collect_solution_targets(self.workspace_root / project_id, item_ids=[item_id], typing_only=True)
+                                     if (self.workspace_root / project_id / "project.json").is_file() else []),
                 "cancel_requested": False, "cancel_requested_at": None,
             }
             self._jobs[job_id] = record
@@ -4865,7 +5087,11 @@ class BatchCoordinator:
         self._executor.submit(self._run_solution_operation, job_id)
         return job_id
 
-    def transcribe_project_solutions(self, project_id: str, item_ids: list[str] | None = None) -> dict[str, Any]:
+    def transcribe_project_solutions(
+        self, project_id: str, item_ids: list[str] | None = None, *, answer_backfill_only: bool = False
+    ) -> dict[str, Any]:
+        if type(answer_backfill_only) is not bool:
+            raise BatchError("answer_backfill_only must be a boolean", status=400)
         try:
             project_id = validate_id(project_id, field="project_id")
         except ModelError as exc:
@@ -4894,8 +5120,10 @@ class BatchCoordinator:
                 "progress": 0, "message": "Project solution transcription is queued.",
                 "created_at": timestamp, "updated_at": timestamp, "finished_at": None,
                 "request": {"ocr_profile": "balanced", "provider_profile": self.project_provider_profile(project_id),
-                            "item_ids": item_ids},
+                            "item_ids": item_ids, "typing_only": True, "answer_backfill_only": answer_backfill_only},
                 "project_id": project_id, "summary": {}, "error_code": None,
+                "solution_targets": self._collect_solution_targets(
+                    project_dir, item_ids=item_ids, typing_only=True, answer_backfill_only=answer_backfill_only),
                 "cancel_requested": False, "cancel_requested_at": None,
             }
             self._jobs[job_id] = record
@@ -4919,20 +5147,26 @@ class BatchCoordinator:
             durable_jobs = copy.deepcopy(list(self._jobs.values()))
         project_dir = self.workspace_root / str(record["project_id"])
         request = record.get("request") or {}
+        # Records already inside the legacy relink stage keep their old policy.
+        # All new operations and ordinary batches transcribe and save only.
+        typing_only = request.get("typing_only", record.get("kind") != "solution_relink") is not False
         provider_profile = parse_provider_profile(request.get("provider_profile"))
         config = effective_provider_config(provider_profile, str(request.get("ocr_profile") or "balanced"))
         previous = {
-            (target.get("item_id"), target.get("candidate_generation")): target
+            (target.get("item_id"), target.get("source_kind") == "quick_answer", target.get("candidate_generation")): target
             for target in record.get("solution_targets", [])
             if isinstance(target, Mapping) and isinstance(target.get("item_id"), str)
         }
-        historical_ocr: dict[tuple[Any, Any], dict[str, int]] = {}
+        previous_items = {(target["item_id"], target.get("source_kind") == "quick_answer"): target
+                          for target in previous.values()}
+        historical_ocr: dict[tuple[str, bool, str], dict[str, int]] = {}
         for durable_job in durable_jobs:
             for durable_target in durable_job.get("solution_targets", []):
                 if not isinstance(durable_target, Mapping):
                     continue
                 durable_key = (
-                    durable_target.get("item_id"), durable_target.get("candidate_generation")
+                    durable_target.get("item_id"), durable_target.get("source_kind") == "quick_answer",
+                    durable_target.get("candidate_generation")
                 )
                 totals = historical_ocr.setdefault(durable_key, {"ocr_calls": 0, "ocr_candidates": 0})
                 for name in ("ocr_calls", "ocr_candidates"):
@@ -4940,25 +5174,53 @@ class BatchCoordinator:
         item_ids = [record["item_id"]] if record.get("kind") == "solution_operation" else request.get("item_ids")
         project = load_json_object(project_dir / "project.json")
         for item_id in item_ids if item_ids is not None else project.get("item_order", []):
+            if self.is_deleted(record["project_id"], item_id):
+                continue
             question_path = project_dir / "items" / item_id / "question.json"
             document = load_json_object(question_path)
-            if refresh_replaced_auto_selection(document):
+            if not typing_only and refresh_replaced_auto_selection(document):
                 save_json_cas(question_path, document, expected_revision=document["workflow"]["revision"])
-        targets = self._collect_solution_targets(project_dir, item_ids=item_ids)
+        targets = self._collect_solution_targets(
+            project_dir, item_ids=item_ids, typing_only=typing_only,
+            answer_backfill_only=request.get("answer_backfill_only") is True,
+        )
+        # Retain already-saved quick targets so a resumed job keeps its durable totals.
+        for prior in previous.values():
+            if self.is_deleted(record["project_id"], prior["item_id"]):
+                continue
+            if prior.get("source_kind") != "quick_answer" or any(
+                target["item_id"] == prior["item_id"] and target.get("source_kind") == "quick_answer"
+                for target in targets
+            ):
+                continue
+            question_path = project_dir / "items" / prior["item_id"] / "question.json"
+            document = load_json_object(question_path)
+            link = self._typing_quick_answer_link(document, item_root=question_path.parent)
+            if (document.get("content", {}).get("answer") is not None and link
+                    and link.get("source_asset_id") == prior.get("asset_id")
+                    and self._asset_sha256(document, prior["asset_id"]) == prior.get("source_sha256")):
+                targets.append(copy.deepcopy(prior))
         for target in targets:
             target.update(historical_ocr.get(
-                (target["item_id"], target["candidate_generation"]), {}
+                (target["item_id"], target.get("source_kind") == "quick_answer", target["candidate_generation"]), {}
             ))
-            prior = previous.get((target["item_id"], target["candidate_generation"]))
+            prior = previous.get((target["item_id"], target.get("source_kind") == "quick_answer", target["candidate_generation"]))
+            if typing_only:
+                prior = prior or previous_items.get((target["item_id"], target.get("source_kind") == "quick_answer"))
+                if prior and any(target.get(name) != prior.get(name) for name in (
+                    "asset_id", "source_sha256", "selection_revision",
+                )):
+                    target["state"] = "cancelled"
+                    continue
             if prior:
                 target.update({name: prior[name] for name in (
-                    "attempts", "ocr_calls", "ocr_candidates", "candidate_job_id",
-                    "verification_receipt", "input_content_hash", "candidate_cursor",
+                    "attempts", "ocr_calls", "ocr_candidates", "candidate_job_id", "before_package",
+                    "verification_receipt", "input_content_hash", "input_revision", "candidate_cursor",
                     "attempted_image_sha256", "verification_calls", "verification_state",
                 ) if name in prior})
                 if prior.get("state") in {"failed", "cancelled", "generated_pending_apply"}:
                     target["state"] = prior["state"]
-            if target["state"] == "pending" and int(target.get("ocr_calls") or 0) >= 3:
+            if not typing_only and target["state"] == "pending" and int(target.get("ocr_calls") or 0) >= 3:
                 target["state"] = "review_budget_exhausted"
             question_path = project_dir / "items" / target["item_id"] / "question.json"
             if target["source_sha256"]:
@@ -4976,13 +5238,26 @@ class BatchCoordinator:
                              and isinstance(selection, Mapping) and selection.get("origin") == "auto_candidate"))
                     for entry in (transcriptions if isinstance(transcriptions, list) else [])
                 )
-                if current_transcription and self._has_explanation(document):
+                saved_typing = solution_link_summary(document, item_root=question_path.parent) if typing_only else None
+                typing_complete = (isinstance(saved_typing, Mapping) and saved_typing.get("transcribed") is True
+                                   and saved_typing.get("source_asset_id") == target["asset_id"]
+                                   and saved_typing.get("source_sha256") == target["source_sha256"])
+                if target.get("source_kind") == "quick_answer":
+                    typing_complete = document.get("content", {}).get("answer") is not None
+                if typing_complete or (not typing_only and target.get("source_kind") != "quick_answer"
+                                        and current_transcription and self._has_explanation(document)):
                     target["state"] = "applied" if prior and prior.get("state") == "applied" else "skipped_current"
         for target in targets:
-            if target["state"] != "pending":
+            if target["state"] != "pending" or target.get("source_kind") == "quick_answer":
                 continue
             question_path = project_dir / "items" / target["item_id"] / "question.json"
             document = load_json_object(question_path)
+            if typing_only and (
+                document["workflow"]["revision"] != target["input_revision"]
+                or solution_content_hash(document) != target["input_content_hash"]
+            ):
+                target["state"] = "generated_pending_apply"
+                continue
             current_selection = document.get("provenance", {}).get("solution_selection")
             if (isinstance(current_selection, Mapping)
                     and current_selection.get("source_asset_id") == target["asset_id"]
@@ -4997,12 +5272,17 @@ class BatchCoordinator:
                 "revision": next_selection_revision, "origin": "auto_candidate", "selected_at": _now(),
             }
             saved = save_json_cas(question_path, document, expected_revision=document["workflow"]["revision"])
+            for sibling in targets:
+                if (sibling["item_id"] == target["item_id"] and sibling.get("source_kind") == "quick_answer"
+                        and sibling["input_revision"] == document["workflow"]["revision"]):
+                    sibling["input_revision"] = saved["workflow"]["revision"]
+                    sibling["selection_revision"] = next_selection_revision
             target["selection_revision"] = next_selection_revision
             target["input_revision"] = saved["workflow"]["revision"]
             target["key"] = f'{target["item_id"]}:{target["asset_id"]}:{target["source_sha256"]}:{next_selection_revision}'
         with self._lock:
             live = self._jobs[job_id]
-            live["solution_targets"] = targets
+            live["solution_targets"] = copy.deepcopy(targets)
             live["state"] = "ocr"
             live["stage"] = "solution_transcription"
             live["progress"] = 86
@@ -5012,17 +5292,25 @@ class BatchCoordinator:
             self._persist(live)
 
         if not targets:
-            self._update(job_id, summary={**record["summary"], "solution_transcription": {"total": 0}})
+            empty_counts = {name: 0 for name in (
+                "total", "applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted",
+                "failed", "no_source", "cancelled", "skipped", "persisted",
+            )}
+            self._update(job_id, summary={**record["summary"], "solution_transcription": empty_counts},
+                         progress=99, message="Solution transcription ended: 0 targets, 0 persisted.")
             return
 
         candidate_cache = self._shared_candidate_cache(project_dir, config, provider_profile=provider_profile,
-            source_sha256s={target["source_sha256"] for target in targets if target["state"] == "pending"})
-        content_cache = self._shared_content_cache(project_dir, provider_profile=provider_profile)
-        analysis_owners = self._shared_analysis_owners(project_dir, provider_profile)
+            source_sha256s={target["source_sha256"] for target in targets if target["state"] == "pending"}, typing_only=typing_only)
+        content_cache = self._shared_content_cache(project_dir, provider_profile=provider_profile, typing_only=typing_only)
+        analysis_owners = self._shared_analysis_owners(project_dir, provider_profile, typing_only=typing_only)
         groups: dict[str, list[dict[str, Any]]] = {}
         for target in targets:
             if target["state"] == "pending":
-                groups.setdefault(target["source_sha256"], []).append(target)
+                # A quick table can have identical pixels but different target answers.
+                group_key = (f"quick:{target['key']}" if target.get("source_kind") == "quick_answer"
+                             else target["source_sha256"])
+                groups.setdefault(group_key, []).append(target)
         terminal_states = {"applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted",
                            "failed", "no_source", "cancelled"}
 
@@ -5049,7 +5337,8 @@ class BatchCoordinator:
                     candidate = create_transcription_job(
                         owner[0] if owner else project_dir / "items" / leader["item_id"] / "question.json",
                         owner[1] if owner else leader["asset_id"],
-                        "explanation", config=config, shared_parent_mode=True,
+                        "explanation", config=config,
+                        shared_parent_mode=leader.get("source_kind") != "quick_answer",
                         provider_profile=provider_profile,
                     )
                     return candidate, attempt + 1, None
@@ -5065,12 +5354,13 @@ class BatchCoordinator:
                     return None, attempt + 1, exc
             raise AssertionError("unreachable provider retry state")
 
-        pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="solution-provider")
+        provider_workers = max(2, _ocr_concurrency())
+        pool = ThreadPoolExecutor(max_workers=provider_workers, thread_name_prefix="solution-provider")
         provider_queue = iter(provider_groups)
         provider_futures = {}
 
         def prefetch() -> None:
-            while len(provider_futures) < 2:
+            while len(provider_futures) < provider_workers:
                 try:
                     source_sha, leader = next(provider_queue)
                 except StopIteration:
@@ -5080,15 +5370,16 @@ class BatchCoordinator:
         try:
             self._checkpoint(job_id)
             prefetch()
-            for source_sha, group in groups.items():
+            for group_key, group in groups.items():
                 self._checkpoint(job_id)
                 pending = [target for target in group if target["state"] == "pending"]
                 if not pending:
                     continue
                 leader = pending[0]
-                candidate = candidate_cache.get(source_sha)
-                if source_sha in provider_futures:
-                    candidate, calls, error = provider_futures.pop(source_sha).result()
+                source_sha = leader["source_sha256"]
+                candidate = candidate_cache.get(group_key)
+                if group_key in provider_futures:
+                    candidate, calls, error = provider_futures.pop(group_key).result()
                     for target in pending:
                         target["ocr_calls"] = int(target.get("ocr_calls") or 0) + calls
                     prefetch()
@@ -5097,7 +5388,7 @@ class BatchCoordinator:
                             target.update(state="failed", error_code=_ocr_error_code(error), attempts=calls)
                         report_targets()
                         continue
-                    candidate_cache[source_sha] = candidate
+                    candidate_cache[group_key] = candidate
                 for target in pending:
                     self._checkpoint(job_id)
                     question_path = project_dir / "items" / target["item_id"] / "question.json"
@@ -5105,8 +5396,16 @@ class BatchCoordinator:
                     if candidate is not None:
                         target["candidate_job_id"] = candidate.path.name
                     selection = current.get("provenance", {}).get("solution_selection")
+                    answer_only = target.get("source_kind") == "quick_answer"
+                    if answer_only and current["content"].get("answer") is not None:
+                        target["state"] = "skipped_current"
+                        report_targets()
+                        continue
+                    current_link = (self._typing_quick_answer_link(current, item_root=question_path.parent)
+                                    if answer_only else self._typing_explanation_link(current, item_root=question_path.parent)
+                                    if typing_only else self._registered_explanation_link(current))
                     if (self._asset_sha256(current, target["asset_id"]) != source_sha
-                        or self._registered_explanation_asset(current) != target["asset_id"]
+                        or current_link is None or current_link.get("source_asset_id") != target["asset_id"]
                         or (isinstance(selection, Mapping) and selection.get("revision") != target["selection_revision"])):
                         target["state"] = "cancelled"
                         report_targets()
@@ -5114,21 +5413,39 @@ class BatchCoordinator:
                     current_hash = solution_content_hash(current)
                     auto_hash = current.get("provenance", {}).get("last_auto_applied_hash")
                     manual_content = self._has_explanation(current) and (not isinstance(auto_hash, str) or auto_hash != current_hash)
-                    if (current_hash != target.get("input_content_hash") or manual_content):
+                    if (current_hash != target.get("input_content_hash")
+                            or (typing_only and current["workflow"]["revision"] != target["input_revision"])
+                            or (not typing_only and manual_content and not answer_only)):
                         target["state"] = "generated_pending_apply"
                         report_targets()
                         continue
                     try:
                         revision = current["workflow"]["revision"]
+                        if typing_only and (self._has_explanation(current) or current["content"].get("answer") is not None):
+                            before_path = self.jobs_root / job_id / "solution_before" / f"{target['item_id']}-r{revision}.json"
+                            if before_path.exists():
+                                if load_json_object(before_path) != current:
+                                    raise CandidateIntegrityError("solution before-package evidence differs")
+                            else:
+                                atomic_write_json(before_path, current)
+                            target["before_package"] = {
+                                "path": before_path.relative_to(self.jobs_root / job_id).as_posix(),
+                                "revision": revision, "sha256": sha256_file(before_path),
+                            }
+                            # Evidence must be durable before canonical content is replaced.
+                            self._update(job_id, solution_targets=targets)
                         if candidate is not None:
-                            local = clone_candidate_job_for_item(question_path, candidate, target["asset_id"], expected_base_revision=revision)
+                            answer_only = target.get("source_kind") == "quick_answer"
+                            local = (candidate if answer_only else clone_candidate_job_for_item(
+                                question_path, candidate, target["asset_id"], expected_base_revision=revision))
                             target["candidate_job_id"] = local.path.name
                             self._update(job_id, solution_targets=targets)
-                            apply_candidate_job(question_path, local.path, expected_base_revision=revision,
-                                preserve_existing_answer=True, discard_candidate_answer=True)
+                            saved = apply_candidate_job(question_path, local.path, expected_base_revision=revision,
+                                preserve_existing_answer=True, discard_candidate_answer=not answer_only,
+                                typing_only=typing_only)
                         else:
                             source_document, source_item_id = content_cache[source_sha]
-                            clone_explanation_content_cas(source_document, question_path, target["asset_id"], source_sha,
+                            saved = clone_explanation_content_cas(source_document, question_path, target["asset_id"], source_sha,
                                 source_item_id=source_item_id, expected_revision=revision)
                     except (RevisionConflict, CandidateValidationError):
                         target["state"] = "generated_pending_apply"
@@ -5136,6 +5453,13 @@ class BatchCoordinator:
                         target.update(state="failed", error_code=_ocr_error_code(exc))
                     else:
                         target["state"] = "applied"
+                        for sibling in targets:
+                            if (isinstance(saved, Mapping) and sibling is not target
+                                    and sibling["item_id"] == target["item_id"]
+                                    and sibling["state"] == "pending" and sibling["input_revision"] == revision
+                                    and sibling["input_content_hash"] == current_hash):
+                                sibling["input_revision"] = saved["workflow"]["revision"]
+                                sibling["input_content_hash"] = solution_content_hash(saved)
                     target["attempts"] = int(target.get("attempts") or 0) + 1
                     report_targets()
         finally:
@@ -5149,13 +5473,26 @@ class BatchCoordinator:
         self._update(job_id, summary=summary, solution_targets=targets, progress=95,
                      message=f"Solution transcription ended: {len(targets)} targets.")
 
+        if typing_only:
+            summary["solution_transcription"].update(
+                skipped=counts["skipped_current"],
+                persisted=counts["applied"] + counts["skipped_current"],
+            )
+            self._update(job_id, summary=summary, solution_targets=targets, progress=99,
+                         message=(f"Solution transcription ended: {counts['applied']} typed, "
+                                  f"{counts['skipped_current']} skipped, {counts['failed']} OCR failed, "
+                                  f"{counts['no_source']} no source; "
+                                  f"{counts['generated_pending_apply']} not saved, {counts['cancelled']} cancelled."))
+            return
+
         from .solution_verification import alternative_assets, can_try_alternative, mark_pair_mismatch, repair_selected_crop, verify_selected
         verified = reviewed = failed = 0
         verification_states = {"applied", "skipped_current", "generated_pending_apply", "review_budget_exhausted"}
-        verification_total = sum(target["state"] in verification_states for target in targets)
+        verification_total = sum(target["state"] in verification_states
+                                 and target.get("source_kind") != "quick_answer" for target in targets)
         self._update(job_id, stage="solution_verification", message=f"Checking solution pairs: 0/{verification_total}.")
         for target in targets:
-            if target["state"] not in verification_states:
+            if target["state"] not in verification_states or target.get("source_kind") == "quick_answer":
                 continue
             if int(target.get("verification_calls") or 0) >= 3:
                 target["verification_state"] = target.get("verification_state") or "review"
@@ -5179,7 +5516,16 @@ class BatchCoordinator:
                 attempted_hashes = target.setdefault("attempted_image_sha256", [])
                 if target.get("source_sha256") and target["source_sha256"] not in attempted_hashes:
                     attempted_hashes.append(target["source_sha256"])
-                if (outcome["state"] == "review" and int(target.get("crop_repairs") or 0) < 1
+                current = load_json_object(question_path)
+                selection = current.get("provenance", {}).get("solution_selection")
+                auto_source = (
+                    isinstance(selection, Mapping)
+                    and selection.get("origin") == "auto_candidate"
+                    and selection.get("source_asset_id") == target["asset_id"]
+                    and selection.get("source_sha256") == target["source_sha256"]
+                    and selection.get("revision") == target["selection_revision"]
+                )
+                if (auto_source and outcome["state"] == "review" and int(target.get("crop_repairs") or 0) < 1
                     and can_try_alternative(target)):
                     current = load_json_object(question_path)
                     last_auto = current.get("provenance", {}).get("last_auto_applied_hash")
@@ -5218,7 +5564,7 @@ class BatchCoordinator:
                                 target["verification_calls"] = int(target.get("verification_calls") or 0) + 1
                             if target["source_sha256"] not in attempted_hashes:
                                 attempted_hashes.append(target["source_sha256"])
-                if outcome["state"] == "mismatch":
+                if auto_source and outcome["state"] == "mismatch":
                     mark_pair_mismatch(question_path)
                     current = load_json_object(question_path)
                     alternatives = alternative_assets(current, target["asset_id"])
@@ -5490,6 +5836,7 @@ class BatchCoordinator:
                     self.workspace_root,
                     project_name=request.get("project_name"),
                     source_name=request.get("source_name"),
+                    project_info=request.get("project_info"),
                 )
                 self._update(job_id, project_id=imported.project_id)
                 project_dir = imported.project_dir
@@ -5522,6 +5869,7 @@ class BatchCoordinator:
             if (
                 parse_provider_profile(request.get("provider_profile")) == "full"
                 and request.get("regenerate_figures") is True
+                and figure_profile_available(str(request.get("figure_profile") or "balanced"))
             ):
                 prior_figure_spend = Decimal("0")
                 if resumed:
@@ -5662,19 +6010,23 @@ class BatchCoordinator:
                 groups.setdefault(source_sha256, []).append(target)
 
         if not groups:
-            for question_path, asset_id, section, unit_id, _ in legacy:
-                self._checkpoint(job_id)
-                self._try_transcription(
-                    job_id,
-                    question_path,
-                    asset_id,
-                    section,
-                    unit_id,
-                    config,
-                    replacing_failure=True,
-                    provider_profile=parse_provider_profile(provider_profile),
-                )
-                self._checkpoint(job_id)
+            self._run_transcriptions_concurrently(
+                job_id,
+                [
+                    (
+                        question_path,
+                        asset_id,
+                        section,
+                        unit_id,
+                        {
+                            "replacing_failure": True,
+                            "provider_profile": parse_provider_profile(provider_profile),
+                        },
+                    )
+                    for question_path, asset_id, section, unit_id, _ in legacy
+                ],
+                config,
+            )
             return
 
         project_dir = next(iter(groups.values()))[0][0].parents[2]
@@ -5718,20 +6070,24 @@ class BatchCoordinator:
             record["updated_at"] = _now()
             self._persist(record)
 
-        for question_path, asset_id, section, unit_id, _ in legacy:
-            self._checkpoint(job_id)
-            self._try_transcription(
-                job_id,
-                question_path,
-                asset_id,
-                section,
-                unit_id,
-                config,
-                replacing_failure=True,
-                track_work=True,
-                provider_profile=parse_provider_profile(provider_profile),
-            )
-            self._checkpoint(job_id)
+        self._run_transcriptions_concurrently(
+            job_id,
+            [
+                (
+                    question_path,
+                    asset_id,
+                    section,
+                    unit_id,
+                    {
+                        "replacing_failure": True,
+                        "track_work": True,
+                        "provider_profile": parse_provider_profile(provider_profile),
+                    },
+                )
+                for question_path, asset_id, section, unit_id, _ in legacy
+            ],
+            config,
+        )
 
         for source_sha256, group in groups.items():
             self._checkpoint(job_id)
@@ -5772,9 +6128,12 @@ class BatchCoordinator:
                 for item in request.get("items", [])
                 if isinstance(item, Mapping)
             }
+            bank_profile = str(request.get("profile") or "quality")
+            if bank_profile not in FIGURE_PROFILES or not figure_profile_available(bank_profile):
+                raise BatchError(GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE, status=409)
             adapter = _BudgetedFigureAdapter(
-                self.figure_adapter or GeminiFigureAdapter(),
-                Decimal(str(FIGURE_PROFILES["quality"].estimated_output_usd)),
+                self.figure_adapter or default_figure_adapter(FIGURE_PROFILES[bank_profile]),
+                Decimal(str(FIGURE_PROFILES[bank_profile].estimated_output_usd)),
                 Decimal(str(request.get("estimated_output_usd_max") or 0)),
             )
             work_total = len(targets) + int(
@@ -5853,6 +6212,7 @@ class BatchCoordinator:
                             expected_revision,
                             target["block_id"],
                             self.figure_cache_root,
+                            profile=bank_profile,
                         )
                         if any(
                             inputs.get(field) != target.get(field)
@@ -5895,6 +6255,7 @@ class BatchCoordinator:
                         representative_path,
                         representative_revision,
                         str(representative["block_id"]),
+                        profile=bank_profile,
                         adapter=adapter,
                     )
                 except _FigureBudgetExceeded:
@@ -6092,10 +6453,21 @@ class BatchCoordinator:
                 targets.append(
                     (question_path, explanation_asset, "explanation", str(unit_id))
                 )
+            quick = self._typing_quick_answer_link(document, item_root=question_path.parent)
+            if quick and quick["source_asset_id"] != explanation_asset:
+                quick_applied = any(
+                    quick["source_asset_id"] in transcription.get("input_asset_ids", [])
+                    for transcription in document.get("provenance", {}).get("transcriptions", [])
+                    if isinstance(transcription, Mapping)
+                )
+                if document.get("content", {}).get("answer") is None or (resume and quick_applied):
+                    targets.append((question_path, quick["source_asset_id"], "answer", str(unit_id)))
         pending = targets
         failure_keys: set[tuple[str, str]] = set()
         with self._lock:
             ocr = self._jobs[job_id]["summary"]["ocr"]
+            ocr.setdefault("answer_succeeded", 0)
+            ocr.setdefault("answer_failed", 0)
             if resume:
                 existing_failures = {
                     (str(item.get("unit_id")), str(item.get("section"))): item
@@ -6133,6 +6505,8 @@ class BatchCoordinator:
                     explanation_failed=sum(
                         s == "explanation" for _, s in failure_keys
                     ),
+                    answer_succeeded=sum(s == "answer" for _, s in completed),
+                    answer_failed=sum(s == "answer" for _, s in failure_keys),
                     failures=retained,
                 )
             else:
@@ -6150,19 +6524,23 @@ class BatchCoordinator:
             progress=78,
             message=f"Transcribing registered crops ({len(targets) - len(pending)}/{len(targets)}).",
         )
-        for question_path, asset_id, section, unit_id in pending:
-            self._checkpoint(job_id)
-            self._try_transcription(
-                job_id,
-                question_path,
-                asset_id,
-                section,
-                unit_id,
-                config,
-                replacing_failure=(unit_id, section) in failure_keys,
-                provider_profile=parsed_profile,
-            )
-            self._checkpoint(job_id)
+        self._run_transcriptions_concurrently(
+            job_id,
+            [
+                (
+                    question_path,
+                    asset_id,
+                    section,
+                    unit_id,
+                    {
+                        "replacing_failure": (unit_id, section) in failure_keys,
+                        "provider_profile": parsed_profile,
+                    },
+                )
+                for question_path, asset_id, section, unit_id in pending
+            ],
+            config,
+        )
         if targets:
             self._mark_project_content_working(project_dir)
 
@@ -6357,7 +6735,7 @@ class BatchCoordinator:
         )
         remaining_budget = max(Decimal("0"), budget_usd - prior_spend_usd)
         adapter = _BudgetedFigureAdapter(
-            self.figure_adapter or GeminiFigureAdapter(),
+            self.figure_adapter or default_figure_adapter(FIGURE_PROFILES[profile]),
             Decimal(str(FIGURE_PROFILES[profile].estimated_output_usd)),
             remaining_budget,
         )
@@ -6625,10 +7003,15 @@ class BatchCoordinator:
             selected_id = selection.get("source_asset_id")
             selected_sha = selection.get("source_sha256")
             manual = selection.get("origin") != "auto_candidate"
-            if (selected_id in asset_ids and selected_sha == cls._asset_sha256(document, selected_id)
+            if (isinstance(selected_id, str) and selected_id in asset_ids and isinstance(selected_sha, str)
+                    and selected_sha == cls._asset_sha256(document, selected_id)
                     and (manual or selected_id in ranked_asset_ids)):
                 chosen = next((link for link in eligible if link.get("source_asset_id") == selected_id), None)
                 return chosen
+            if manual:
+                # An explicit source with missing/changed bytes is unavailable;
+                # automatic ranking must not silently replace its authority.
+                return None
             provenance = document.get("provenance", {})
             raw_snapshot = provenance.get("raw_snapshot") if isinstance(provenance, Mapping) else None
             raw_link = raw_snapshot.get("link_item") if isinstance(raw_snapshot, Mapping) else None
@@ -6646,7 +7029,11 @@ class BatchCoordinator:
         protected = [
             link for link in candidates if cls._is_protected_solution_link(link)
         ]
-        selected_pool = protected or candidates
+        # A seam repair supersedes an unprotected review crop, not an explicit
+        # selection, a verified/manual link, or the current raw candidate scope.
+        repaired = [link for link in candidates
+                    if link.get("status") == "review" and cls._is_boundary_seam_repaired(link)]
+        selected_pool = protected or repaired or candidates
         return selected_pool[0] if selected_pool else None
 
     @classmethod
@@ -6708,6 +7095,58 @@ class BatchCoordinator:
 
     _verified_explanation_asset = _registered_explanation_asset
 
+    @classmethod
+    def _typing_explanation_link(
+        cls, document: Mapping[str, Any], *, item_root: Path
+    ) -> Mapping[str, Any] | None:
+        """Resolve physical typing authority, never pair quality or alternatives."""
+        provenance = document.get("provenance", {})
+        links = [link for link in provenance.get("solution_links", [])
+                 if isinstance(link, Mapping) and link.get("kind") in {"detailed_solution", "mixed", "quick_answer"}
+                 and isinstance(link.get("source_asset_id"), str)]
+        selection = provenance.get("solution_selection")
+        if isinstance(selection, Mapping):
+            asset_id, expected_sha = selection.get("source_asset_id"), selection.get("source_sha256")
+            associated = [link for link in links if link.get("source_asset_id") == asset_id]
+            if not isinstance(asset_id, str) or not associated or expected_sha != cls._asset_sha256(document, asset_id):
+                return None
+            link = next((link for link in associated if link.get("kind") != "quick_answer"), associated[0])
+        else:
+            detailed = [link for link in links if link.get("kind") != "quick_answer"]
+            pool = detailed or links
+            unique = {link["source_asset_id"]: link for link in pool}
+            if len(unique) != 1:
+                return None
+            asset_id, link = next(iter(unique.items()))
+            expected_sha = cls._asset_sha256(document, asset_id)
+        assets = [asset for asset in document.get("resources", {}).get("assets", [])
+                  if isinstance(asset, Mapping) and asset.get("asset_id") == asset_id]
+        if (len(assets) != 1 or not isinstance(expected_sha, str)
+                or assets[0].get("section") not in {"answer", "explanation"}
+                or assets[0].get("role") != "source_crop" or assets[0].get("state", "ready") != "ready"
+                or not isinstance(assets[0].get("path"), str)):
+            return None
+        root = item_root.resolve()
+        source_path = (root / assets[0]["path"]).resolve()
+        if not source_path.is_relative_to(root) or not source_path.is_file() or sha256_file(source_path) != expected_sha:
+            return None
+        return link
+
+    @classmethod
+    def _typing_quick_answer_link(cls, document, *, item_root: Path):
+        """Resolve an eligible, unambiguous quick source independently of the explanation selection."""
+        filtered = copy.deepcopy(document)
+        provenance = filtered.setdefault("provenance", {})
+        provenance.pop("solution_selection", None)
+        provenance["solution_links"] = [
+            link for link in provenance.get("solution_links", [])
+            if isinstance(link, Mapping) and link.get("kind") == "quick_answer"
+            and link.get("status") in {"verified", "review"}
+            and not any("rejected" in str(reason) or "excluded" in str(reason)
+                        for reason in (link.get("review_reasons") or []))
+        ]
+        return cls._typing_explanation_link(filtered, item_root=item_root)
+
     @staticmethod
     def _asset_sha256(document: Mapping[str, Any], asset_id: str) -> str | None:
         assets = document.get("resources", {}).get("assets", [])
@@ -6722,14 +7161,16 @@ class BatchCoordinator:
 
     @classmethod
     def _shared_analysis_owners(
-        cls, project_dir: Path, provider_profile: str = "full"
+        cls, project_dir: Path, provider_profile: str = "full", *, typing_only: bool = False
     ) -> dict[str, tuple[Path, str, Path]]:
         latest: dict[str, tuple[int, Path, str, Path]] = {}
         documents = [(item_dir, load_json_object(item_dir / "question.json"))
                      for item_dir in (project_dir / "items").iterdir()]
         source_shas = set()
         for _item_dir, document in documents:
-            asset_id = cls._registered_explanation_asset(document)
+            link = (cls._typing_explanation_link(document, item_root=_item_dir)
+                    if typing_only else cls._registered_explanation_link(document))
+            asset_id = link.get("source_asset_id") if link else None
             source_sha = cls._asset_sha256(document, asset_id) if asset_id else None
             if source_sha is not None:
                 source_shas.add(source_sha)
@@ -6760,10 +7201,10 @@ class BatchCoordinator:
     @classmethod
     def _shared_candidate_cache(
         cls, project_dir: Path, config: ProviderConfig, *, provider_profile: str = "full",
-        source_sha256s: set[str] | None = None,
+        source_sha256s: set[str] | None = None, typing_only: bool = False,
     ) -> dict[str, CandidateJob]:
         cached: dict[str, CandidateJob] = {}
-        analysis_owners = cls._shared_analysis_owners(project_dir, provider_profile)
+        analysis_owners = cls._shared_analysis_owners(project_dir, provider_profile, typing_only=typing_only)
         for item_dir in (project_dir / "items").iterdir():
             try:
                 job_paths = list((item_dir / "jobs" / "transcription").iterdir())
@@ -6811,19 +7252,21 @@ class BatchCoordinator:
 
     @classmethod
     def _shared_content_cache(
-        cls, project_dir: Path, *, provider_profile: str = "full"
+        cls, project_dir: Path, *, provider_profile: str = "full", typing_only: bool = False
     ) -> dict[str, tuple[dict[str, Any], str]]:
         cached: dict[str, tuple[dict[str, Any], str]] = {}
-        analysis_owners = cls._shared_analysis_owners(project_dir, provider_profile)
+        analysis_owners = cls._shared_analysis_owners(project_dir, provider_profile, typing_only=typing_only)
         for item_dir in (project_dir / "items").iterdir():
             document = load_json_object(item_dir / "question.json")
-            asset_id = cls._registered_explanation_asset(document)
+            link = (cls._typing_explanation_link(document, item_root=item_dir)
+                    if typing_only else cls._registered_explanation_link(document))
+            asset_id = link.get("source_asset_id") if link else None
             source_sha256 = cls._asset_sha256(document, asset_id) if asset_id else None
             explanation = document.get("content", {}).get("explanation")
             blocks = explanation.get("blocks") if isinstance(explanation, Mapping) else None
             item_id = document.get("item_id")
             if (
-                source_sha256 is None or not isinstance(blocks, list) or not blocks
+                source_sha256 is None or not isinstance(asset_id, str) or not isinstance(blocks, list) or not blocks
                 or source_sha256 in analysis_owners
                 or not isinstance(item_id, str) or cls._has_invalid_bogi_labels(explanation)
                 or not cls._has_shared_parent_provenance(document, asset_id, source_sha256, provider_profile=provider_profile)
@@ -7169,6 +7612,69 @@ class BatchCoordinator:
                     application_attempted=True,
                 )
 
+    def _run_transcriptions_concurrently(
+        self,
+        job_id: str,
+        targets: Sequence[tuple[Path, str, str, str, Mapping[str, Any]]],
+        config: ProviderConfig,
+    ) -> None:
+        """Run OCR targets in parallel; sections of one item stay in order.
+
+        Every save still goes through the item's own revision-checked apply path
+        and every job-record update through ``self._lock``. The first raised
+        exception (cancellation, rate limit) stops new work; in-flight calls
+        finish before it is re-raised.
+        """
+
+        groups: dict[Path, list[tuple[Path, str, str, str, Mapping[str, Any]]]] = {}
+        for target in targets:
+            groups.setdefault(target[0], []).append(target)
+        workers = _ocr_concurrency()
+        if workers == 1 or len(groups) <= 1:
+            for group in groups.values():
+                for question_path, asset_id, section, unit_id, options in group:
+                    self._checkpoint(job_id)
+                    self._try_transcription(
+                        job_id, question_path, asset_id, section, unit_id, config, **options
+                    )
+                    self._checkpoint(job_id)
+            return
+        stop = threading.Event()
+
+        def stop_requested() -> bool:
+            with self._lock:
+                record = self._jobs[job_id]
+                if record.get("cancel_requested") is True or record.get("state") == "cancelled":
+                    stop.set()
+            return stop.is_set()
+
+        def run_group(group: Sequence[tuple[Path, str, str, str, Mapping[str, Any]]]) -> None:
+            for question_path, asset_id, section, unit_id, options in group:
+                if stop_requested():
+                    return
+                self._try_transcription(
+                    job_id, question_path, asset_id, section, unit_id, config, **options
+                )
+
+        # Workers only observe a cancel request; the cancelled transition is
+        # finalized once below, after every in-flight call has been recorded.
+        self._checkpoint(job_id)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr") as pool:
+            futures = [pool.submit(run_group, group) for group in groups.values()]
+            done, _ = wait_futures(futures, return_when=FIRST_EXCEPTION)
+            if any(future.exception() is not None for future in done):
+                stop.set()
+                for future in futures:
+                    future.cancel()
+        errors = [
+            future.exception()
+            for future in futures
+            if not future.cancelled() and future.exception() is not None
+        ]
+        self._checkpoint(job_id)
+        if errors:
+            raise errors[0]
+
     def _try_transcription(
         self,
         job_id: str,
@@ -7182,23 +7688,53 @@ class BatchCoordinator:
         track_work: bool = False,
         provider_profile: Any = None,
     ) -> None:
+        answer_only = section == "answer"
+        if answer_only and load_json_object(question_path).get("content", {}).get("answer") is not None:
+            with self._lock:
+                record = self._jobs[job_id]
+                ocr = record["summary"]["ocr"]
+                ocr["total"] -= 1
+                if replacing_failure:
+                    for index, previous in enumerate(ocr["failures"]):
+                        if previous.get("unit_id") == unit_id and previous.get("section") == section:
+                            ocr["failures"].pop(index)
+                            ocr["attempted"] -= 1
+                            ocr["failed"] -= 1
+                            ocr["answer_failed"] -= 1
+                            break
+                self._record_ocr_progress(record)
+                record["revision"] = int(record.get("revision") or 0) + 1
+                record["event"] = "ocr_answer_skipped_current"
+                record["updated_at"] = _now()
+                self._persist(record)
+            return
         with self._lock:
             record = self._jobs[job_id]
             ocr = record["summary"]["ocr"]
-            ocr["attempted"] += 1
+            if not replacing_failure or ocr["attempted"] < ocr["succeeded"] + ocr["failed"]:
+                ocr["attempted"] += 1
             record["revision"] = int(record.get("revision") or 0) + 1
             record["event"] = "ocr_attempt_started"
             record["updated_at"] = _now()
             self._persist(record)
         candidate_job: CandidateJob | None = None
         try:
-            candidate_job = create_transcription_job(
-                question_path,
-                asset_id,
-                section,
-                config=config,
-                provider_profile=parse_provider_profile(provider_profile),
-            )
+            for timeout_attempt in range(2):
+                try:
+                    candidate_job = create_transcription_job(
+                        question_path,
+                        asset_id,
+                        "explanation" if answer_only else section,
+                        config=config,
+                        provider_profile=parse_provider_profile(provider_profile),
+                    )
+                    break
+                except AstraTranscriptionError as exc:
+                    # A stalled provider call usually succeeds on a fresh call;
+                    # the failed attempt stays recorded under jobs/.analysis.
+                    if timeout_attempt == 0 and exc.code == "timeout":
+                        continue
+                    raise
             if track_work:
                 self._record_provider_result(
                     job_id,
@@ -7208,6 +7744,8 @@ class BatchCoordinator:
                     ),
                 )
             apply_options: dict[str, Any] = {}
+            if answer_only:
+                apply_options.update(preserve_existing_answer=True, typing_only=True)
             if section == "explanation":
                 current = load_json_object(question_path)
                 content = current.get("content")
@@ -7216,7 +7754,7 @@ class BatchCoordinator:
             if track_work:
                 self._record_application_started(job_id)
             try:
-                apply_candidate_job(
+                applied = apply_candidate_job(
                     question_path,
                     candidate_job.path,
                     expected_base_revision=int(
@@ -7224,6 +7762,8 @@ class BatchCoordinator:
                     ),
                     **apply_options,
                 )
+                if answer_only and applied["content"].get("answer") is None:
+                    raise CandidateValidationError("quick-answer source has no explicit answer")
             except CandidateValidationError as exc:
                 if section != "explanation" or (
                     "cannot be linked without inference" not in str(exc)
@@ -7268,7 +7808,7 @@ class BatchCoordinator:
                 record["event"] = "ocr_attempt_failed"
                 record["updated_at"] = _now()
                 self._persist(record)
-            if isinstance(exc, CodexRateLimitError):
+            if isinstance(exc, CodexRateLimitError) and not answer_only:
                 raise
             return
         with self._lock:
@@ -7404,16 +7944,28 @@ class BatchCoordinator:
                 )
             else:
                 crop_progress = record.get("progress")
+                live = crop_log_progress(self._crop_log_lines(crop_job_id))
+                if live is not None and (
+                    type(crop_progress) is not int or live["fraction"] > crop_progress
+                ):
+                    crop_progress = live["fraction"]
                 projected = (
                     5 + round(min(100, max(0, crop_progress)) * 0.62)
                     if type(crop_progress) is int
                     else 5
                 )
+                message = "Cropping and verifying problem pages."
+                if live is not None:
+                    total = live.get("total")
+                    message = (
+                        f"{live['label']} {live['done']}/{total if total is not None else '?'}"
+                        f"{live.get('unit', '')}"
+                    )
                 self._update(
                     job_id,
                     stage="crop",
                     progress=projected,
-                    message="Cropping and verifying problem pages.",
+                    message=message,
                 )
             time.sleep(self.poll_seconds)
         raise RuntimeError("crop timed out")

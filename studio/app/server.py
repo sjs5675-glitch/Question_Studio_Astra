@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import secrets
+import gzip
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -17,17 +18,23 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from astra_runtime import inside, validate_parsed_paths, port_number
 from solution_learning.contracts import ActorKind
 from . import ASTRA
 from .batch import BatchCoordinator, BatchError, validate_figure_options
+from .batch_content import project_content_projection
+from .answer_promotion import promote_answer_from_explanation
 from .document_routes import DocumentRequest, document_response
 from .document_types import DocumentError
 from .equation_bridge import equation_source_changed
 from .figure_generation import (
     FIGURE_PROFILES,
+    GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE,
+    active_figure_profile,
+    figure_profile_available,
+    gemini_figure_generation_enabled,
     IMAGE_SIZE as FIGURE_IMAGE_SIZE,
     PRICING_AS_OF as FIGURE_PRICING_AS_OF,
     FigureGenerationAdapter,
@@ -55,6 +62,7 @@ from .model import (
     is_advisory_review_issue,
     load_json_object,
     registration_summary,
+    stored_content_status,
     solution_link_summary,
     update_tags_cas,
     review_figure_asset_cas,
@@ -119,6 +127,8 @@ from .transcription import (
     load_candidate_job,
     parse_provider_profile,
 )
+from . import ai_explanation
+from .explanation_queue import ExplanationQueue, QueueError
 from .trash import Trash, TrashError
 from .tagging import (
     TaggingAdapter,
@@ -212,16 +222,20 @@ class StudioApplication:
         *,
         figure_adapter: FigureGenerationAdapter | None = None,
         tagging_adapter: TaggingAdapter | None = None,
+        explanation_runner: "ai_explanation.Runner | None" = None,
         feedback_sync: Callable[[FeedbackSyncRequest], None] | None = None,
         learning_library: LearningLibrary | None = None,
+        explanation_queue_autostart: bool = True,
     ) -> None:
         self.config = config
         self.figure_adapter = figure_adapter
         self.tagging_adapter = tagging_adapter
+        self.explanation_runner = explanation_runner or ai_explanation.cli_runner
         self.feedback_sync = feedback_sync
         self.learning_library = learning_library
         self._import_lock = threading.Lock()
         self._project_status_lock = threading.Lock()
+        self._projects_listed = threading.Event()
         self.config.workspace_root.mkdir(parents=True, exist_ok=True)
         self.trash = Trash(self.config.workspace_root, busy=lambda pid: any(
             job.get("project_id") == pid and job.get("state") not in {"completed", "failed", "interrupted", "cancelled"}
@@ -239,7 +253,27 @@ class StudioApplication:
             self.config.workspace_root,
             retained_ids=self.batches.retained_upload_ids(),
         )
-        list_bank_items(self.config.workspace_root, lightweight=True)
+        # Warm the question-bank cache off the startup path so readiness is not
+        # delayed by a full workspace scan; requests that arrive first build it themselves.
+        threading.Thread(target=self._warm_bank_cache, name="bank-cache-warmup", daemon=True).start()
+        self.explanation_queue = ExplanationQueue(
+            self.config.workspace_root, self._run_queued_explanation, autostart=explanation_queue_autostart
+        )
+        from .item_generation_bot import BotChats
+        from .item_generation_pipeline import GenerationWorker
+
+        # Same switch as the explanation queue: tests construct the app without background AI work.
+        self.item_generation_worker = GenerationWorker(self.config.workspace_root, autostart=explanation_queue_autostart)
+        self.item_generation_bots = BotChats(self.config.workspace_root)
+
+    def _warm_bank_cache(self) -> None:
+        # Let the first project list (the app's opening screen) finish first; running the
+        # full bank scan concurrently starves it of the GIL and disk (measured 2.8s -> 72s).
+        self._projects_listed.wait(timeout=60)
+        try:
+            list_bank_items(self.config.workspace_root, lightweight=True)
+        except Exception:  # best effort; a real request rebuilds and reports errors
+            pass
 
     def recovery_progress(self) -> dict[str, Any] | None:
         return newest_recovery_progress(self.config.recovery_root)
@@ -364,8 +398,11 @@ class StudioApplication:
         effective = self._project_provider_profile(project_id, provider_profile)
         return self.batches.transcribe_missing(project_id, profile, effective)
 
-    def transcribe_project_solutions(self, project_id: str, item_ids: list[str] | None = None) -> dict[str, Any]:
-        return self.batches.transcribe_project_solutions(project_id, item_ids)
+    def transcribe_project_solutions(
+        self, project_id: str, item_ids: list[str] | None = None, *, answer_backfill_only: bool = False
+    ) -> dict[str, Any]:
+        return self.batches.transcribe_project_solutions(
+            project_id, item_ids, answer_backfill_only=answer_backfill_only)
 
     def upload_solution_image(self, project_id: str, item_id: str, body: bytes, media_type: str, filename: str) -> dict[str, Any]:
         return stage_image(self._item_path(project_id, item_id), body, media_type, filename)
@@ -554,7 +591,12 @@ class StudioApplication:
             ),
             "openai": bool((os.environ.get("OPENAI_API_KEY") or "").strip()),
         }
-        figure_configured = configured["gemini"] or self.figure_adapter is not None
+        def figure_configured(profile: Any) -> bool:
+            if not figure_profile_available(profile):
+                return False
+            if self.figure_adapter is not None:
+                return True
+            return configured.get(FIGURE_PROFILES[profile].provider, False)
         return {
             "provider_profiles": ["full", "codex_only"],
             "profiles": {
@@ -565,14 +607,15 @@ class StudioApplication:
                 }
                 for name, config in PROVIDER_DEFAULTS.items()
             },
+            "active_figure_profile": active_figure_profile(),
             "figure_profiles": {
                 name: {
-                    "provider": "gemini",
+                    "provider": profile.provider,
                     "model": profile.model,
                     "image_size": FIGURE_IMAGE_SIZE,
                     "estimated_output_usd": profile.estimated_output_usd,
                     "pricing_as_of": FIGURE_PRICING_AS_OF,
-                    "configured": figure_configured,
+                    "configured": figure_configured(name),
                 }
                 for name, profile in FIGURE_PROFILES.items()
             },
@@ -667,9 +710,19 @@ class StudioApplication:
         }
 
     def list_projects(self) -> list[dict[str, Any]]:
+        try:
+            return self._list_projects()
+        finally:
+            self._projects_listed.set()
+
+    def _list_projects(self) -> list[dict[str, Any]]:
+        is_deleted = self.trash.deletion_snapshot()
         projects = []
         for path in sorted(self.config.workspace_root.glob("*/project.json")):
             if path.parent.name.startswith("."):
+                continue
+            if path.parent.name.startswith("project-itemgen-"):
+                # Internal storage for AI-generated items: visible only through the bank.
                 continue
             if not _is_within(path.resolve(), self.config.workspace_root):
                 continue
@@ -679,7 +732,13 @@ class StudioApplication:
                 provider_profile = self.batches.project_provider_profile(project_id)
             except (BatchError, ModelError, OSError):
                 continue
-            if self.trash.is_deleted(project_id):
+            if is_deleted(project_id):
+                continue
+            try:
+                projection = project_content_projection(
+                    path.parent, is_deleted=lambda item_id: is_deleted(project_id, item_id)
+                )
+            except (ModelError, OSError):
                 continue
             projects.append(
                 {
@@ -687,14 +746,16 @@ class StudioApplication:
                     "provider_profile": provider_profile,
                     "metadata": project.get("metadata", {}),
                     "workflow": project.get("workflow", {}),
-                    "item_count": sum(not self.trash.is_deleted(project_id, item_id) for item_id in project.get("item_order", [])),
+                    "item_count": sum(not is_deleted(project_id, item_id) for item_id in project.get("item_order", [])),
+                    **projection,
                 }
             )
         return projects
 
     def bank_items(self) -> list[dict[str, Any]]:
+        is_deleted = self.trash.deletion_snapshot()
         items = [item for item in list_bank_items(self.config.workspace_root, lightweight=True)
-                 if not self.trash.is_deleted(item["ref"]["project_id"], item["ref"]["item_id"])]
+                 if not is_deleted(item["ref"]["project_id"], item["ref"]["item_id"])]
         profiles: dict[str, str] = {}
         for item in items:
             reference = item.get("ref")
@@ -827,11 +888,12 @@ class StudioApplication:
 
     @quality_read_scope()
     def list_items(self, project_id: str) -> list[dict[str, Any]]:
+        is_deleted = self.trash.deletion_snapshot()
         project_dir, project = self._project(project_id)
         target_states = self._solution_target_states(project_id)
         summaries = []
         for item_id in project.get("item_order", []):
-            if self.trash.is_deleted(project_id, item_id):
+            if is_deleted(project_id, item_id):
                 continue
             try:
                 item_id = validate_id(item_id, field="item_id")
@@ -851,11 +913,12 @@ class StudioApplication:
                     {
                         "item_id": item_id,
                         "identity": package.get("identity", {}),
-                        "workflow": package.get("workflow", {}),
+                        "workflow": {**package.get("workflow", {}), "status": registration["workflow_status"]},
                         "review": package.get("review", {}),
                         "issue_count": len(package.get("review", {}).get("issues", [])),
                         "warning_count": registration["warning_count"],
                         "registration": registration,
+                        "content_status": stored_content_status(package),
                         "solution_link": solution,
                         "tags": package.get("tags"),
                         "figure_generation": figure_generation_summary(package),
@@ -965,6 +1028,91 @@ class StudioApplication:
         self._refresh_project_status(project_id)
         return self._item_response(project_id, item_id, saved)
 
+    def promote_project_answers(
+        self, project_id: str, *, dry_run: bool, item_ids: list[str] | None = None
+    ) -> dict[str, Any]:
+        if type(dry_run) is not bool:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "dry_run은 boolean이어야 합니다.")
+        project_dir, project = self._project(project_id)
+        order = project.get("item_order", [])
+        if item_ids is not None and (not isinstance(item_ids, list)
+                or any(not isinstance(item_id, str) for item_id in item_ids)
+                or len(set(item_ids)) != len(item_ids)):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "item_ids는 중복 없는 문자열 배열이어야 합니다.")
+        selected = order if item_ids is None else item_ids
+        deleted = {item_id for item_id in selected
+                   if item_id in order and self.trash.is_deleted(project_id, item_id)}
+        if item_ids is None:
+            selected = [item_id for item_id in selected if item_id not in deleted]
+        # Resolve the entire request before making any writes.
+        paths = {item_id: self._item_path(project_id, item_id)
+                 for item_id in selected if item_id not in deleted}
+        documents = {item_id: load_json_object(project_dir / "items" / item_id / "question.json")
+                     for item_id in order if not self.trash.is_deleted(project_id, item_id)}
+        source_owners: dict[str, set[str]] = {}
+        for item_id, document in documents.items():
+            asset_ids = {block.get("source_region", {}).get("source_asset_id")
+                         for block in (document.get("content", {}).get("explanation") or {}).get("blocks", [])}
+            for asset in document.get("resources", {}).get("assets", []):
+                if asset.get("asset_id") in asset_ids and asset.get("sha256"):
+                    source_owners.setdefault(asset["sha256"], set()).add(item_id)
+        shared_items = set().union(*(owners for owners in source_owners.values() if len(owners) > 1))
+        rows = []
+        reasons: dict[str, int] = {}
+        promoted_count = 0
+        for item_id in selected:
+            if item_id in deleted:
+                reasons["deleted"] = reasons.get("deleted", 0) + 1
+                rows.append({"item_id": item_id, "action": "skip", "reason": "deleted",
+                             "answer": None})
+                continue
+            path = paths[item_id]
+            document = documents[item_id]
+            answer, reason = promote_answer_from_explanation(document)
+            if answer is not None and item_id in shared_items:
+                answer, reason = None, "shared_explanation"
+            revision = document["workflow"]["revision"]
+            if answer is not None:
+                updated = copy.deepcopy(document)
+                updated["content"]["answer"] = answer
+                updated["review"]["answer"] = "unreviewed"
+                updated["review"].update(approved_revision=None, approved_sha256=None,
+                                         reviewer=None, reviewed_at=None)
+                updated["workflow"]["status"] = "needs_review"
+                errors = self._package_errors(path, updated)
+                if errors:
+                    # Historical incomplete packages must not block every other item.
+                    # Report their exact validation failures without repairing source data.
+                    reason = "invalid_package"
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    rows.append({"item_id": item_id, "revision": revision, "action": "skip",
+                                 "reason": reason, "answer": None, "validation_errors": errors})
+                    continue
+                # The validator checks referenced draft assets only in content_ready;
+                # this operation must also verify them before publishing an answer.
+                file_validator = PackageValidator(path, check_files=True)
+                for asset in updated.get("resources", {}).get("assets", []):
+                    if asset.get("state") == "ready":
+                        file_validator.check_file_for_asset(asset["asset_id"], asset)
+                errors.extend(file_validator.errors)
+                if errors:
+                    raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "package 검증 실패: " + errors[0])
+                if not dry_run:
+                    # Retain source blocks/coverage exactly; approval was invalidated above.
+                    saved = save_json_cas(path, updated, revision, preserve_approval=True)
+                    revision = saved["workflow"]["revision"]
+                promoted_count += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+            rows.append({"item_id": item_id, "revision": revision,
+                         "action": "promote" if answer is not None else "skip",
+                         "reason": reason, "answer": answer})
+        if not dry_run and promoted_count:
+            self._refresh_project_status(project_id)
+        return {"project_id": project_id, "dry_run": dry_run, "items": rows,
+                "summary": {"total": len(rows), "promote": promoted_count,
+                            "skip": len(rows) - promoted_count, "reasons": reasons,
+                            "deleted_skipped": len(deleted)}}
+
     def approve_item(
         self,
         project_id: str,
@@ -1032,6 +1180,106 @@ class StudioApplication:
         if warning:
             response["tagging_warning"] = warning
         return response
+
+    def write_ai_explanation(
+        self, project_id: str, item_id: str, expected_revision: Any, mode: str = "write"
+    ) -> dict[str, Any]:
+        """Write (no explanation yet) or supplement (append to the original) an explanation.
+
+        The answer is never changed and original explanation blocks are never edited.
+        If any AI flags the answer or missing figure information, nothing is saved.
+        """
+        if mode not in {"write", "supplement"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "mode는 write 또는 supplement여야 합니다.")
+        item_path = self._item_path(project_id, item_id)
+        _, project = self._project(project_id)
+        document = load_json_object(item_path)
+        current_revision = document.get("workflow", {}).get("revision")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "expected_revision은 정수여야 합니다.")
+        if current_revision != expected_revision:
+            raise RevisionConflict(expected_revision, current_revision)
+        raw_content = document.get("content")
+        content: Mapping[str, Any] = raw_content if isinstance(raw_content, Mapping) else {}
+        has_explanation = content.get("explanation") is not None
+        if mode == "write" and has_explanation:
+            raise ApiError(HTTPStatus.CONFLICT, "이미 해설이 있는 문항입니다. 보충을 사용하세요.")
+        if mode == "supplement" and not has_explanation:
+            raise ApiError(HTTPStatus.CONFLICT, "보충할 기존 해설이 없습니다.")
+        if mode == "supplement" and (document.get("provenance") or {}).get("ai_explanation"):
+            raise ApiError(HTTPStatus.CONFLICT, "이미 AI가 작성하거나 보충한 해설입니다.")
+        answer = ai_explanation.answer_text(document)
+        if not answer.strip():
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "확정 정답이 없는 문항은 AI 해설을 쓸 수 없습니다.")
+        try:
+            result = ai_explanation.write_explanation(
+                project,
+                document,
+                question_image=item_path.parent / "source" / "question.png",
+                runner=self.explanation_runner,
+                supplement=mode == "supplement",
+            )
+        except ai_explanation.ExplanationError as exc:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, str(exc)) from exc
+        summary: dict[str, Any] = {
+            "mode": mode,
+            "plan": result.plan,
+            "saved": False,
+            "sufficient": [d.writer.provider for d in result.drafts if d.verdict == "sufficient"],
+            "refusals": result.refusals,
+            "errors": [f"{d.writer.provider}: {d.error}" for d in result.drafts if d.error],
+            "judge": result.judge,
+        }
+        if result.chosen is None:
+            response = self._item_response(project_id, item_id, document)
+            response["ai_explanation"] = summary
+            return response
+        candidate = copy.deepcopy(document)
+        if mode == "write":
+            candidate["content"]["explanation"] = ai_explanation.explanation_section(
+                item_id, result.chosen.explanation
+            )
+            block_ids = [b["block_id"] for b in candidate["content"]["explanation"]["blocks"]]
+        else:
+            added = ai_explanation.supplement_blocks(item_id, result.chosen.explanation)
+            candidate["content"]["explanation"]["blocks"].extend(added)
+            block_ids = [b["block_id"] for b in added]
+        candidate.setdefault("provenance", {})["ai_explanation"] = ai_explanation.provenance_record(
+            result, answer, mode=mode, block_ids=block_ids
+        )
+        errors = self._package_errors(item_path, candidate)
+        if errors:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "AI 해설 검증 실패: " + errors[0])
+        saved = save_json_cas(item_path, candidate, expected_revision)
+        self._refresh_project_status(project_id)
+        summary.update(saved=True, provider=result.chosen.writer.provider, model=result.chosen.model)
+        response = self._item_response(project_id, item_id, saved)
+        response["ai_explanation"] = summary
+        return response
+
+    def _run_queued_explanation(self, project_id: str, item_id: str) -> dict[str, Any]:
+        """Queue worker: pick write/supplement from the item's current content, then save via CAS."""
+        self.trash.require_active(project_id, item_id)
+        document = load_json_object(self._item_path(project_id, item_id))
+        revision = document.get("workflow", {}).get("revision")
+        content = document.get("content") if isinstance(document.get("content"), Mapping) else {}
+        mode = "supplement" if content.get("explanation") is not None else "write"
+        if (document.get("provenance") or {}).get("ai_explanation"):
+            return {"state": "held", "mode": mode, "message": "이미 AI가 작성하거나 보충한 해설입니다."}
+        try:
+            response = self.write_ai_explanation(project_id, item_id, revision, mode)
+        except RevisionConflict:
+            return {"state": "failed", "mode": mode, "message": "AI 작성 중 문항이 수정되어 저장하지 않았습니다. 다시 넣어 주세요."}
+        except ApiError as exc:
+            return {"state": "failed", "mode": mode, "message": exc.message}
+        summary = response.get("ai_explanation") or {}
+        if summary.get("saved"):
+            return {"state": "saved", "mode": mode, "message": f"{summary.get('provider') or ''} {summary.get('model') or ''}".strip()}
+        if summary.get("refusals"):
+            return {"state": "held", "mode": mode, "message": "; ".join(summary["refusals"])}
+        if summary.get("sufficient"):
+            return {"state": "sufficient", "mode": mode, "message": "기존 해설로 충분하다고 판단해 저장하지 않음"}
+        return {"state": "failed", "mode": mode, "message": "; ".join(summary.get("errors") or []) or "해설을 만들지 못했습니다."}
 
     def save_item_tags(
         self,
@@ -1224,6 +1472,7 @@ class StudioApplication:
             job_path,
             expected_base_revision=expected_revision,
             use_jsonschema=False,
+            typing_only=True,
         )
         self._refresh_project_status(project_id)
         return self._item_response(project_id, item_id, applied)
@@ -1340,11 +1589,17 @@ class StudioApplication:
         profile: Any,
         remove_blue_text: Any,
     ) -> dict[str, Any]:
-        if self._project_provider_profile(project_id) == "codex_only":
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                "Codex-only projects cannot regenerate figures.",
-            )
+        if profile is None:
+            profile = active_figure_profile()
+        if (
+            isinstance(profile, str)
+            and profile in FIGURE_PROFILES
+            and FIGURE_PROFILES[profile].provider != "codex"
+            and self._project_provider_profile(project_id) == "codex_only"
+        ):
+            raise ApiError(HTTPStatus.CONFLICT, "Codex-only projects cannot regenerate figures.")
+        if isinstance(profile, str) and profile in FIGURE_PROFILES and not figure_profile_available(profile):
+            raise ApiError(HTTPStatus.CONFLICT, GEMINI_FIGURE_GENERATION_DISABLED_MESSAGE)
         item_path = self._item_path(project_id, item_id)
         if (
             isinstance(expected_revision, bool)
@@ -1353,7 +1608,7 @@ class StudioApplication:
         ):
             raise ApiError(HTTPStatus.BAD_REQUEST, "expected_revision은 양의 정수여야 합니다.")
         if not isinstance(profile, str) or profile not in FIGURE_PROFILES:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "profile은 balanced 또는 quality여야 합니다.")
+            raise ApiError(HTTPStatus.BAD_REQUEST, "profile은 codex여야 합니다(Gemini 프로필은 비활성화됨).")
         if not isinstance(remove_blue_text, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST, "remove_blue_text는 boolean이어야 합니다.")
         try:
@@ -1561,6 +1816,44 @@ class StudioApplication:
             raise ApiError(HTTPStatus.NOT_FOUND, "문항을 찾을 수 없습니다.")
         return path
 
+    def update_project_info(self, project_id: str, expected_revision: Any, values: Mapping[str, Any]) -> dict[str, Any]:
+        """Change project name/publisher/target/subject/semester with CAS protection."""
+        from .project_info import ProjectInfoError, apply_info, normalize_info
+
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "expected_revision은 양의 정수여야 합니다.")
+        try:
+            info = normalize_info(values, require_title=False)
+        except ProjectInfoError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        if not info:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "바꿀 프로젝트 정보가 없습니다.")
+        project_dir, project = self._project(project_id)
+        metadata = project.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ApiError(HTTPStatus.CONFLICT, "프로젝트 정보 형식이 올바르지 않습니다.")
+        # Subject/grade used to be guessed from the project name. Freeze the
+        # current guess before a rename so tagging/explanations keep working.
+        if "title" in info and "target" not in info and not metadata.get("subject"):
+            from .tagging import _project_context
+
+            subject, school_level, grade = _project_context(project, {})
+            metadata["subject"] = subject
+            if not metadata.get("school_level"):
+                metadata["school_level"] = school_level
+            if not metadata.get("grade") and grade is not None:
+                metadata["grade"] = str(grade)
+        apply_info(metadata, info)
+        try:
+            saved = save_json_cas(project_dir / "project.json", project, expected_revision)
+        except RevisionConflict as exc:
+            raise ApiError(HTTPStatus.CONFLICT, "다른 곳에서 프로젝트가 바뀌었습니다. 새로고침 후 다시 시도하세요.") from exc
+        return {
+            "project_id": project_id,
+            "metadata": saved.get("metadata", {}),
+            "workflow": saved.get("workflow", {}),
+        }
+
     def _refresh_project_status(self, project_id: str) -> None:
         # Project status is derived from item JSON. A racing derived-status write
         # must never turn an already committed item mutation into an HTTP failure.
@@ -1635,6 +1928,7 @@ class StudioApplication:
             "package": package,
             "revision": package.get("workflow", {}).get("revision"),
             "registration": registration,
+            "content_status": stored_content_status(package),
             "solution_link": solution,
             "figure_generation": figure_generation_summary(package),
             "warning_count": registration["warning_count"],
@@ -1718,6 +2012,11 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 if parsed.path.startswith("/api/exam/"):
                     from .exam_routes import handle_exam_api
                     handle_exam_api(self, method, parsed.path.strip("/").split("/"))
+                    return
+                if parsed.path.startswith("/api/item-generation/"):
+                    from .item_generation_routes import handle_item_generation_api
+                    query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+                    handle_item_generation_api(self, method, [unquote(p) for p in parsed.path.strip("/").split("/")], query)
                     return
                 if method == "POST" and parsed.path.rstrip("/") == "/api/uploads/pdf":
                     self._handle_api(method, parsed.path)
@@ -1993,6 +2292,20 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             )
             return
         if (
+            method == "PATCH"
+            and len(parts) == 3
+            and parts[:2] == ["api", "projects"]
+        ):
+            body = self._read_json()
+            if "expected_revision" not in body:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "expected_revision이 필요합니다.")
+            values = {key: value for key, value in body.items() if key != "expected_revision"}
+            self._send_json(
+                HTTPStatus.OK,
+                self.app.update_project_info(parts[2], body["expected_revision"], values),
+            )
+            return
+        if (
             method == "POST"
             and len(parts) == 4
             and parts[:2] == ["api", "projects"]
@@ -2054,6 +2367,34 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 expected_sha256=expected_sha,
             )
             return
+        if parts[:2] == ["api", "ai-explanation-queue"]:
+            queue = self.app.explanation_queue
+            try:
+                if method == "GET" and len(parts) == 2:
+                    self._send_json(HTTPStatus.OK, queue.snapshot())
+                    return
+                if method == "POST" and len(parts) == 2:
+                    body = self._read_json()
+                    if not ({"project_id", "item_id"} <= set(body) <= {"project_id", "item_id", "label"}):
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "대기열 요청은 project_id, item_id, label만 포함할 수 있습니다.")
+                    project_id, item_id = str(body["project_id"]), str(body["item_id"])
+                    self.app.trash.require_active(project_id, item_id)
+                    self.app._item_path(project_id, item_id)
+                    self._send_json(HTTPStatus.CREATED, {"entry": queue.enqueue(project_id, item_id, str(body.get("label") or "")), **queue.snapshot()})
+                    return
+                if method == "POST" and parts[2:] == ["clear"]:
+                    queue.clear_finished()
+                    self._send_json(HTTPStatus.OK, queue.snapshot())
+                    return
+                if method == "DELETE" and len(parts) == 3:
+                    queue.cancel(parts[2])
+                    self._send_json(HTTPStatus.OK, queue.snapshot())
+                    return
+            except QueueError as exc:
+                raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+            except KeyError as exc:
+                raise ApiError(HTTPStatus.NOT_FOUND, "대기열 항목을 찾을 수 없습니다.") from exc
+            raise ApiError(HTTPStatus.NOT_FOUND, "지원하지 않는 대기열 요청입니다.")
         if method == "GET" and parts == ["api", "batches"]:
             self._send_json(HTTPStatus.OK, {"batches": self.app.batches.list()})
             return
@@ -2080,11 +2421,22 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(HTTPStatus.ACCEPTED, job)
             return
+        if method == "POST" and len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["answers", "promote-from-explanation"]:
+            body = self._read_json()
+            if set(body) - {"dry_run", "item_ids"} or "dry_run" not in body:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "dry_run과 선택적인 item_ids만 사용하세요.")
+            self._send_json(HTTPStatus.OK, self.app.promote_project_answers(
+                parts[2], dry_run=body["dry_run"], item_ids=body.get("item_ids")))
+            return
         if method == "POST" and len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["solutions", "transcribe"]:
             body = self._read_json()
-            if set(body) - {"item_ids"}:
+            if set(body) - {"item_ids", "answer_backfill_only"}:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "해설 전사 요청에는 추가 필드를 사용할 수 없습니다.")
-            self._send_json(HTTPStatus.ACCEPTED, self.app.transcribe_project_solutions(parts[2], body.get("item_ids")))
+            answer_backfill_only = body.get("answer_backfill_only", False)
+            if type(answer_backfill_only) is not bool:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "answer_backfill_only는 boolean이어야 합니다.")
+            self._send_json(HTTPStatus.ACCEPTED, self.app.transcribe_project_solutions(
+                parts[2], body.get("item_ids"), answer_backfill_only=answer_backfill_only))
             return
         if (
             method == "POST"
@@ -2152,6 +2504,7 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             allowed = {
                 "project_name",
+                "project_info",
                 "source_path",
                 "solution_path",
                 "source_upload_id",
@@ -2174,6 +2527,9 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 )
             validate_figure_options(body)
             self._send_json(HTTPStatus.ACCEPTED, self.app.create_batch(body))
+            return
+        if method == "GET" and len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "progress":
+            self._send_json(HTTPStatus.OK, {"progress_detail": self.app.batches.progress_detail(parts[2])})
             return
         if method == "GET" and len(parts) == 3 and parts[:2] == ["api", "batches"]:
             self._send_json(HTTPStatus.OK, self.app.batches.get(parts[2]))
@@ -2370,6 +2726,21 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK,
                     self.app.auto_tag_item(parts[2], parts[4], body["expected_revision"]),
+                )
+                return
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "items" and parts[5] == "ai-explanation":
+            if method == "POST":
+                body = self._read_json()
+                if not ({"expected_revision"} <= set(body) <= {"expected_revision", "mode"}):
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "AI 해설 요청은 expected_revision과 mode만 포함할 수 있습니다.",
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.app.write_ai_explanation(
+                        parts[2], parts[4], body["expected_revision"], body.get("mode", "write")
+                    ),
                 )
                 return
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "items" and parts[5] == "tags":
@@ -2624,8 +2995,14 @@ class StudioRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status: int, payload: Mapping[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        compressed = len(data) > 262144 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+        if compressed:
+            data = gzip.compress(data, compresslevel=5)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self._security_headers(cache="no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -2715,6 +3092,7 @@ def create_server(
     tailnet_owner_login: str | None = None,
     figure_adapter: FigureGenerationAdapter | None = None,
     tagging_adapter: TaggingAdapter | None = None,
+    explanation_runner: "ai_explanation.Runner | None" = None,
     review_actor_kind: str = "human",
     feedback_sync: Callable[[FeedbackSyncRequest], None] | None = None,
     learning_root: Path | str | None = None,
@@ -2808,6 +3186,7 @@ def create_server(
         ),
         figure_adapter=figure_adapter,
         tagging_adapter=tagging_adapter,
+        explanation_runner=explanation_runner,
         feedback_sync=effective_feedback_sync,
         learning_library=learning_library,
         )

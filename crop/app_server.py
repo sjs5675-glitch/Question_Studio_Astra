@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_runtime import bootstrap, inside, validate_parsed_paths
 from process_control import OwnedProcess
+import recovery_receipt
 from astra_page_failure import parse_page_failure, page_failure_message
 
 ASTRA = bootstrap()
@@ -829,6 +830,78 @@ class JobCancelled(RuntimeError):
 
 
 class JobStore:
+    def _persist_diagnostic(self, job_id: str, detail: dict) -> None:
+        # Outside output/run_dir: neither asset route serves this directory.
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', job_id):
+            raise ValueError('invalid diagnostic owner')
+        owner = self.job_root / job_id
+        path = owner / 'internal-errors.json'
+        for entry in (self.job_root, owner, path):
+            if entry.is_symlink() or entry.is_junction():
+                raise ValueError('linked diagnostic path')
+        resolved_owner = inside(owner, 'diagnostic_owner')
+        if resolved_owner.parent != self.job_root.resolve():
+            raise ValueError('diagnostic owner mismatch')
+        owner.mkdir(parents=True, exist_ok=True)
+        events = []
+        if path.exists():
+            if path.stat().st_size > 131072:
+                raise ValueError('diagnostic history too large')
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if value.get('version') != 1 or not isinstance(value.get('events'), list):
+                raise ValueError('invalid diagnostic history')
+            events = value['events']
+        if len(events) >= 32:
+            events = events[:1] + events[-30:]
+        events.append(detail)
+        payload = json.dumps({'version': 1, 'events': events}, ensure_ascii=False)
+        if len(payload.encode('utf-8')) > 131072:
+            raise ValueError('diagnostic history too large')
+        temporary = owner / ('.diag-' + uuid.uuid4().hex[:12] + '.tmp')
+        inside(temporary, 'diagnostic_temporary')
+        try:
+            with temporary.open('x', encoding='utf-8') as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _diagnose(self, job_id, operation, exc):
+        # Deliberately exclude messages, source lines, locals, argv and raw paths.
+        if not hasattr(exc, '_astra_operation'):
+            exc._astra_operation = operation
+        operation = exc._astra_operation
+        name = Path(str(getattr(exc, 'filename', '') or '')).name
+        safe_name = name if name in {'job.json', 'job.json.tmp', 'worker.log'} else None
+        frames = []
+        tb = exc.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            filename = Path(code.co_filename).name
+            frames.append({'file': filename if filename in {'app_server.py', 'process_control.py'} else 'external',
+                           'line': tb.tb_lineno, 'function': code.co_name[:80]})
+            tb = tb.tb_next
+        detail = {'operation': operation, 'type': type(exc).__name__,
+                  'errno': getattr(exc, 'errno', None), 'winerror': getattr(exc, 'winerror', None),
+                  'filename': safe_name, 'traceback': frames[-16:]}
+        with self.lock:
+            if not hasattr(self, '_private_diagnostics'):
+                self._private_diagnostics = {}
+            history = self._private_diagnostics.setdefault(job_id, [])
+            # Keep the first failure and bounded most recent details.
+            if len(history) >= 32:
+                del history[1]
+            history.append(detail)
+            try:
+                self._persist_diagnostic(job_id, detail)
+            except Exception:
+                self._diagnostic_sink_failed = True
+
     def __init__(self, job_root: Path = JOB_ROOT, upload_root: Path = UPLOAD_ROOT) -> None:
         self.lock = threading.RLock()
         self.jobs: dict[str, dict] = {}
@@ -856,15 +929,25 @@ class JobStore:
                 continue
 
     def persist(self, record: dict) -> None:
-        write_json(self.job_root / record["id"] / "job.json", record)
+        try:
+            write_json(self.job_root / record["id"] / "job.json", record)
+        except OSError as exc:
+            self._diagnose(record['id'], 'state_write', exc)
+            raise
 
     def update(self, job_id: str, **changes: object) -> dict:
         with self.lock:
             record = self.jobs[job_id]
             if record.get("cancel_requested"):
                 return dict(record)
+            previous = dict(record)
             record.update(changes, updated_at=now())
-            self.persist(record)
+            try:
+                self.persist(record)
+            except OSError:
+                record.clear()
+                record.update(previous)
+                raise
             return dict(record)
 
     def update_solution(self, job_id: str, **changes: object) -> dict:
@@ -874,8 +957,14 @@ class JobStore:
                 return dict(record)
             solution = dict(record.get("solution") or {})
             solution.update(changes, updated_at=now())
+            previous = dict(record)
             record.update(solution=solution, updated_at=now())
-            self.persist(record)
+            try:
+                self.persist(record)
+            except OSError:
+                record.clear()
+                record.update(previous)
+                raise
             return dict(record)
 
     def create(self, payload: dict) -> dict:
@@ -941,11 +1030,30 @@ class JobStore:
         return dict(record)
 
     def resume(self, job_id: str, payload: dict) -> dict:
+        return self._resume(job_id, payload)
+
+    def recovery_resume(self, job_id: str, payload: dict) -> dict:
+        if type(payload) is not dict or payload:
+            raise recovery_receipt.RecoveryConflict('recovery request must be empty')
+        with self.lock:
+            record = self.jobs[job_id]
+            if job_id in self.processes or record.get('state') in {'queued', 'running'}:
+                raise recovery_receipt.RecoveryConflict('job already active')
+            before, intent, exit_evidence, key = recovery_receipt.load_bundle(self.job_root, job_id, inside)
+            attempts = record.get('resume_attempts') or []
+            if any(a.get('recovery_receipt_sha256') == key for a in attempts):
+                # Receipt consumed with the durable queued transition: never launch twice.
+                return dict(record)
+            recovery_receipt.validate_cancelled(self.job_root, job_id, record, before, intent, exit_evidence)
+            return self._resume(job_id, {}, recovery_key=key)
+
+    def _resume(self, job_id: str, payload: dict, *, recovery_key: str | None = None) -> dict:
         if payload:
             raise ValueError("재개 요청 본문은 빈 객체여야 합니다.")
         with self.lock:
             record = self.jobs[job_id]
-            if record.get("state") not in {"failed", "interrupted"}:
+            allowed = {'cancelled'} if recovery_key is not None else {'failed', 'interrupted'}
+            if record.get("state") not in allowed:
                 raise ValueError("실패하거나 중단된 작업만 재개할 수 있습니다.")
             if job_id in self.processes:
                 raise ValueError("작업이 이미 실행 중입니다.")
@@ -988,6 +1096,9 @@ class JobStore:
                 },
                 "log_file": record.get("log_file"),
             })
+            if recovery_key is not None:
+                attempts[-1]['recovery_receipt_sha256'] = recovery_key
+            previous = dict(record)
             record.update(
                 state="queued",
                 stage="재개 대기 중",
@@ -998,7 +1109,12 @@ class JobStore:
                 resume_attempts=attempts,
                 updated_at=now(),
             )
-            self.persist(record)
+            try:
+                self.persist(record)
+            except OSError:
+                record.clear()
+                record.update(previous)
+                raise
             queued = dict(record)
         self.executor.submit(self.run, job_id)
         return queued
@@ -1009,12 +1125,18 @@ class JobStore:
             return
         with self.lock:
             record = self.jobs[job_id]
+            started = False
+            try:
+                Path(record["log_file"]).parent.mkdir(parents=True, exist_ok=True)
+                with Path(record["log_file"]).open("a", encoding="utf-8") as stream:
+                    started = True
+                    stream.write(line + "\n")
+            except OSError as exc:
+                exc._astra_log_uncertain = started
+                self._diagnose(job_id, 'log_write', exc)
+                raise
             if not line.startswith("ASTRA_INTERNAL_DIAGNOSTIC "):
-                logs = (record.get("logs") or [])[-79:] + [line]
-                record["logs"] = logs
-            Path(record["log_file"]).parent.mkdir(parents=True, exist_ok=True)
-            with Path(record["log_file"]).open("a", encoding="utf-8") as stream:
-                stream.write(line + "\n")
+                record['logs'] = (record.get('logs') or [])[-79:] + [line]
             self.persist(record)
 
     def stage_from_line(self, job_id: str, line: str) -> None:
@@ -1024,8 +1146,9 @@ class JobStore:
             ("저비용 페이지 분류", "페이지 분류", 18),
             ("Codex 검출", "Codex 의미 분석", 35),
             ("경계 교정 패스", "경계 교정", 56),
-            ("크롭 ", "문항 이미지 크롭", 68),
+            # "VLM 크롭 검수" also contains "크롭 ", so it must be matched first.
             ("VLM 크롭 검수", "크롭 검수", 78),
+            ("크롭 ", "문항 이미지 크롭", 68),
         ]
         for token, stage, progress in rules:
             if token in line:
@@ -1068,30 +1191,84 @@ class JobStore:
         with self.lock:
             if self.jobs[job_id].get("cancel_requested"):
                 raise JobCancelled()
+            if job_id in self.processes:
+                raise ValueError("이전 실행의 종료를 아직 확인하지 못했습니다.")
             owned = OwnedProcess(command, ROOT)
             self.processes[job_id] = owned
         process = owned.process
+        exited = False
+        pending = []
+        lost = False
+        operation = 'pipe_read'
+        def flush_pending():
+            nonlocal lost
+            while pending:
+                try:
+                    self.append_log(job_id, pending[0])
+                except OSError as exc:
+                    if getattr(exc, '_astra_operation', None) == 'state_write':
+                        pending.pop(0)  # log append committed; do not duplicate it
+                        continue
+                    if getattr(exc, '_astra_operation', None) != 'log_write':
+                        raise
+                    if getattr(exc, '_astra_log_uncertain', False):
+                        lost = True  # never replay a potentially partial append
+                        pending.pop(0)
+                    break
+                else:
+                    pending.pop(0)
         try:
             assert process.stdout is not None
             for line in process.stdout:
-                self.append_log(job_id, "[해설] " + line.rstrip() if solution else line)
+                pending.append("[해설] " + line.rstrip() if solution else line)
+                if len(pending) > 80:
+                    pending.pop(0)
+                    lost = True
+                flush_pending()
                 if not solution:
-                    self.stage_from_line(job_id, line)
+                    try:
+                        self.stage_from_line(job_id, line)
+                    except OSError as exc:
+                        if getattr(exc, '_astra_operation', None) != 'state_write':
+                            raise
+                operation = 'pipe_read'
+            operation = 'process_wait'
             code = process.wait()
             # A child can close its inherited pipe and outlive the direct parent.
+            operation = 'job_query'
             while owned.active():
                 time.sleep(0.05)
+            exited = True
             with self.lock:
                 if self.jobs[job_id].get("cancel_requested"):
                     raise JobCancelled()
+                flush_pending()
+                # Child failure retains its original fail-closed path.
+                if not code:
+                    if pending or lost:
+                        exc = OSError('recording incomplete')
+                        exc._astra_operation = 'log_write'
+                        raise exc
+                    self.persist(self.jobs[job_id])
             return code
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            self._diagnose(job_id, operation, exc)
+            raise
         finally:
             with self.lock:
-                if not owned.active():
-                    self.processes.pop(job_id, None)
-                    owned.close()
-                    if process.stdout is not None:
-                        process.stdout.close()
+                # No second query that could hide the primary exception.
+                # Unknown/alive ownership always blocks resume.
+                if exited:
+                    try:
+                        owned.close()
+                        if process.stdout is not None:
+                            process.stdout.close()
+                    except Exception as exc:
+                        self._diagnose(job_id, 'close', exc)
+                    else:
+                        self.processes.pop(job_id, None)
 
     def run_command(self, job_id: str, command: list[str], stage: str, progress: int) -> int:
         self.update(job_id, state="running", stage=stage, progress=progress, message=f"{stage}을 진행하고 있습니다.")
@@ -1169,13 +1346,39 @@ class JobStore:
             self.cancel(job_id)
             return
         except Exception as exc:
+            operation = getattr(exc, '_astra_operation', None)
+            if operation in {'state_write', 'log_write', 'pipe_read', 'job_query', 'process_wait'}:
+                with self.lock:
+                    if record.get('cancel_requested'):
+                        return  # never overwrite an independently confirmed cancellation
+                    record.update(state='interrupted', stage='기록/관측 장애',
+                                  message='작업 기록 또는 실행 상태를 확인하지 못했습니다.',
+                                  error_code=('recording_failed' if operation in {'state_write', 'log_write'}
+                                              else 'observation_failed'), updated_at=now())
+                    try:
+                        self.persist(record)
+                    except OSError:
+                        pass  # private diagnostic retained; never claim durable success
+                return
             failure = self.detection_failure(job_id)
             message = page_failure_message(failure) if failure else "문항 분석에 실패했습니다. 작업 로그를 확인해 주세요."
-            self.append_log(job_id, f"ERROR: {type(exc).__name__}: {message}")
+            self._diagnose(job_id, 'pipeline', exc)
+            try:
+                self.append_log(job_id, f"ERROR: {type(exc).__name__}: {message}")
+            except OSError:
+                pass
             current = self.get(job_id)
-            self.update(job_id, state="failed", stage=("경계 교정 실패" if failure and failure["stage"] == "boundary_repair" else "실패"),
-                        message=message, progress=int(current.get("progress") or 0),
-                        error_code="crop_failed", detection_failure=failure)
+            try:
+                self.update(job_id, state="failed", stage=("경계 교정 실패" if failure and failure["stage"] == "boundary_repair" else "실패"),
+                            message=message, progress=int(current.get("progress") or 0),
+                            error_code="crop_failed", detection_failure=failure)
+            except OSError:
+                # Child failure remains failure even when its receipt cannot commit.
+                with self.lock:
+                    if not record.get('cancel_requested'):
+                        record.update(state='failed', stage='실패', error_code='crop_failed',
+                                      message=message, recording_uncommitted=True)
+                return
             if (self.get(job_id).get("solution") or {}).get("state") == "queued":
                 self.update_solution(
                     job_id,
@@ -1277,7 +1480,14 @@ class JobStore:
             self.cancel(job_id)
             return
         except Exception as exc:
-            self.append_log(job_id, f"SOLUTION ERROR: {type(exc).__name__}")
+            self._diagnose(job_id, 'solution_pipeline', exc)
+            with self.lock:
+                if self.jobs[job_id].get('cancel_requested'):
+                    return
+            try:
+                self.append_log(job_id, f"SOLUTION ERROR: {type(exc).__name__}")
+            except OSError:
+                pass
             record = self.get(job_id)
             documents = []
             for document in record.get("documents", []):
@@ -1288,17 +1498,25 @@ class JobStore:
                     if isinstance(item, dict)
                 ]
                 documents.append(clean_document)
-            self.update(job_id, documents=documents)
-            self.update_solution(
-                job_id,
-                state="failed",
-                outcome="questions_only",
-                progress=100,
-                message="해설 연결을 완료하지 못했습니다. 문제 문항은 정상 저장되었습니다.",
-                warning_code="solution_link_failed",
-                solution_data_available=False,
-                explanations_available=False,
-            )
+            # Commit one fail-closed solution state; do not let a second failed
+            # receipt leave linking/completed or available=True in memory.
+            operation = getattr(exc, '_astra_operation', '')
+            observation = operation in {'state_write', 'log_write', 'pipe_read', 'job_query', 'process_wait'}
+            with self.lock:
+                live = self.jobs[job_id]
+                if live.get('cancel_requested'):
+                    return
+                solution = dict(live.get('solution') or {})
+                solution.update(state='interrupted' if observation else 'failed',
+                                outcome='questions_only', progress=100,
+                                message='해설 연결을 완료하지 못했습니다.',
+                                warning_code='solution_observation_failed' if observation else 'solution_link_failed',
+                                solution_data_available=False, explanations_available=False, updated_at=now())
+                live.update(documents=documents, solution=solution, updated_at=now())
+                try:
+                    self.persist(live)
+                except OSError:
+                    live['recording_uncommitted'] = True
 
     def list(self) -> list[dict]:
         with self.lock:
@@ -1840,20 +2058,21 @@ class JobStore:
         )
 
     def link_solutions(self, job_id: str, payload: dict) -> dict:
-        record = self.get(job_id)
-        if record.get("state") != "completed":
-            raise ValueError("문제 crop이 완료된 작업에만 해설을 연결할 수 있습니다.")
-        current_solution = record.get("solution") or {}
-        if current_solution.get("state") in {"queued", "indexing", "linking"}:
-            raise ValueError("해설 연결이 이미 진행 중입니다.")
         solution_source = pdf_path(payload.get("source"), required=True)
         assert solution_source is not None
-        selected_crop_dpi = crop_dpi(
-            payload.get("crop_dpi") or record.get("options", {}).get("crop_dpi")
-        )
         force = bool(payload.get("force", False))
         with self.lock:
             live_record = self.jobs[job_id]
+            if live_record.get("state") != "completed":
+                raise ValueError("문제 crop이 완료된 작업에만 해설을 연결할 수 있습니다.")
+            current_solution = live_record.get("solution") or {}
+            if current_solution.get("state") in {"queued", "indexing", "linking"}:
+                raise ValueError("해설 연결이 이미 진행 중입니다.")
+            if job_id in self.processes:
+                raise ValueError("이전 실행의 종료를 아직 확인하지 못했습니다.")
+            selected_crop_dpi = crop_dpi(
+                payload.get("crop_dpi") or live_record.get("options", {}).get("crop_dpi")
+            )
             options = dict(live_record.get("options") or {})
             options.update(
                 solution_source=str(solution_source),
@@ -1861,20 +2080,20 @@ class JobStore:
             )
             live_record["options"] = options
             self.persist(live_record)
-        queued = self.update_solution(
-            job_id,
-            state="queued",
-            outcome="pending",
-            progress=0,
-            message="정답과해설 연결 작업을 준비하고 있습니다.",
-            warning_code=None,
-            solution_data_available=False,
-            explanations_available=False,
-            source=str(solution_source),
-            source_name=solution_source.name,
-            crop_dpi=selected_crop_dpi,
-            force=force,
-        )
+            queued = self.update_solution(
+                job_id,
+                state="queued",
+                outcome="pending",
+                progress=0,
+                message="정답과해설 연결 작업을 준비하고 있습니다.",
+                warning_code=None,
+                solution_data_available=False,
+                explanations_available=False,
+                source=str(solution_source),
+                source_name=solution_source.name,
+                crop_dpi=selected_crop_dpi,
+                force=force,
+            )
         self.executor.submit(
             self.run_solution_linking,
             job_id,
@@ -2440,6 +2659,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
                     raise ValueError("application/json 요청만 허용됩니다.")
                 self.send_json(self.server.store.resume(parts[2], self.read_json()), 202)
+            elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "recovery-resume":
+                if not self.headers.get('Content-Type', '').lower().startswith('application/json'):
+                    raise ValueError('application/json required')
+                try:
+                    self.send_json(self.server.store.recovery_resume(parts[2], self.read_json()), 202)
+                except recovery_receipt.RecoveryConflict as exc:
+                    self.send_json({'error': str(exc)}, 409)
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
                 self.send_json(self.server.store.cancel(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "refresh":

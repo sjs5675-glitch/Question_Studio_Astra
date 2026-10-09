@@ -481,6 +481,34 @@
         "updated_at": {
           "type": "string",
           "format": "date-time"
+        },
+        "topic_path": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "taxonomy",
+            "major",
+            "subunit",
+            "topic"
+          ],
+          "properties": {
+            "taxonomy": {
+              "type": "string",
+              "minLength": 1
+            },
+            "major": {
+              "type": "string",
+              "minLength": 1
+            },
+            "subunit": {
+              "type": "string",
+              "minLength": 1
+            },
+            "topic": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
       }
     },
@@ -1429,7 +1457,7 @@
       ],
       "properties": {
         "name": {
-          "enum": ["question_crop", "exam_region"]
+          "enum": ["question_crop", "exam_region", "item_generation"]
         },
         "pipeline_version": {
           "type": "string",
@@ -2159,7 +2187,6 @@
       "required": [
         "imported_at",
         "source_system",
-        "problem",
         "solution_links",
         "transcriptions",
         "raw_snapshot"
@@ -2175,6 +2202,9 @@
         "exam_region": {
           "$ref": "#/$defs/exam_region_provenance"
         },
+        "generation": {
+          "$ref": "#/$defs/generation_provenance"
+        },
         "problem": {
           "$ref": "#/$defs/problem_provenance"
         },
@@ -2188,6 +2218,22 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/transcription_attempt"
+          }
+        },
+        "ai_explanation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["plan", "provider", "model", "candidates", "answer_sha256", "created_at"],
+          "properties": {
+            "mode": {"enum": ["write", "supplement"]},
+            "block_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+            "plan": {"type": "string", "minLength": 1},
+            "provider": {"enum": ["codex", "claude"]},
+            "model": {"type": "string", "minLength": 1},
+            "candidates": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["provider", "model", "verdict"], "properties": {"provider": {"enum": ["codex", "claude"]}, "model": {"type": "string"}, "verdict": {"enum": ["ok", "answer_suspect", "insufficient", "error"]}}}},
+            "judge": {"oneOf": [{"type": "null"}, {"type": "object", "additionalProperties": false, "properties": {"model": {"type": ["string", "null"]}, "choice": {"type": ["string", "null"]}, "reason": {"type": "string"}}}]},
+            "answer_sha256": {"$ref": "#/$defs/sha256"},
+            "created_at": {"type": "string", "format": "date-time"}
           }
         },
         "last_auto_applied_hash": {
@@ -2264,8 +2310,99 @@
         {"if": {"properties": {"source_system": {"properties": {"name": {"const": "exam_region"}}}}},
          "then": {"required": ["exam_region"], "properties": {"raw_snapshot": {"type": "null"}}}},
         {"if": {"properties": {"source_system": {"properties": {"name": {"const": "question_crop"}}}}},
-         "then": {"properties": {"raw_snapshot": {"$ref": "#/$defs/raw_snapshot"}}}}
+         "then": {"properties": {"raw_snapshot": {"$ref": "#/$defs/raw_snapshot"}}}},
+        {"if": {"properties": {"source_system": {"properties": {"name": {"const": "item_generation"}}}}},
+         "then": {"required": ["generation"], "not": {"required": ["problem"]},
+                  "properties": {"raw_snapshot": {"type": "null"}}},
+         "else": {"required": ["problem"], "not": {"required": ["generation"]}}}
       ]
+    },
+    "generation_provenance": {
+      "description": "AI가 학습 데이터로 만든 문항. 원본 PDF·크롭이 없으므로 problem 대신 생성·검증 근거를 기록한다.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "route", "source_item", "reference_item_ids", "topic", "scope_file", "scope_concepts",
+                   "design_intent", "generator", "figure", "verification", "auto_checks", "confirmed_at"],
+      "properties": {
+        "kind": {"enum": ["variant", "new"]},
+        "route": {"enum": ["quick", "bot"]},
+        "job_id": {"type": "string", "minLength": 1},
+        "draft_no": {"type": "integer", "minimum": 1},
+        "variant_type": {"type": "array", "items": {"type": "string"}},
+        "source_item": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "object", "additionalProperties": false,
+             "required": ["project_id", "item_id", "printed_number", "content_hash"],
+             "properties": {
+               "project_id": {"$ref": "#/$defs/id"},
+               "item_id": {"$ref": "#/$defs/id"},
+               "printed_number": {"type": ["string", "null"]},
+               "content_hash": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+             }}
+          ]
+        },
+        "reference_item_ids": {"type": "array", "items": {"type": "string"}},
+        "topic": {
+          "type": "object", "additionalProperties": false,
+          "required": ["subject", "major", "middle"],
+          "properties": {
+            "subject": {"type": "string", "minLength": 1},
+            "major": {"type": "string", "minLength": 1},
+            "middle": {"type": "string", "minLength": 1},
+            "detail": {"type": ["string", "null"]}
+          }
+        },
+        "scope_file": {"type": "string", "minLength": 1},
+        "scope_concepts": {"type": "array", "items": {"type": "string"}},
+        "concepts": {"type": "array", "items": {"type": "string"}},
+        "difficulty": {"type": ["string", "null"]},
+        "format": {"type": ["string", "null"]},
+        "design_intent": {"type": "object"},
+        "distractor_intents": {"type": "object"},
+        "unique_answer_rationale": {"type": ["string", "null"]},
+        "generator": {
+          "type": "object", "additionalProperties": false,
+          "required": ["model", "effort", "created_at", "guide_sha256", "request"],
+          "properties": {
+            "model": {"type": "string", "minLength": 1},
+            "effort": {"type": ["string", "null"]},
+            "created_at": {"type": "string", "format": "date-time"},
+            "guide_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+            "request": {"type": "object"},
+            "bot_session_id": {"type": ["string", "null"]}
+          }
+        },
+        "figure": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "object", "additionalProperties": false,
+             "required": ["method", "spec", "check"],
+             "properties": {
+               "method": {"enum": ["code", "codex_image"]},
+               "spec": {"type": "object"},
+               "check": {"type": "object"},
+               "asset_id": {"$ref": "#/$defs/id"},
+               "sha256": {"$ref": "#/$defs/sha256"}
+             }}
+          ]
+        },
+        "verification": {
+          "type": "object", "required": ["status", "model", "effort", "at"],
+          "properties": {
+            "status": {"enum": ["verified", "answer_conflict", "item_issue", "needs_review", "not_solved", "error", "pending"]},
+            "model": {"type": ["string", "null"]},
+            "effort": {"type": ["string", "null"]},
+            "at": {"type": ["string", "null"]},
+            "verifier_answer": {"type": ["string", "null"]},
+            "verifier_reasoning": {"type": ["string", "null"]},
+            "verifier_issue": {"type": ["string", "null"]},
+            "verifier_bogi": {"type": ["object", "null"]}
+          }
+        },
+        "auto_checks": {"type": "object"},
+        "confirmed_at": {"type": "string", "format": "date-time"}
+      }
     },
     "exam_region_provenance": {
       "type": "object",
@@ -2550,6 +2687,7 @@
             "source_page",
             "figure_original",
             "figure_regenerated",
+            "figure_generated",
             "table_snapshot",
             "reference"
           ]

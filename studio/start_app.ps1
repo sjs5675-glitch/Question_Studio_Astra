@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [switch]$Preflight,
     [switch]$NoBrowser,
@@ -113,7 +113,7 @@ if (Test-Path -LiteralPath $leasePath) {
     $quotedArguments = @($arguments | ForEach-Object { '"' + $_.Replace('"', '\"') + '"' })
     $child = Start-Process -FilePath $python -ArgumentList $quotedArguments -WorkingDirectory $astraRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $owner 'launcher.stdout.log') -RedirectStandardError (Join-Path $owner 'launcher.stderr.log')
 }
-$deadline = [DateTime]::UtcNow.AddSeconds(30)
+$deadline = [DateTime]::UtcNow.AddSeconds(90)
 while ([DateTime]::UtcNow -lt $deadline) {
     if ($child -and $child.HasExited) { throw 'Astra exited before readiness; inspect its local launcher log.' }
     if ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath $accessPath)) {

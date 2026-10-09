@@ -1,8 +1,8 @@
 """Provider-free Phase 3 snapshot and fixed-edge planning primitives.
 
-The module deliberately knows nothing about the runtime, server, or provider
-clients.  It persists the exact normalized inputs needed for replay and plans
-role-local monotonic changes from those inputs only.
+The planner has no server or provider calls. File-bound REVIEW input validation
+reuses the runtime's existing local-input validator, never its execution hooks.
+It persists exact normalized inputs and plans role-local monotonic changes only.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -893,6 +894,47 @@ def _validate_scope_binding(
         or inventory_sha != provenance["input_inventory_sha256"]
     ):
         raise SnapshotError("scope_contract does not match the source-bound index")
+    reviewed = provenance.get("reviewed_episode_context")
+    if reviewed is None and os.path.lexists(run_dir / "solutions/reviewed_episode_context.json"):
+        raise SnapshotError("scope snapshot predates the reviewed episode context input")
+    if reviewed is not None:
+        # Reject reparse components before resolving/hashing a REVIEW reference.
+        references = [(reviewed["relative_path"], reviewed["sha256"])] + [
+            ("solutions/" + proof["path"], proof["sha256"])
+            for proof in reviewed["proof_files"]
+        ]
+        try:
+            for relative, expected_sha in references:
+                candidate = run_dir.absolute() / relative
+                for component in (candidate, *candidate.parents):
+                    info = component.lstat()
+                    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                        raise SnapshotError("reviewed scope symlink or reparse point forbidden")
+                _resolve_bound_file(run_dir, relative, expected_sha)
+            # Source episodes are rebuilt from the validated, original consensus,
+            # not the already overridden alignment or an invented proof payload.
+            from solution_runtime import SolutionRuntimeAdapter
+
+            current_index = solution_scope.build_scope_index(
+                run_dir / "solutions", provider_profile=provenance.get("provider_profile", "full")
+            )
+            _, current_reviewed = SolutionRuntimeAdapter._reviewed_episode_context(
+                run_dir / "solutions", current_index,
+                snapshot["problem_source_sha256"], snapshot["solution_source_sha256"]
+            )
+            if current_reviewed != reviewed:
+                raise SnapshotError("reviewed episode context provenance changed")
+            # Keep the snapshot binding valid across the runtime's local reads.
+            for relative, expected_sha in references:
+                _resolve_bound_file(run_dir, relative, expected_sha)
+            solution_scope.read_scope_index(
+                _resolve_bound_file(run_dir, index["relative_path"], index["sha256"]),
+                expected_solution_sha256=snapshot["solution_source_sha256"],
+                expected_provider_profile=provenance.get("provider_profile", "full"),
+                solutions_dir=run_dir / "solutions",
+            )
+        except (OSError, ValueError, sl.StageHookError) as exc:
+            raise SnapshotError(f"reviewed episode context file binding failed: {exc}") from exc
 
 
 def validate_alignment_snapshot(

@@ -1096,6 +1096,18 @@ class _Renderer:
             raise HwpxRenderError(f"{path}.original_asset_id does not identify a local asset")
         selected = assets[asset_id]
         original = assets[original_id]
+        if selected.get("role") == "figure_generated" or original.get("role") == "figure_generated":
+            if asset_id != original_id or selected.get("section") not in {self.kind, "shared"}:
+                raise HwpxRenderError(f"{path} generated figure must reference itself in its section")
+            if selected.get("state") != "ready":
+                raise HwpxRenderError(f"{path} generated figure is not ready")
+            return self._embed_png_asset(
+                item,
+                selected,
+                path,
+                available_width=available_width,
+                available_height=available_height,
+            )
         if original.get("role") != "figure_original":
             raise HwpxRenderError(f"{path}.original_asset_id is not a figure original")
         original_region = original.get("source_region")

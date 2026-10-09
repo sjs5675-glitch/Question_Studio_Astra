@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .equation_bridge import normalize_equations
+from .content_status import content_status_counts, stored_content_status
 
 from astra_runtime import inside
 from astra_cli.quality_manifest import stored_reason
@@ -164,6 +165,7 @@ def save_json_cas(
     expected_revision: int,
     *,
     preserve_approval: bool = False,
+    preserve_content: bool = False,
 ) -> dict[str, Any]:
     """Atomically save a project/item when its revision still matches.
 
@@ -188,6 +190,13 @@ def save_json_cas(
             raise RevisionConflict(expected_revision, current_revision)
 
         candidate = copy.deepcopy(dict(document))
+        if preserve_content and (
+            current_document is None
+            or ("content" in candidate) != ("content" in current_document)
+            or json.dumps(candidate.get("content"), sort_keys=True, ensure_ascii=False)
+            != json.dumps(current_document.get("content"), sort_keys=True, ensure_ascii=False)
+        ):
+            raise ModelError("preserve_content requires unchanged stored content")
         workflow = candidate.get("workflow")
         if not isinstance(workflow, dict):
             raise ModelError("document.workflow must be an object")
@@ -225,8 +234,10 @@ def save_json_cas(
             )
             if has_transcribed_content or workflow.get("status") != "source_only":
                 workflow["status"] = "needs_review"
-        if not preserve_approval:
+        if not preserve_approval and not preserve_content:
             normalize_equations(candidate.get("content"))
+        if "item_id" in candidate:
+            workflow["status"] = registration_summary(candidate)["workflow_status"]
         atomic_write_json(path, candidate)
         return candidate
 
@@ -322,6 +333,22 @@ def registration_summary(
     question = content.get("question") if isinstance(content, Mapping) else None
     blocks = question.get("blocks") if isinstance(question, Mapping) else None
     has_structured_question = isinstance(blocks, list) and bool(blocks)
+    answer = content.get("answer") if isinstance(content, Mapping) else None
+    answer_field = {"choice": "choice_ids", "content": "blocks", "true_false": "items"}.get(
+        str(answer.get("kind")) if isinstance(answer, Mapping) else ""
+    )
+    answer_values = answer.get(answer_field) if isinstance(answer, Mapping) and answer_field else None
+    answer_present = isinstance(answer_values, list) and bool(answer_values)
+    # Input completion is independent of optional explanation and approval evidence.
+    completion_status = (
+        "error" if workflow_status == "error"
+        else "complete" if has_structured_question and answer_present
+        else "incomplete"
+    )
+
+    # Completion is a saved-input state, not a human-review approval.
+    if completion_status == "complete" and workflow_status not in {"content_ready", "export_ready"}:
+        workflow_status = "transcribed"
 
     resources = document.get("resources")
     assets = resources.get("assets") if isinstance(resources, Mapping) else None
@@ -353,6 +380,8 @@ def registration_summary(
             else "unavailable"
         ),
         "source_fallback_available": source_fallback_available,
+        "answer_present": answer_present,
+        "completion_status": completion_status,
         "warning_count": warning_count,
         "workflow_status": workflow_status,
     }
@@ -483,9 +512,11 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
         link_state = "unverified"
     else:
         link_state = "no_candidate"
-    if any(link.get("source_asset_id") == selected_id and "pair_mismatch_rejected" in (link.get("review_reasons") or [])
-           for link in detailed):
-        selected_id = selected_sha = None
+    rejected_selected_source = any(
+        link.get("source_asset_id") == selected_id
+        and "pair_mismatch_rejected" in (link.get("review_reasons") or [])
+        for link in detailed
+    )
     attempts_for_source = provenance.get("transcriptions", []) if isinstance(provenance, Mapping) else []
     current_transcription = any(
         isinstance(attempt, Mapping)
@@ -496,6 +527,12 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
         and (not isinstance(selection, Mapping) or attempt.get("selection_revision") == selection.get("revision"))
         for attempt in attempts_for_source if isinstance(attempts_for_source, list)
     )
+    # A saved recognition of the explicitly selected image is typed, even
+    # when pair quality still needs correction. Never count stale/unselected
+    # receipts or promote the link's review/approval status.
+    if rejected_selected_source and not (isinstance(selection, Mapping) and current_transcription):
+        selected_id = selected_sha = None
+        current_transcription = False
     source_present = bool(selected_id and selected_sha)
     current_attempts = [attempt for attempt in attempts_for_source
                         if isinstance(attempt, Mapping) and attempt.get("section") == "explanation"
@@ -511,7 +548,7 @@ def solution_link_summary(document: Mapping[str, Any], *, item_root: Path | None
     answer_only_transcribed = bool(
         has_answer and not explanation_blocks and current_transcription
         and source_present and source_integrity == "ready"
-        and link_state not in {"mismatch", "conflict"}
+        and (link_state not in {"mismatch", "conflict"} or isinstance(selection, Mapping))
     )
     transcribed = bool(
         (isinstance(explanation_blocks, list) and explanation_blocks and current_transcription)
@@ -1455,6 +1492,10 @@ def approve_question_cas(
         selected_id = block.get("asset_id")
         original = assets_by_id.get(original_id) if isinstance(original_id, str) else None
         selected = assets_by_id.get(selected_id) if isinstance(selected_id, str) else None
+        if original is not None and original.get("role") == "figure_generated":
+            if selected_id != original_id or original.get("section") not in {section, "shared"} or original.get("state") != "ready":
+                raise ModelError(f"cannot approve invalid generated figure asset {original_id}")
+            continue
         if original is None or original.get("role") not in {"figure_original", "table_snapshot"}:
             raise ModelError("figure block original_asset_id must identify a figure_original or table_snapshot asset")
         if original.get("section") not in {section, "shared"} or original.get("state") != "ready":

@@ -22,6 +22,7 @@ from .model import (
     figure_generation_summary,
     load_json_object,
     registration_summary,
+    stored_content_status,
     solution_link_summary,
     utc_now,
     validate_id,
@@ -40,6 +41,7 @@ _FILTERS = frozenset(
         "problem_type",
         "has_figure",
         "has_graph",
+        "origin",
     }
 )
 _SUBQUESTION_NUMBER = re.compile(
@@ -66,6 +68,9 @@ _LOCKS: dict[Path, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 _BANK_CACHE_LOCK = threading.Lock()
 _BANK_CACHE: tuple[Path, tuple[tuple[str, int, int, int], ...], list[dict[str, Any]]] | None = None
+# Per-item lightweight summaries keyed by file path; reused while the item and its
+# project.json are byte-identical (inode, mtime_ns, size). Only changed items are rebuilt.
+_BANK_ITEM_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
 
 
 def _lock_for(path: Path) -> threading.Lock:
@@ -229,6 +234,39 @@ def _preview(section: Any, *, limit: int | None = 420) -> str:
     return result if limit is None else result[:limit]
 
 
+def _reading_preview(section: Any, assets: list[Any], *, limit: int = 900) -> list[dict[str, Any]]:
+    """Ordered typed text and figure references for bank cards (display only)."""
+
+    ready = {
+        asset["asset_id"]: asset
+        for asset in assets
+        if isinstance(asset, Mapping) and isinstance(asset.get("asset_id"), str) and asset.get("state") == "ready"
+    }
+    segments: list[dict[str, Any]] = []
+    used = 0
+    for node in _walk(section):
+        kind = node.get("type")
+        if kind == "paragraph" and used < limit:
+            text = "".join(
+                "\n" if inline.get("type") == "line_break"
+                else str(inline.get("text") or inline.get("source_text") or inline.get("plain_text") or inline.get("latex") or "")
+                for inline in (node.get("inlines") or []) if isinstance(inline, Mapping)
+            ).strip()
+            if text:
+                text = text[: limit - used]
+                used += len(text)
+                segments.append({"type": "text", "text": text, "role": node.get("role")})
+        elif kind == "figure":
+            chosen = node.get("asset_id")  # same asset the item reader shows
+            if isinstance(chosen, str) and chosen in ready:
+                asset = ready[chosen]
+                segments.append({
+                    "type": "figure", "asset_id": chosen,
+                    "width_px": asset.get("width_px"), "height_px": asset.get("height_px"),
+                })
+    return segments if any(segment["type"] == "text" for segment in segments) else []
+
+
 def _normalised_question_text(section: Any) -> str:
     """Return stable OCR content for fingerprints and conservative duplicate hints."""
 
@@ -300,6 +338,12 @@ def _dependency_seed(
     }
 
 
+def _generation_summary(package: Mapping[str, Any]) -> dict[str, Any] | None:
+    from .item_generation import generation_summary
+
+    return generation_summary(package)
+
+
 def _source_summary(project: Mapping[str, Any], package: Mapping[str, Any]) -> dict[str, Any]:
     metadata = project.get("metadata") if isinstance(project.get("metadata"), Mapping) else {}
     provenance = package.get("provenance")
@@ -340,17 +384,20 @@ def _bank_summary(
         "revision": revision,
         "updated_at": workflow.get("updated_at") if isinstance(workflow.get("updated_at"), str) else None,
         "identity": copy.deepcopy(dict(identity)),
+        "content_status": stored_content_status(package),
         "dependency": _dependency_seed(project_id, project, item_id, package),
         "content_fingerprint_sha256": hashlib.sha256(duplicate_text.encode("utf-8")).hexdigest(),
         "duplicate_warning": None,
         "duplicate_similarity_status": "not_checked" if lightweight else "checked",
         "_duplicate_text": duplicate_text,
         "tags": copy.deepcopy(package.get("tags")),
+        "generation": _generation_summary(package),
         "figure_generation": figure_generation_summary(package),
         "source": _source_summary(project, package),
         "preview": {
             "printed_number": identity.get("printed_number"),
             "text": _preview(question),
+            "reading": _reading_preview(question, assets),
             "images": [
                 {
                     "asset_id": asset["asset_id"],
@@ -366,11 +413,16 @@ def _bank_summary(
             ],
         },
         "status": {
-            "workflow": workflow.get("status", "unknown"),
+            "workflow": registration["workflow_status"],
             "registration": registration["status"],
             "usable": registration["usable"],
-            "answer_saved": content.get("answer") is not None,
+            "answer_saved": registration["answer_present"],
+            "completion_status": registration["completion_status"],
             "explanation_saved": content.get("explanation") is not None,
+            "ai_explanation": bool(
+                isinstance(package.get("provenance"), Mapping)
+                and package["provenance"].get("ai_explanation")
+            ),
             "review_issue_count": len(review.get("issues", []))
             if isinstance(review.get("issues"), list)
             else 0,
@@ -477,6 +529,9 @@ def list_bank_items(workspace_root: Path | str, *, lightweight: bool = False, in
                 return copy.deepcopy(_BANK_CACHE[2])
     summaries: list[dict[str, Any]] = []
     trash = Trash(workspace)
+    is_deleted = trash.deletion_snapshot()
+    item_cache = _BANK_ITEM_CACHE if lightweight else {}
+    seen_keys: set[str] = set()
     for project_path in sorted(workspace.glob("project-*/project.json")):
         project_path = project_path.resolve()
         if not _is_within(project_path, workspace):
@@ -484,9 +539,11 @@ def list_bank_items(workspace_root: Path | str, *, lightweight: bool = False, in
         try:
             project = load_json_object(project_path)
             project_id = validate_id(project.get("project_id"), field="project_id")
+            project_stat = project_path.stat()
         except (ModelError, OSError):
             continue
-        if not include_deleted and trash.is_deleted(project_id):
+        project_key = (project_stat.st_ino, project_stat.st_mtime_ns, project_stat.st_size)
+        if not include_deleted and is_deleted(project_id):
             continue
         project_dir = project_path.parent
         if project_id != project_dir.name:
@@ -512,15 +569,29 @@ def list_bank_items(workspace_root: Path | str, *, lightweight: bool = False, in
                 ordered.append(item_id)
         ordered.extend(sorted(set(paths) - set(ordered)))
         for item_id in ordered:
-            if not include_deleted and trash.is_deleted(project_id, item_id):
+            if not include_deleted and is_deleted(project_id, item_id):
                 continue
             try:
-                package = load_json_object(paths[item_id])
-                if package.get("item_id") != item_id:
-                    continue
-                summaries.append(_bank_summary(project_id, project, item_id, package, item_root=paths[item_id].parent, lightweight=lightweight))
+                item_stat = paths[item_id].stat()
+                cache_key = str(paths[item_id])
+                stamp = (project_key, item_stat.st_ino, item_stat.st_mtime_ns, item_stat.st_size)
+                cached = item_cache.get(cache_key)
+                if cached is not None and cached[0] == stamp:
+                    summary = copy.deepcopy(cached[1])
+                else:
+                    package = load_json_object(paths[item_id])
+                    if package.get("item_id") != item_id:
+                        continue
+                    summary = _bank_summary(project_id, project, item_id, package, item_root=paths[item_id].parent, lightweight=lightweight)
+                    if lightweight:
+                        item_cache[cache_key] = (stamp, copy.deepcopy(summary))
+                seen_keys.add(str(paths[item_id]))
+                summaries.append(summary)
             except (ModelError, OSError):
                 continue
+    if lightweight:
+        for stale in set(item_cache) - seen_keys:
+            item_cache.pop(stale, None)
     _postprocess_bank_summaries(summaries, lightweight=lightweight)
     if signature is not None and signature == _bank_signature(workspace):
         with _BANK_CACHE_LOCK:
@@ -547,6 +618,8 @@ def search_bank_items(
     for boolean_filter in ("has_figure", "has_graph"):
         if boolean_filter in filters and not isinstance(filters[boolean_filter], bool):
             raise QuestionBankError(f"{boolean_filter} must be a boolean")
+    if "origin" in filters and filters["origin"] not in {"source", "variant", "new", "generated"}:
+        raise QuestionBankError("origin must be source, variant, new or generated")
     terms = query.casefold().split()
     matches: list[dict[str, Any]] = []
     for summary in list_bank_items(workspace_root, lightweight=True):
@@ -571,6 +644,12 @@ def search_bank_items(
             continue
         if any(features.get(key) is not filters[key] for key in ("has_figure", "has_graph") if key in filters):
             continue
+        if "origin" in filters:
+            kind = (summary.get("generation") or {}).get("kind")
+            origin = filters["origin"]
+            if (origin == "source" and kind) or (origin == "generated" and not kind) or (
+                    origin in {"variant", "new"} and kind != origin):
+                continue
         matches.append(summary)
     return matches
 

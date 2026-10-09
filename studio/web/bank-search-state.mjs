@@ -1,6 +1,6 @@
 const PAGE_SIZES = new Set([20, 50, 100]);
 const INTERNAL_CODE = /AS1-[a-f\d]{64}/i;
-const FILTER_CATEGORIES = new Set(["subject", "unit", "source", "difficulty", "problemTypes", "keywords", "features", "figureStatus"]);
+const FILTER_CATEGORIES = new Set(["subject", "unit", "source", "difficulty", "problemTypes", "keywords", "features", "figureStatus", "origin"]);
 
 export function createBankSearchState(value = {}) {
   const tabs = Array.isArray(value.tabs)

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from astra_cli import quality
 from astra_cli.quality_manifest import decision_body, decision_reason
+from astra_cli.quality_reads import quality_read_scope
 from astra_cli.contracts import JsonMap
 from printed_identifiers import normalize_parent_number
 from solution_scope import SCOPE_INDEX_VERSION as SCOPE_INDEX_CONTRACT_VERSION
@@ -253,6 +254,43 @@ def normalize_subquestion_label(value: str | None) -> str | None:
     return str(int(text)) if text.isdigit() else text
 
 
+def split_printed_number(
+    value: str, unit_kind: str | None = None,
+    subquestion_label: str | None = None,
+) -> tuple[str, str | None]:
+    """Split an explicit child delimiter before NFKC can erase its boundary.
+
+    Bare decimal suffixes are never children. Standalone enclosed numbers
+    remain parent identifiers; only an enclosed numeric suffix after a decimal
+    parent is unambiguous. Conflicting explicit labels fail closed.
+    """
+    raw = str(value).strip()
+    explicit = normalize_subquestion_label(subquestion_label)
+    suffix = raw[-1:] if raw else ''
+    numeric = unicodedata.numeric(suffix, None) if suffix else None
+    enclosed = 'CIRCLED' in unicodedata.name(suffix, '') if suffix else False
+    parent_text = raw[:-1].strip()
+    extracted = None
+    if enclosed and numeric is not None and numeric.is_integer() and parent_text:
+        if all(c.isdecimal() for c in parent_text):
+            raw = parent_text
+            extracted = str(int(numeric))
+        elif parent_text[0].isdecimal():
+            raise ValueError('ambiguous printed child suffix')
+    text = unicodedata.normalize('NFKC', raw).strip()
+    if extracted is None and (unit_kind == 'subquestion' or explicit is not None):
+        bracket_text = raw.translate(str.maketrans('（）［］', '()[]'))
+        match = re.fullmatch(r'(.*?)\s*(?:\(([^()]+)\)|\[([^\[\]]+)\])', bracket_text)
+        if match and match.group(1).strip():
+            if any('CIRCLED' in unicodedata.name(c, '') for c in match.group(1)):
+                raise ValueError('ambiguous printed child suffix')
+            text = match.group(1)
+            extracted = normalize_subquestion_label(match.group(2) or match.group(3))
+    if extracted is not None and explicit is not None and extracted != explicit:
+        raise ValueError('conflicting printed and explicit child labels')
+    return normalize_parent_number(text), extracted if extracted is not None else explicit
+
+
 @dataclass(frozen=True)
 class NumberingScope:
     book_id: str
@@ -309,8 +347,9 @@ def assign_numbering_scopes(
     result: list[ScopedNumberedItem] = []
     for item in ordered:
         path = tuple(part.strip() for part in item.section_path if part.strip())
-        parent = normalize_parent_number(item.printed_number)
-        sublabel = normalize_subquestion_label(item.subquestion_label)
+        parent, sublabel = split_printed_number(
+            item.printed_number, subquestion_label=item.subquestion_label
+        )
         reset = current_scope is None or current_scope.section_path != path
         if previous is not None and not reset:
             previous_item, previous_parent, previous_sub = previous
@@ -1575,7 +1614,17 @@ def _explicit_answers_conflict(
     )
 
 
-def align_solution_assets(
+def align_solution_assets(*args: Any, **kwargs: Any) -> tuple[LinkDecision, ...]:
+    """Reuse unchanged receipt file reads within one alignment call.
+
+    The DP scores each candidate pair several times; without this scope every score re-hashed the
+    full problem/solution PDFs. quality_read_scope still re-hashes any file whose stat stamp changes.
+    """
+    with quality_read_scope():
+        return _align_solution_assets(*args, **kwargs)
+
+
+def _align_solution_assets(
     problems: Sequence[ProblemItem],
     assets: Sequence[SolutionAsset],
     verifications: Mapping[tuple[str, str], PairVerification] | None = None,
@@ -1585,6 +1634,7 @@ def align_solution_assets(
     min_runner_up_margin: float = 0.15,
     scope_alignment: "ScopeAlignmentLike | None" = None,
     episode_assets: Mapping[str, tuple[SolutionAsset, ...]] | None = None,
+    parent_review_authority: ParentReviewAuthority | None = None,
     admitted_pairs: frozenset[PairKey] = frozenset(),
     problem_source_sha256: str | None = None,
     solution_source_sha256: str | None = None,
@@ -2097,13 +2147,19 @@ def align_solution_assets(
                 )
             )
     if scope_alignment is not None and episode_assets is not None:
-        return augment_decisions_with_episode_candidates(
+        supplemented = augment_decisions_with_episode_candidates(
             tuple(decisions), problems, scope_alignment, episode_assets
         )
+        return augment_decisions_with_episode_candidates(
+            supplemented, problems, scope_alignment, episode_assets,
+            parent_review_authority=parent_review_authority,
+            problem_source_sha256=problem_source_sha256,
+            solution_source_sha256=solution_source_sha256)
     return tuple(decisions)
 
 
 _EPISODE_BLOCKER_MARKERS = (
+    "scope_fragment_review",
     "scope_alignment_ambiguous",
     "scope_alignment_untrusted",
     "scope_alignment_unresolved",
@@ -2200,11 +2256,65 @@ def scope_candidate_pairs(
     )
 
 
+@dataclass(frozen=True)
+class ParentReviewAuthority:
+    """Exact source-bound native and problem signatures, not number ownership."""
+
+    problem_source_sha256: str
+    solution_source_sha256: str
+    native_index_sha256: str
+    problem_signatures: tuple[tuple[str, str], ...]
+    native_signatures: tuple[tuple[str, str, str], ...]
+
+
+def bind_parent_review_authority(
+    problems: Sequence[ProblemItem],
+    episode_assets: Mapping[str, tuple[SolutionAsset, ...]],
+    native_index: Mapping[str, Any],
+    *, problem_source_sha256: str, solution_source_sha256: str,
+) -> ParentReviewAuthority:
+    """Bind faithful native conversions; caller verifies index input/PDF SHA."""
+    if (any(re.fullmatch(r'[0-9a-f]{64}', value) is None for value in
+            (problem_source_sha256, solution_source_sha256))
+            or native_index.get('source', {}).get('solution_sha256') != solution_source_sha256):
+        raise ValueError('parent review source binding mismatch')
+    natives = native_index.get('native_assets', ())
+    native_by_id = {n['native_asset_id']: n for n in natives}
+    if len(native_by_id) != len(natives) or len({p.item_id for p in problems}) != len(problems):
+        raise ValueError('parent review authority identities must be unique')
+    numbers_by_episode = {e['episode_id']: {normalize_parent_number(n) for n in e['entry_numbers']}
+                          for e in native_index.get('episodes', ())}
+    signatures = []
+    for episode_id, assets in episode_assets.items():
+        for asset in assets:
+            native = native_by_id.get(asset.asset_id)
+            if (native is None or native['solution_scope_id'] != episode_id
+                    or native.get('parent_number') is None
+                    or asset.parent_number not in numbers_by_episode.get(episode_id, ())):
+                continue
+            expected = SolutionAsset(
+                native['native_asset_id'], SolutionRole(native['role']), native['sequence'],
+                f'episode:{episode_id}', native['parent_number'], native['subquestion_label'],
+                tuple(SolutionPart(PageIdentity(p['pdf_index'], p['pdf_page'], p['printed_page'],
+                                               p['segment_id']), tuple(p['bbox'])) for p in native['parts']),
+                tuple(native['fingerprints']), native['explicit_answer'], native['confidence'],
+                source_document='solution', review_reason=(
+                    'continuation_unresolved' if native.get('continuation_unresolved') else None))
+            if asset.signature() == expected.signature():
+                signatures.append((episode_id, asset.asset_id, quality.identity(expected.signature())))
+    return ParentReviewAuthority(
+        problem_source_sha256, solution_source_sha256, quality.identity(dict(native_index)),
+        tuple((p.item_id, quality.identity(p.signature())) for p in problems), tuple(signatures))
+
+
 def augment_decisions_with_episode_candidates(
     decisions: tuple[LinkDecision, ...],
     problems: Sequence[ProblemItem],
     scope_alignment: ScopeAlignmentLike,
     episode_assets: Mapping[str, tuple[SolutionAsset, ...]],
+    *, parent_review_authority: ParentReviewAuthority | None = None,
+    problem_source_sha256: str | None = None,
+    solution_source_sha256: str | None = None,
 ) -> tuple[LinkDecision, ...]:
     """Supplement empty-candidate REVIEW/UNMATCHED decisions with episode
     candidates.
@@ -2217,12 +2327,22 @@ def augment_decisions_with_episode_candidates(
     """
     problems_by_id = {problem.item_id: problem for problem in problems}
     out: list[LinkDecision] = []
+    authority_valid = (isinstance(parent_review_authority, ParentReviewAuthority)
+                       and parent_review_authority.problem_source_sha256 == problem_source_sha256
+                       and parent_review_authority.solution_source_sha256 == solution_source_sha256)
+    problem_signatures: dict[str, str] = {}
+    native_signatures: dict[tuple[str, str], str] = {}
+    if authority_valid and parent_review_authority is not None:
+        problem_signatures = dict(parent_review_authority.problem_signatures)
+        native_signatures = {(ep, aid): digest for ep, aid, digest in
+                             parent_review_authority.native_signatures}
     for decision in decisions:
         problem = problems_by_id.get(decision.item_id)
         if (
             problem is None
             or decision.status not in (LinkStatus.REVIEW, LinkStatus.UNMATCHED)
             or decision.candidate_ids
+            or decision.answer_ids or decision.explanation_ids
         ):
             out.append(decision)
             continue
@@ -2232,6 +2352,8 @@ def augment_decisions_with_episode_candidates(
         for role_name, role_pool in _EPISODE_ROLE_POOLS.items():
             entry = scope_alignment.get(problem.scope_id, role_name)
             if entry is None:
+                continue
+            if not problem.crop_is_search_eligible:
                 continue
             if entry.aligned_episode_id is not None:
                 targets: list[tuple[str, str | None]] = [
@@ -2247,8 +2369,25 @@ def augment_decisions_with_episode_candidates(
                     "scope_alignment_unaligned",
                 )
                 targets = [(episode_id, blocker) for episode_id in entry.allows]
+            if problem_signatures.get(problem.item_id) == quality.identity(problem.signature()):
+                targets.extend((a.episode_id, 'scope_parent_fragment_review')
+                               for a in getattr(scope_alignment, 'parent_review_admissions', ())
+                               if a.scope_id == problem.scope_id and a.role == role_name
+                               and problem.parent_number in a.parent_numbers)
             for episode_id, blocker in targets:
                 for asset in episode_assets.get(episode_id, ()):
+                    if blocker == 'scope_parent_fragment_review' and (
+                        asset.source_document != 'solution'
+                        or asset.scope_id != f'episode:{episode_id}'
+                        or asset.review_reason is not None
+                        or native_signatures.get((episode_id, asset.asset_id)) != quality.identity(asset.signature())
+                    ):
+                        continue
+                    if "scope_fragment_review" in entry.evidence and (
+                        asset.source_document != "solution"
+                        or asset.scope_id != f"episode:{episode_id}"
+                    ):
+                        continue
                     if asset.role not in role_pool:
                         continue
                     if asset.parent_number != problem.parent_number:
@@ -2490,8 +2629,14 @@ def _validate_scope_contract(
     if not isinstance(provenance, dict) or frozenset(provenance) not in {
         frozenset(provenance_fields),
         frozenset(profiled_fields),
+        frozenset(provenance_fields | {"reviewed_episode_context"}),
+        frozenset(profiled_fields | {"reviewed_episode_context"}),
     }:
         raise ManifestError("scope provenance fields are invalid")
+    if "reviewed_episode_context" in provenance:
+        _validate_reviewed_scope_provenance(
+            provenance["reviewed_episode_context"], manifest, alignment
+        )
     profile = provenance.get("provider_profile", "full")
     expected_consensus = (
         "solutions/detections/solution-blocks/consensus"
@@ -2555,6 +2700,79 @@ def _validate_scope_contract(
         page_sets.append(set(pages))
     if page_sets[0] & page_sets[1]:
         raise ManifestError("scope page coverage overlaps")
+
+
+def _validate_reviewed_scope_provenance(
+    reviewed: Any, manifest: Mapping[str, Any], alignment: Mapping[str, Any]
+) -> None:
+    """Validate serialized REVIEW input, not a verification or approval receipt.
+
+    File-bound readers additionally re-run the existing runtime input validator.
+    Multiple page proofs are legitimate; aliases of the same target/page are not.
+    """
+    fields = {"relative_path", "sha256", "proof_files", "proof_inventory_sha256",
+              "episode_ids", "mode", "trust_flag", "confirmed"}
+    if (
+        not isinstance(reviewed, dict) or set(reviewed) != fields
+        or reviewed.get("relative_path") != "solutions/reviewed_episode_context.json"
+        or reviewed.get("mode") != "REVIEW"
+        or type(reviewed.get("trust_flag")) is not int or reviewed["trust_flag"] != 0
+        or type(reviewed.get("confirmed")) is not int or reviewed["confirmed"] != 0
+        or not _valid_sha256(reviewed.get("sha256"))
+        or not _valid_sha256(reviewed.get("proof_inventory_sha256"))
+        or not isinstance(reviewed.get("episode_ids"), list) or not reviewed["episode_ids"]
+        or any(not isinstance(value, str) or not value.strip() for value in reviewed["episode_ids"])
+        or len(set(reviewed["episode_ids"])) != len(reviewed["episode_ids"])
+        or not isinstance(reviewed.get("proof_files"), list) or not reviewed["proof_files"]
+    ):
+        raise ManifestError("reviewed scope provenance is invalid")
+    episodes = {edge.get("episode_id") for edge in alignment["edges"]
+                if isinstance(edge, dict) and isinstance(edge.get("episode_id"), str)}
+    if not set(reviewed["episode_ids"]).issubset(episodes):
+        raise ManifestError("reviewed scope episode target is unknown")
+    paths: set[str] = set()
+    targets: set[tuple[str, int | None]] = set()
+    for proof in reviewed["proof_files"]:
+        if not isinstance(proof, dict):
+            raise ManifestError("reviewed proof binding is invalid")
+        target = proof.get("target")
+        if not isinstance(target, str) or target not in {
+            "problem_source", "solution_source", "problem_page", "solution_page"
+        }:
+            raise ManifestError("reviewed proof target is invalid")
+        fields = {"path", "sha256", "target", "source_sha256"}
+        if target.endswith("_page"):
+            fields.add("pdf_page")
+            if type(proof.get("pdf_page")) is not int or proof["pdf_page"] < 1:
+                raise ManifestError("reviewed proof page is invalid")
+        relative = proof.get("path")
+        expected_source = manifest.get(
+            "problem" if target.startswith("problem_") else "solution", {}
+        ).get("source_sha256")
+        if (
+            set(proof) != fields
+            or not isinstance(relative, str) or not relative
+            or "\\" in relative or ":" in relative or relative.startswith("/")
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not _valid_sha256(proof.get("sha256"))
+            or not _valid_sha256(proof.get("source_sha256"))
+            or proof["source_sha256"] != expected_source
+            or target.endswith("_source") and proof["sha256"] != expected_source
+        ):
+            raise ManifestError("reviewed proof binding is invalid")
+        identity = (target, proof.get("pdf_page"))
+        if relative.casefold() in paths or identity in targets:
+            raise ManifestError("reviewed proof target or path is duplicated")
+        paths.add(relative.casefold())
+        targets.add(identity)
+    if {target for target, _ in targets} != {
+        "problem_source", "solution_source", "problem_page", "solution_page"
+    }:
+        raise ManifestError("reviewed proof targets are incomplete")
+    inventory_sha = hashlib.sha256(json.dumps(
+        reviewed["proof_files"], sort_keys=True).encode("utf-8")).hexdigest()
+    if inventory_sha != reviewed["proof_inventory_sha256"]:
+        raise ManifestError("reviewed proof inventory changed")
 
 
 def _validate_manual_propagation_header(manifest: Mapping[str, Any]) -> None:
@@ -2672,6 +2890,8 @@ def validate_link_manifest(manifest: Any) -> None:
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ManifestError(f"invalid {document_name} page map") from exc
+    from solution_fragment_review import validate_header
+    validate_header(manifest)
     _validate_scope_contract(manifest.get("scope_contract"), manifest)
     _validate_manual_propagation_header(manifest)
     expected_item_ids = manifest["problem"].get("item_ids")
@@ -2811,6 +3031,9 @@ def read_link_manifest(
     except (OSError, json.JSONDecodeError) as exc:
         raise ManifestError("cannot read link manifest") from exc
     validate_link_manifest(manifest)
+    if manifest.get('fragment_review_admission') is not None:
+        from solution_fragment_review import validate_published
+        validate_published(run_dir, manifest)
     if expected_cache_key is not None and manifest["cache_key"] != expected_cache_key:
         if (manifest.get("manual_confirmation_events")
                 or manifest.get("manual_constraints")
@@ -2852,7 +3075,7 @@ def read_link_manifest(
                 expected_file_sha256=reference["sha256"],
                 expected_problem_source_sha256=manifest["problem"]["source_sha256"],
                 expected_solution_source_sha256=manifest["solution"]["source_sha256"],
-                expected_link_cache_key=manifest["cache_key"],
+                expected_link_cache_key=(manifest.get("fragment_review_admission", {}).get("base_cache_key") or manifest["cache_key"]),
                 expected_versions={
                     "core_version": CORE_VERSION,
                     "runtime_version": solution_runtime.RUNTIME_VERSION,
@@ -3318,6 +3541,7 @@ class ScopeAlignmentBundle:
     alignment: ScopeAlignmentLike
     episode_assets: Mapping[str, tuple[SolutionAsset, ...]]
     provenance: Mapping[str, Any] | None = None
+    parent_review_authority: ParentReviewAuthority | None = None
 
     def flat_assets(self) -> tuple[SolutionAsset, ...]:
         seen: dict[str, SolutionAsset] = {}
@@ -3331,6 +3555,8 @@ class ScopeAlignmentBundle:
         a changed bbox/part/fingerprint must invalidate the link cache."""
         payload = {
             "alignment": self.alignment.signature(),
+            "parent_review_authority": (asdict(self.parent_review_authority)
+                                        if self.parent_review_authority is not None else None),
             "episode_assets": {
                 episode_id: [
                     asset.signature()
@@ -3388,6 +3614,10 @@ def run_link_pipeline(
 ) -> dict[str, Any]:
     if not context.solution_path.is_file():
         raise StageHookError('solution_source_absent')
+    from solution_fragment_review import try_review_pipeline
+    reviewed = try_review_pipeline(context, hooks)
+    if reviewed is not None:
+        return reviewed
     problem = hooks.detect_problem_index(context)
     solution = hooks.detect_solution_index(context)
     bundle = (
@@ -3455,7 +3685,8 @@ def run_link_pipeline(
             admitted_pairs=frozenset(admitted),
             problem_source_sha256=problem.source_sha256, solution_source_sha256=solution.source_sha256,
             scope_alignment=bundle.alignment if bundle else None,
-            episode_assets=bundle.episode_assets if bundle else None)
+            episode_assets=bundle.episode_assets if bundle else None,
+            parent_review_authority=bundle.parent_review_authority if bundle else None)
         scope_pairs = scope_candidate_pairs(problem.items, decisions, bundle.alignment, bundle.episode_assets) if bundle else ()
         native_by_id = {asset.asset_id: asset for asset in bundle.flat_assets()} if bundle else {}
         scope_fresh = tuple(pair for pair in scope_pairs if (
@@ -3471,7 +3702,8 @@ def run_link_pipeline(
             admitted_pairs=frozenset(admitted),
             problem_source_sha256=problem.source_sha256, solution_source_sha256=solution.source_sha256,
             scope_alignment=bundle.alignment if bundle else None,
-            episode_assets=bundle.episode_assets if bundle else None)
+            episode_assets=bundle.episode_assets if bundle else None,
+            parent_review_authority=bundle.parent_review_authority if bundle else None)
         search_trace.append({'stage': stage, 'problem_ids': [item.item_id for item in unresolved],
             'ordinary_pairs': [[pair.problem_id, pair.asset_id] for pair in fresh],
             'scope_pairs': [[pair.problem_id, pair.asset_id] for pair in scope_fresh],

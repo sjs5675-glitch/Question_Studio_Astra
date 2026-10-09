@@ -112,6 +112,9 @@ def _list(app) -> dict[str, Any]:
                 continue
             observed.add((project_id, item_id))
             item = {key: summary.get(key) for key in ('project_id', 'item_id', 'ref', 'revision', 'updated_at', 'identity', 'tags', 'dependency', 'preview', 'status', 'source', 'package_sha256')}
+            item['status'] = {key: value for key, value in item['status'].items() if key != 'review_issue_count'}
+            item['status']['workflow'] = item['status']['completion_status']
+            item['status']['usable_for_homework'] = item['status']['completion_status'] == 'complete'
             group_key = item['dependency']['group_key']
             if group_key:
                 item['dependency'].update(group_size=group_sizes[group_key], shared_context=True)
@@ -220,16 +223,12 @@ def handle(handler, method: str, parsed) -> None:
                         handler.end_headers()
                         handler.wfile.write(raw)
                         return
-                    issues = handler.app._validation_issues(path, package, check_files=True)
-                    review = package.get('review') or {}
-                    valid = (package['workflow'].get('status') == 'content_ready'
-                             and type(review.get('approved_revision')) is int
-                             and review['approved_revision'] == revision
-                             and review.get('approved_sha256') == approval_digest(package)
-                             and not any(issue.get('blocking') is True for issue in issues))
+                    registration = registration_summary(package)
+                    completion = registration['completion_status']
                     _send_json(handler, 200, {'contract_version': VERSION, 'source_id': _source_id(handler.app),
                         'package': package, 'revision': revision, 'package_sha256': _digest(package),
-                        'approval_valid': valid, 'registration': registration_summary(package, warning_count=len(issues)),
+                        'completion_status': completion, 'usable_for_homework': completion == 'complete',
+                        'registration': {**registration, 'workflow_status': completion},
                         'solution_link': solution_link_summary(package, item_root=path.parent),
                         'asset_urls': {a['asset_id']: PREFIX + f'/projects/{project_id}/items/{item_id}/assets/{a["asset_id"]}?revision={revision}&sha256={a["sha256"]}'
                                        for a in package.get('resources', {}).get('assets', [])
